@@ -4,10 +4,14 @@ import time
 from abc import ABC, abstractmethod
 
 import httpx
+from openhands.sdk.utils.models import DiscriminatedUnionMixin
+from openhands.sdk.utils.paging import page_iterator
 
 from openhands.app_server.errors import SandboxError
 from openhands.app_server.sandbox.sandbox_models import (
     AGENT_SERVER,
+    SandboxAcl,
+    SandboxAclUpdate,
     SandboxInfo,
     SandboxPage,
     SandboxRecord,
@@ -17,8 +21,6 @@ from openhands.app_server.services.injector import Injector
 from openhands.app_server.utils.docker_utils import (
     replace_localhost_hostname_for_docker,
 )
-from openhands.sdk.utils.models import DiscriminatedUnionMixin
-from openhands.sdk.utils.paging import page_iterator
 
 _logger = logging.getLogger(__name__)
 
@@ -297,6 +299,14 @@ class SandboxService(ABC):
         conversation-scoped step (``archive_conversation_workspace``) the
         conversation-delete finalizer runs before the sandbox is torn down.
         """
+
+    async def get_sandbox_acl(self, sandbox_id: str) -> SandboxAcl | None:
+        raise NotImplementedError
+
+    async def update_sandbox_acl(
+        self, sandbox_id: str, update: SandboxAclUpdate
+    ) -> SandboxAcl | None:
+        raise NotImplementedError
 
     async def archive_conversation_workspace(
         self,

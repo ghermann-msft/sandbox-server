@@ -1,9 +1,9 @@
 from datetime import datetime
 from enum import Enum
-
-from pydantic import BaseModel, Field
+from uuid import UUID
 
 from openhands.agent_server.utils import utc_now
+from pydantic import BaseModel, Field, field_validator
 
 
 class SandboxStatus(Enum):
@@ -13,6 +13,30 @@ class SandboxStatus(Enum):
     ERROR = 'ERROR'
     MISSING = 'MISSING'
     """Missing - possibly deleted"""
+
+
+class SandboxAccessType(str, Enum):
+    PERSONAL = 'PERSONAL'
+    TEAM = 'TEAM'
+
+
+class SandboxAclUpdate(BaseModel):
+    access_type: SandboxAccessType
+    member_object_ids: list[str] = Field(default_factory=list)
+
+    @field_validator('member_object_ids')
+    @classmethod
+    def validate_member_object_ids(cls, values: list[str]) -> list[str]:
+        try:
+            return sorted({str(UUID(value)) for value in values})
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise ValueError('ACL members must be Microsoft Entra object IDs') from exc
+
+
+class SandboxAcl(SandboxAclUpdate):
+    sandbox_id: str
+    owner_object_id: str
+    is_owner: bool
 
 
 class ExposedUrl(BaseModel):
@@ -50,6 +74,8 @@ class SandboxInfo(BaseModel):
 
     id: str
     created_by_user_id: str | None
+    access_type: SandboxAccessType | None = None
+    is_owner: bool | None = None
     sandbox_spec_id: str
     status: SandboxStatus
     session_api_key: str | None = Field(

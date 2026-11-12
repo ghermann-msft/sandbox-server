@@ -5,10 +5,12 @@ from typing import Annotated, cast
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
 from fastapi.security import APIKeyHeader
-
 from openhands.agent_server.models import Success
+
 from openhands.app_server.config import depends_sandbox_service, depends_user_context
 from openhands.app_server.sandbox.sandbox_models import (
+    SandboxAcl,
+    SandboxAclUpdate,
     SandboxInfo,
     SandboxPage,
     SecretNameItem,
@@ -105,7 +107,7 @@ async def resume_sandbox(
     return Success()
 
 
-@router.delete('/{id}', responses={404: {'description': 'Item not found'}})
+@router.delete('/{sandbox_id}', responses={404: {'description': 'Item not found'}})
 async def delete_sandbox(
     sandbox_id: str,
     sandbox_service: SandboxService = sandbox_service_dependency,
@@ -117,6 +119,41 @@ async def delete_sandbox(
     if not exists:
         raise HTTPException(status.HTTP_404_NOT_FOUND)
     return Success()
+
+
+@router.get('/{sandbox_id}/acl', responses={404: {'description': 'Item not found'}})
+async def get_sandbox_acl(
+    sandbox_id: str,
+    sandbox_service: SandboxService = sandbox_service_dependency,
+) -> SandboxAcl:
+    try:
+        acl = await sandbox_service.get_sandbox_acl(sandbox_id)
+    except NotImplementedError:
+        raise HTTPException(
+            status.HTTP_501_NOT_IMPLEMENTED,
+            detail='Sandbox ACLs are not supported by this runtime',
+        )
+    if acl is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND)
+    return acl
+
+
+@router.put('/{sandbox_id}/acl', responses={404: {'description': 'Item not found'}})
+async def update_sandbox_acl(
+    sandbox_id: str,
+    update: SandboxAclUpdate,
+    sandbox_service: SandboxService = sandbox_service_dependency,
+) -> SandboxAcl:
+    try:
+        acl = await sandbox_service.update_sandbox_acl(sandbox_id, update)
+    except NotImplementedError:
+        raise HTTPException(
+            status.HTTP_501_NOT_IMPLEMENTED,
+            detail='Sandbox ACLs are not supported by this runtime',
+        )
+    if acl is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND)
+    return acl
 
 
 # ---------------------------------------------------------------------------

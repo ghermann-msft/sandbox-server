@@ -61,6 +61,10 @@ from openhands.app_server.services.db_session_injector import (
 from openhands.app_server.services.httpx_client_injector import HttpxClientInjector
 from openhands.app_server.services.injector import InjectorState
 from openhands.app_server.services.jwt_service import JwtService, JwtServiceInjector
+from openhands.app_server.user.trusted_identity import (
+    TrustedIdentityService,
+    TrustedIdentityServiceInjector,
+)
 from openhands.app_server.user.user_context import UserContext, UserContextInjector
 from openhands.app_server.utils.environment import StorageProvider, get_storage_provider
 from openhands.app_server.web_client.default_web_client_config_injector import (
@@ -222,6 +226,7 @@ class AppServerConfig(OpenHandsModel):
     app_conversation: AppConversationServiceInjector | None = None
     pending_message: PendingMessageServiceInjector | None = None
     user: UserContextInjector | None = None
+    trusted_identity: TrustedIdentityServiceInjector | None = None
     jwt: JwtServiceInjector | None = None
     httpx: HttpxClientInjector = Field(default_factory=HttpxClientInjector)
     db_session: DbSessionInjector = Field(
@@ -424,6 +429,36 @@ def config_from_env() -> AppServerConfig:
     if config.user is None:
         config.user = AuthUserContextInjector()
 
+    if config.trusted_identity is None:
+        assertion_secret = os.getenv('OH_TRUSTED_IDENTITY_ASSERTION_SECRET')
+        if assertion_secret:
+            config.trusted_identity = TrustedIdentityServiceInjector(
+                secret=SecretStr(assertion_secret),
+                issuer=os.getenv(
+                    'OH_TRUSTED_IDENTITY_ASSERTION_ISSUER', 'halo-bff'
+                ),
+                audience=os.getenv(
+                    'OH_TRUSTED_IDENTITY_ASSERTION_AUDIENCE',
+                    'openhands-sandbox-server',
+                ),
+                header_name=os.getenv(
+                    'OH_TRUSTED_IDENTITY_ASSERTION_HEADER',
+                    'X-OpenHands-Identity-Assertion',
+                ),
+                max_lifetime_seconds=int(
+                    os.getenv(
+                        'OH_TRUSTED_IDENTITY_ASSERTION_MAX_LIFETIME_SECONDS',
+                        '300',
+                    )
+                ),
+                clock_skew_seconds=int(
+                    os.getenv(
+                        'OH_TRUSTED_IDENTITY_ASSERTION_CLOCK_SKEW_SECONDS',
+                        '30',
+                    )
+                ),
+            )
+
     if config.jwt is None:
         config.jwt = JwtServiceInjector(persistence_dir=config.persistence_dir)
 
@@ -512,6 +547,17 @@ def get_user_context(
 ) -> AsyncContextManager[UserContext]:
     injector = get_global_config().user
     assert injector is not None
+    return injector.context(state, request)
+
+
+def get_trusted_identity_service(
+    state: InjectorState, request: Request | None = None
+) -> AsyncContextManager[TrustedIdentityService]:
+    injector = get_global_config().trusted_identity
+    if injector is None:
+        raise RuntimeError(
+            'OH_TRUSTED_IDENTITY_ASSERTION_SECRET is required for trusted identity'
+        )
     return injector.context(state, request)
 
 
