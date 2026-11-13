@@ -12,6 +12,8 @@ ENV PYTHONPATH=/app \
     POETRY_CACHE_DIR=/tmp/poetry_cache
 
 ARG POETRY_VERSION=2.3.4
+ARG SOFTWARE_AGENT_SDK_REPOSITORY=https://github.com/OpenHands/software-agent-sdk.git
+ARG SOFTWARE_AGENT_SDK_REF=
 RUN apt-get update -y \
     && apt-get install -y curl make git build-essential jq gettext \
     && python3 -m pip install "poetry==${POETRY_VERSION}" --break-system-packages
@@ -19,6 +21,18 @@ RUN apt-get update -y \
 COPY pyproject.toml poetry.lock ./
 RUN touch README.md \
     && poetry install --no-root \
+    && if [ -n "${SOFTWARE_AGENT_SDK_REF}" ]; then \
+        git init /tmp/software-agent-sdk \
+        && git -C /tmp/software-agent-sdk remote add origin "${SOFTWARE_AGENT_SDK_REPOSITORY}" \
+        && git -C /tmp/software-agent-sdk fetch --depth 1 origin "${SOFTWARE_AGENT_SDK_REF}" \
+        && git -C /tmp/software-agent-sdk checkout --detach FETCH_HEAD \
+        && poetry run python -m pip install --upgrade \
+            /tmp/software-agent-sdk/openhands-sdk \
+            /tmp/software-agent-sdk/openhands-tools \
+            /tmp/software-agent-sdk/openhands-agent-server \
+        && poetry run python -m pip check \
+        && rm -rf /tmp/software-agent-sdk; \
+    fi \
     && rm -rf "${POETRY_CACHE_DIR}"
 
 FROM base AS openhands-sandbox-server

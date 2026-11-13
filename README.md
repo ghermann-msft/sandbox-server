@@ -46,6 +46,22 @@ docker compose up --build
 The Compose setup mounts the Docker socket and a local workspace so the server
 can manage sandbox containers.
 
+Release images use the `openhands-agent-server`, `openhands-sdk`, and
+`openhands-tools` versions pinned in `poetry.lock`. To build against an Agent
+Server image made from an unreleased software-agent-sdk revision, build Sandbox
+Server from the same repository and full commit:
+
+```bash
+docker build \
+  --build-arg SOFTWARE_AGENT_SDK_REPOSITORY=https://github.com/OpenHands/software-agent-sdk.git \
+  --build-arg SOFTWARE_AGENT_SDK_REF=b1d818a6078691cd765e05adbc60cd5fecb4c671 \
+  -f containers/app/Dockerfile \
+  -t openhands-sandbox-server:latest .
+```
+
+`SOFTWARE_AGENT_SDK_REF` is opt-in. When it is empty, the Docker build uses the
+locked release packages without cloning software-agent-sdk.
+
 ## Extraction provenance
 
 The extraction is based on:
