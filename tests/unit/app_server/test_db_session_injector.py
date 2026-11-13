@@ -28,6 +28,7 @@ sys.modules['storage.database'] = mock_storage_database
 sys.modules['pg8000'] = MagicMock()
 sys.modules['asyncpg'] = MagicMock()
 sys.modules['google.cloud.sql.connector'] = MagicMock()
+sys.modules['azure.identity'] = MagicMock()
 
 # Import after mocking to avoid import-time issues
 from openhands.app_server.services.db_session_injector import (  # noqa: E402
@@ -109,6 +110,7 @@ class TestDbSessionInjectorConfiguration:
         assert service.gcp_db_instance is None
         assert service.gcp_project is None
         assert service.gcp_region is None
+        assert service.azure_identity is False
         assert service.ssl_mode is None
 
     def test_environment_variable_processing(self, temp_persistence_dir):
@@ -123,6 +125,7 @@ class TestDbSessionInjectorConfiguration:
             'GCP_DB_INSTANCE': 'env_instance',
             'GCP_PROJECT': 'env_project',
             'GCP_REGION': 'env_region',
+            'DB_AZURE_IDENTITY': 'true',
         }
 
         with patch.dict(os.environ, env_vars):
@@ -136,6 +139,7 @@ class TestDbSessionInjectorConfiguration:
             assert service.gcp_db_instance == 'env_instance'
             assert service.gcp_project == 'env_project'
             assert service.gcp_region == 'env_region'
+            assert service.azure_identity is True
             assert service.ssl_mode == 'require'
 
     def test_pool_size_env_vars_override_defaults(self, temp_persistence_dir):
@@ -225,6 +229,112 @@ class TestDbSessionInjectorConnections:
             assert call_args[1]['max_overflow'] == 10
             assert call_args[1]['pool_pre_ping']
             assert call_args[1]['pool_use_lifo'] is True
+
+    def test_password_mode_does_not_create_azure_credential(
+        self, postgres_db_session_injector
+    ):
+        with patch(
+            'openhands.app_server.services.db_session_injector.create_engine'
+        ) as mock_create_engine:
+            postgres_db_session_injector.get_db_engine()
+
+        assert mock_create_engine.call_args.kwargs.get('creator') is None
+        assert postgres_db_session_injector._azure_credential is None
+
+    def test_azure_identity_mode_selects_azure_engine(self, temp_persistence_dir):
+        service = DbSessionInjector(
+            persistence_dir=temp_persistence_dir,
+            host='halo.postgres.database.azure.com',
+            azure_identity=True,
+        )
+        azure_engine = MagicMock()
+
+        with patch.object(
+            service, '_create_azure_engine', return_value=azure_engine
+        ) as create_azure_engine:
+            engine = service.get_db_engine()
+
+        assert engine is azure_engine
+        create_azure_engine.assert_called_once_with()
+
+    def test_azure_connection_uses_fresh_token_for_each_connection(
+        self, temp_persistence_dir
+    ):
+        credential = MagicMock()
+        credential.get_token.side_effect = [
+            MagicMock(token='token-one'),
+            MagicMock(token='token-two'),
+        ]
+        pg8000 = sys.modules['pg8000']
+        pg8000.connect.reset_mock()
+        pg8000.connect.side_effect = [MagicMock(), MagicMock()]
+        service = DbSessionInjector(
+            persistence_dir=temp_persistence_dir,
+            host='halo.postgres.database.azure.com',
+            name='halo',
+            user='halo-workload',
+            azure_identity=True,
+            ssl_mode='require',
+        )
+        service._azure_credential = credential
+
+        service._create_azure_db_connection()
+        service._create_azure_db_connection()
+
+        assert [call.kwargs['password'] for call in pg8000.connect.call_args_list] == [
+            'token-one',
+            'token-two',
+        ]
+        assert all(
+            call.kwargs['user'] == 'halo-workload'
+            for call in pg8000.connect.call_args_list
+        )
+        assert credential.get_token.call_count == 2
+        credential.get_token.assert_called_with(
+            'https://ossrdbms-aad.database.windows.net/.default'
+        )
+
+    @pytest.mark.asyncio
+    async def test_async_azure_connection_uses_token(self, temp_persistence_dir):
+        credential = MagicMock()
+        credential.get_token.return_value = MagicMock(token='async-token')
+        service = DbSessionInjector(
+            persistence_dir=temp_persistence_dir,
+            host='halo.postgres.database.azure.com',
+            name='halo',
+            user='halo-workload',
+            azure_identity=True,
+            ssl_mode='require',
+        )
+        service._azure_credential = credential
+
+        with patch(
+            'openhands.app_server.services.db_session_injector.asyncpg.connect',
+            new=AsyncMock(return_value=MagicMock()),
+        ) as connect:
+            await service._create_async_azure_db_connection()
+
+        connect.assert_awaited_once_with(
+            host='halo.postgres.database.azure.com',
+            port=5432,
+            database='halo',
+            user='halo-workload',
+            password='async-token',
+            ssl='require',
+        )
+
+    def test_azure_token_failure_propagates(self, temp_persistence_dir):
+        credential = MagicMock()
+        credential.get_token.side_effect = RuntimeError('identity unavailable')
+        service = DbSessionInjector(
+            persistence_dir=temp_persistence_dir,
+            host='halo.postgres.database.azure.com',
+            azure_identity=True,
+        )
+        service._azure_credential = credential
+
+        with pytest.raises(RuntimeError, match='identity unavailable'):
+            service._create_azure_db_connection()
 
     @pytest.mark.asyncio
     async def test_postgres_async_connection_with_host(

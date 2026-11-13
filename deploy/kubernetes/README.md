@@ -47,6 +47,19 @@ Everything else has a default; override through config as needed:
 | `inject_session_key` | `true` | Give every sandbox its own session API key |
 | `shutdown_after_seconds` | unset | TTL safety net; the controller deletes the claim afterwards |
 
+### Azure PostgreSQL workload identity
+
+Set `DB_AZURE_IDENTITY=true` to authenticate PostgreSQL connections with
+`DefaultAzureCredential` instead of `DB_PASS`. The configured `DB_USER` is the
+Microsoft Entra PostgreSQL principal. Every new physical connection obtains a new
+token for `https://ossrdbms-aad.database.windows.net/.default`; pooled connections
+continue to be reused normally.
+
+At minimum configure `DB_HOST`, `DB_NAME`, `DB_USER`, and `DB_SSL_MODE=require`.
+Use the standard Azure Identity environment variables when needed, including
+`AZURE_CLIENT_ID` to select a user-assigned workload identity. Leave
+`DB_AZURE_IDENTITY` unset or false to preserve static `DB_PASS` authentication.
+
 Pod-level concerns live in the `SandboxTemplate` rather than here. That covers the
 image, CPU and memory, `runtimeClassName`, network policy and volumes.
 

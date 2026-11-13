@@ -25,6 +25,7 @@ dependencies = [
   "anthropic[vertex]",
   "anyio==4.9.0",
   "asyncpg>=0.30",
+  "azure-identity==1.25.2",
   "authlib>=1.6.12,!=1.7.0",
   "bashlex==0.18",
   "binaryornot==0.6.0",
@@ -255,6 +256,7 @@ joserfc = ">=1.0.0"
 sqlalchemy = { extras = [ "asyncio" ], version = "^2.0.40" }
 pg8000 = "1.31.5"
 asyncpg = ">=0.30,<0.32"
+azure-identity = "1.25.2"
 deprecation = "2.1.0"
 lmnr = "^0.7.20"
 
