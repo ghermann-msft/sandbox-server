@@ -10,8 +10,10 @@ No cluster is required: the CustomObjectsApi is mocked.
 """
 
 import re
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
+import httpx
 import pytest
 from kubernetes.client.rest import ApiException
 from pydantic import ValidationError
@@ -21,6 +23,7 @@ from openhands.app_server.sandbox.kubernetes_sandbox_service import (
     MANAGED_BY_LABEL,
     MANAGED_BY_VALUE,
     SANDBOX_ID_LABEL,
+    SANDBOX_POD_NAME_ANNOTATION,
     SESSION_KEY_HASH_LABEL,
     SPEC_ID_ANNOTATION,
     KubernetesSandboxService,
@@ -52,7 +55,12 @@ def custom_objects():
 
 
 @pytest.fixture
-def service(mock_sandbox_spec_service, custom_objects):
+def core_v1():
+    return MagicMock()
+
+
+@pytest.fixture
+def service(mock_sandbox_spec_service, custom_objects, core_v1):
     return KubernetesSandboxService(
         sandbox_spec_service=mock_sandbox_spec_service,
         namespace='agents',
@@ -63,6 +71,7 @@ def service(mock_sandbox_spec_service, custom_objects):
         exposed_ports=[],
         max_num_sandboxes=5,
         _custom_objects=custom_objects,
+        _core_v1=core_v1,
     )
 
 
@@ -97,6 +106,135 @@ def _sandbox(ready=True, operating_mode='Running', reason=None, message=None):
             ]
         },
     }
+
+
+def _pod(pod_ip='10.1.2.3', ready=True):
+    return SimpleNamespace(
+        status=SimpleNamespace(
+            pod_ip=pod_ip,
+            conditions=[
+                SimpleNamespace(
+                    type='Ready',
+                    status='True' if ready else 'False',
+                )
+            ],
+        )
+    )
+
+
+async def test_readiness_uses_internal_pod_ip_and_session_key(
+    service, custom_objects, core_v1
+):
+    service.exposed_ports = [
+        type('P', (), {'name': AGENT_SERVER, 'container_port': 8000})()
+    ]
+    claim = _claim(env=[{'name': SESSION_API_KEY_VARIABLE, 'value': 'session-secret'}])
+    sandbox_object = _sandbox()
+    sandbox_object['metadata'] = {
+        'name': 'sb-1',
+        'annotations': {SANDBOX_POD_NAME_ANNOTATION: 'warm-pod-7'},
+    }
+    custom_objects.list_namespaced_custom_object.return_value = {'items': [claim]}
+    custom_objects.get_namespaced_custom_object.return_value = sandbox_object
+    core_v1.read_namespaced_pod.return_value = _pod()
+    httpx_client = AsyncMock()
+    httpx_client.get.return_value = MagicMock(is_success=True)
+
+    info = await service.get_sandbox('sb1')
+    assert info is not None
+    assert info.exposed_urls[0].url == 'https://sb-1.example.com:8000'
+
+    assert await service._check_agent_server_alive(info, httpx_client) is True
+
+    core_v1.read_namespaced_pod.assert_called_once_with(
+        name='warm-pod-7', namespace='agents'
+    )
+    httpx_client.get.assert_awaited_once_with(
+        'http://10.1.2.3:8000/alive',
+        headers={'X-Session-API-Key': 'session-secret'},
+        timeout=5.0,
+    )
+
+
+@pytest.mark.parametrize(
+    'pod',
+    [
+        _pod(ready=False),
+        _pod(pod_ip=None),
+    ],
+)
+async def test_readiness_rejects_not_ready_or_missing_pod_ip(
+    service, custom_objects, core_v1, pod
+):
+    service.exposed_ports = [
+        type('P', (), {'name': AGENT_SERVER, 'container_port': 8000})()
+    ]
+    custom_objects.list_namespaced_custom_object.return_value = {
+        'items': [_claim(env=[{'name': SESSION_API_KEY_VARIABLE, 'value': 'key'}])]
+    }
+    sandbox_object = _sandbox()
+    sandbox_object['metadata'] = {'name': 'sb-1'}
+    custom_objects.get_namespaced_custom_object.return_value = sandbox_object
+    core_v1.read_namespaced_pod.return_value = pod
+    httpx_client = AsyncMock()
+
+    info = await service.get_sandbox('sb1')
+    assert info is not None
+    assert await service._check_agent_server_alive(info, httpx_client) is False
+    httpx_client.get.assert_not_awaited()
+
+
+async def test_readiness_ignores_protected_external_url(
+    service, custom_objects, core_v1
+):
+    service.exposed_ports = [
+        type('P', (), {'name': AGENT_SERVER, 'container_port': 8000})()
+    ]
+    custom_objects.list_namespaced_custom_object.return_value = {
+        'items': [_claim(env=[{'name': SESSION_API_KEY_VARIABLE, 'value': 'key'}])]
+    }
+    sandbox_object = _sandbox()
+    sandbox_object['metadata'] = {'name': 'sb-1'}
+    custom_objects.get_namespaced_custom_object.return_value = sandbox_object
+    core_v1.read_namespaced_pod.return_value = _pod()
+
+    async def probe(request):
+        assert request.url == httpx.URL('http://10.1.2.3:8000/alive')
+        return httpx.Response(200, request=request)
+
+    httpx_client = httpx.AsyncClient(transport=httpx.MockTransport(probe))
+    try:
+        info = await service.get_sandbox('sb1')
+        assert info is not None
+        assert info.exposed_urls[0].url.startswith('https://')
+        assert await service._check_agent_server_alive(info, httpx_client) is True
+    finally:
+        await httpx_client.aclose()
+
+
+async def test_readiness_handles_pod_api_and_probe_errors(
+    service, custom_objects, core_v1
+):
+    service.exposed_ports = [
+        type('P', (), {'name': AGENT_SERVER, 'container_port': 8000})()
+    ]
+    custom_objects.list_namespaced_custom_object.return_value = {
+        'items': [_claim(env=[{'name': SESSION_API_KEY_VARIABLE, 'value': 'key'}])]
+    }
+    sandbox_object = _sandbox()
+    sandbox_object['metadata'] = {'name': 'sb-1'}
+    custom_objects.get_namespaced_custom_object.return_value = sandbox_object
+    info = await service.get_sandbox('sb1')
+    assert info is not None
+    httpx_client = AsyncMock()
+
+    core_v1.read_namespaced_pod.side_effect = ApiException(status=500)
+    assert await service._check_agent_server_alive(info, httpx_client) is False
+
+    core_v1.read_namespaced_pod.side_effect = None
+    core_v1.read_namespaced_pod.return_value = _pod()
+    httpx_client.get.side_effect = httpx.ConnectError('unreachable')
+    assert await service._check_agent_server_alive(info, httpx_client) is False
 
 
 async def test_start_sandbox_creates_claim(service, custom_objects):

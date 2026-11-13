@@ -28,13 +28,14 @@ from datetime import datetime, timedelta
 from typing import Any, AsyncGenerator
 
 import base62
+import httpx
 from fastapi import Request
 from kubernetes import client as k8s_client
 from kubernetes import config as k8s_config
 from kubernetes.client.rest import ApiException
-from openhands.agent_server.utils import utc_now
 from pydantic import BaseModel, ConfigDict, Field
 
+from openhands.agent_server.utils import utc_now
 from openhands.app_server.errors import SandboxError
 from openhands.app_server.sandbox.sandbox_access import SandboxAccessService
 from openhands.app_server.sandbox.sandbox_models import (
@@ -82,6 +83,7 @@ SPEC_ID_ANNOTATION = 'agents.openhands.dev/sandbox-spec-id'
 # Lookup index for the session key. The env var stays the canonical secret; this is
 # a one-way hash so the API server can filter instead of us scanning every claim.
 SESSION_KEY_HASH_LABEL = 'agents.openhands.dev/session-key-hash'
+SANDBOX_POD_NAME_ANNOTATION = 'agents.x-k8s.io/pod-name'
 
 _INVALID_NAME_CHARS = re.compile(r'[^a-z0-9-]+')
 # Sandbox ids travel as label values, so they are limited to the label charset and
@@ -145,6 +147,7 @@ class KubernetesSandboxService(SandboxService):
     default_sandbox_spec_id: str | None = None
     access_service: SandboxAccessService | None = None
     _custom_objects: Any = None
+    _core_v1: Any = None
 
     def __post_init__(self) -> None:
         if self._custom_objects is None:
@@ -271,6 +274,19 @@ class KubernetesSandboxService(SandboxService):
             name=sandbox_name,
             body={'spec': {'operatingMode': mode}},
         )
+
+    def _get_pod_sync(self, pod_name: str) -> Any | None:
+        if self._core_v1 is None:
+            self._core_v1 = k8s_client.CoreV1Api()
+        try:
+            return self._core_v1.read_namespaced_pod(
+                name=pod_name,
+                namespace=self.namespace,
+            )
+        except ApiException as e:
+            if e.status == 404:
+                return None
+            raise
 
     # ── Conversion ────────────────────────────────────────────────────────────
 
@@ -408,10 +424,7 @@ class KubernetesSandboxService(SandboxService):
         # Each conversion reads the claim's Sandbox, so run them concurrently
         # rather than paying one API round-trip per claim in series.
         infos = await asyncio.gather(
-            *[
-                self._claim_to_sandbox_info(claim, load_access=False)
-                for claim in claims
-            ]
+            *[self._claim_to_sandbox_info(claim, load_access=False) for claim in claims]
         )
         items = [info for info in infos if info is not None]
         items.sort(key=lambda item: item.created_at)
@@ -425,8 +438,8 @@ class KubernetesSandboxService(SandboxService):
         page = items[offset : offset + limit]
         if self.access_service is not None:
             for item in page:
-                item.created_by_user_id = (
-                    await self.access_service.owner_object_id(item.id)
+                item.created_by_user_id = await self.access_service.owner_object_id(
+                    item.id
                 )
                 item.access_type = await self.access_service.access_type(item.id)
                 item.is_owner = await self.access_service.is_owner(item.id)
@@ -442,6 +455,65 @@ class KubernetesSandboxService(SandboxService):
         if claim is None:
             return None
         return await self._claim_to_sandbox_info(claim)
+
+    async def _check_agent_server_alive(
+        self, sandbox: SandboxInfo, httpx_client: httpx.AsyncClient
+    ) -> bool:
+        """Probe Agent Server directly through the ready Sandbox pod."""
+        url = None
+        try:
+            claim = await asyncio.to_thread(self._get_claim_sync, sandbox.id)
+            sandbox_name = _sandbox_name(claim or {})
+            if not sandbox_name:
+                return False
+            sandbox_object = await asyncio.to_thread(
+                self._get_sandbox_object_sync, sandbox_name
+            )
+            if sandbox_object is None:
+                return False
+
+            metadata = sandbox_object.get('metadata') or {}
+            annotations = metadata.get('annotations') or {}
+            pod_name = (
+                annotations.get(SANDBOX_POD_NAME_ANNOTATION)
+                or metadata.get('name')
+                or sandbox_name
+            )
+            pod = await asyncio.to_thread(self._get_pod_sync, pod_name)
+            if pod is None or not _pod_is_ready(pod):
+                return False
+
+            pod_ip = getattr(getattr(pod, 'status', None), 'pod_ip', None)
+            if not pod_ip:
+                return False
+            agent_server_port = next(
+                (
+                    port.container_port
+                    for port in self.exposed_ports
+                    if port.name == AGENT_SERVER
+                ),
+                None,
+            )
+            if agent_server_port is None:
+                return False
+
+            host = f'[{pod_ip}]' if ':' in pod_ip else pod_ip
+            url = f'http://{host}:{agent_server_port}/alive'
+            headers = (
+                {'X-Session-API-Key': sandbox.session_api_key}
+                if sandbox.session_api_key
+                else {}
+            )
+            response = await httpx_client.get(url, headers=headers, timeout=5.0)
+            return response.is_success
+        except Exception as exc:
+            _logger.debug(
+                'Agent server pod health check failed for sandbox %s%s: %s',
+                sandbox.id,
+                f' at {url}' if url else '',
+                exc,
+            )
+            return False
 
     async def _claim_for_session_api_key(self, session_api_key: str) -> dict | None:
         """Find a claim by session key, filtered by the API server.
@@ -480,9 +552,7 @@ class KubernetesSandboxService(SandboxService):
         created_by_user_id = None
         if self.access_service is not None:
             created_by_user_id = await self.access_service.owner_object_id(sandbox_id)
-        return SandboxRecord(
-            id=sandbox_id, created_by_user_id=created_by_user_id
-        )
+        return SandboxRecord(id=sandbox_id, created_by_user_id=created_by_user_id)
 
     async def start_sandbox(
         self, sandbox_spec_id: str | None = None, sandbox_id: str | None = None
@@ -659,6 +729,15 @@ def _claim_condition_message(claim: dict) -> str | None:
     return None
 
 
+def _pod_is_ready(pod: Any) -> bool:
+    conditions = getattr(getattr(pod, 'status', None), 'conditions', None) or []
+    return any(
+        getattr(condition, 'type', None) == 'Ready'
+        and str(getattr(condition, 'status', '')).lower() == 'true'
+        for condition in conditions
+    )
+
+
 class KubernetesSandboxServiceInjector(SandboxServiceInjector):
     """Dependency injector for kubernetes sandbox services."""
 
@@ -684,11 +763,11 @@ class KubernetesSandboxServiceInjector(SandboxServiceInjector):
     sandbox_url_pattern: str = Field(
         default='http://{sandbox_name}.{namespace}.svc.cluster.local:{port}',
         description=(
-            'URL pattern for reaching a sandbox. Placeholders: {sandbox_name} '
-            '(the Sandbox resource, which cluster DNS resolves), {sandbox_id} '
-            '(the app-level id), {namespace} and {port}. The default suits an app '
-            'server running in the same cluster; browsers need an externally '
-            'routable pattern such as https://{sandbox_name}.sandboxes.example.com.'
+            'URL pattern exposed to clients for reaching a sandbox. Placeholders: '
+            '{sandbox_name}, {sandbox_id}, {namespace} and {port}. The default '
+            'requires the SandboxTemplate to enable a per-sandbox Service; browser '
+            'clients need an externally routable pattern such as '
+            'https://{sandbox_name}.sandboxes.example.com.'
         ),
     )
     webhook_base_url: str = Field(

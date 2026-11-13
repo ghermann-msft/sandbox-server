@@ -41,7 +41,7 @@ Everything else has a default; override through config as needed:
 |---|---|---|
 | `namespace` | `default` | Namespace holding the pool and sandboxes |
 | `warm_pool` | unset | Pool to claim from. When unset the sandbox spec id is used, so several pools can be offered as runtimes |
-| `sandbox_url_pattern` | `http://{sandbox_name}.{namespace}.svc.cluster.local:{port}` | How a sandbox is reached. Placeholders: `{sandbox_name}` (the Sandbox resource, which cluster DNS resolves), `{sandbox_id}` (app-level id), `{namespace}`, `{port}` |
+| `sandbox_url_pattern` | `http://{sandbox_name}.{namespace}.svc.cluster.local:{port}` | Client-facing sandbox URL. Placeholders: `{sandbox_name}`, `{sandbox_id}`, `{namespace}`, `{port}`. The default requires `spec.service: true` in the SandboxTemplate; otherwise configure an external router pattern |
 | `webhook_base_url` | in-cluster service URL | This app server, as reachable *from* a sandbox pod |
 | `max_num_sandboxes` | `10` | Concurrency cap; the oldest sandboxes are paused beyond it |
 | `inject_session_key` | `true` | Give every sandbox its own session API key |
@@ -86,6 +86,11 @@ must support the `azure_workload_identity` LLM authentication mode.
 
 Pod-level concerns live in the `SandboxTemplate` rather than here. That covers the
 image, CPU and memory, `runtimeClassName`, network policy and volumes.
+
+The app server checks Agent Server readiness over the backing pod IP, independent
+of `sandbox_url_pattern`, and authenticates the `/alive` request with the sandbox
+session key. Its service account therefore needs `get` access to pods; the supplied
+`rbac.yaml` includes that permission.
 
 ### Reaching sandboxes from a browser
 
