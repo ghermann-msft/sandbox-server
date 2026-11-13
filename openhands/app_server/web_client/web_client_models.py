@@ -1,8 +1,8 @@
 from datetime import datetime
 
+from openhands.agent_server.env_parser import DiscriminatedUnionMixin
 from pydantic import BaseModel, Field, model_validator
 
-from openhands.agent_server.env_parser import DiscriminatedUnionMixin
 from openhands.app_server.config_api.config_models import AppMode
 from openhands.app_server.integrations.service_types import ProviderType
 from openhands.app_server.web_client.web_client_deployment_mode import (
@@ -30,8 +30,8 @@ class WebClientFeatureFlags(BaseModel):
     # string, base URL, and API key inputs) in LLM settings, leaving only the
     # managed model dropdown. Used by OHE installs where admins curate the
     # model list on the bundled LiteLLM proxy. Defaults to True so SaaS and
-    # existing installs are unaffected. UI-level only — previously saved BYOK
-    # settings keep working at runtime.
+    # existing installs are unaffected. When false, the app server also uses
+    # its deployment LLM_* configuration as the authoritative launch LLM.
     allow_user_llm_configuration: bool = True
     # Defaults to True so the ACP agent configuration UI (Settings > Agent) is
     # visible on SaaS and existing installs, matching Agent Canvas. Set

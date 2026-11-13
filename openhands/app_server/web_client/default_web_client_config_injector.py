@@ -2,6 +2,7 @@ import os
 from datetime import datetime
 from urllib.parse import urlparse
 
+from openhands.sdk.settings import ACP_PROVIDERS
 from pydantic import Field
 
 from openhands.app_server.integrations.jira_dc.config import (
@@ -18,7 +19,6 @@ from openhands.app_server.web_client.web_client_models import (
     WebClientConfig,
     WebClientFeatureFlags,
 )
-from openhands.sdk.settings import ACP_PROVIDERS
 
 
 def _get_recaptcha_site_key() -> str | None:
@@ -173,9 +173,10 @@ def _get_feature_flags() -> WebClientFeatureFlags:
 
     OH_ALLOW_USER_LLM_CONFIGURATION and ENABLE_ACP are the exceptions: they
     default to 'true' when unset. OH_ALLOW_USER_LLM_CONFIGURATION keeps the
-    BYOK editing UI visible; ENABLE_ACP keeps the ACP agent configuration UI
-    (Settings > Agent) visible on SaaS and existing installs, matching Agent
-    Canvas. Set ENABLE_ACP=false to hide it.
+    BYOK editing UI visible and user LLM settings authoritative; ENABLE_ACP
+    keeps the ACP agent configuration UI (Settings > Agent) visible on SaaS
+    and existing installs, matching Agent Canvas. Set ENABLE_ACP=false to hide
+    it.
     """
     return WebClientFeatureFlags(
         enable_billing=os.getenv('ENABLE_BILLING', 'false') == 'true',

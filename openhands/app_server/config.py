@@ -61,6 +61,7 @@ from openhands.app_server.services.db_session_injector import (
 from openhands.app_server.services.httpx_client_injector import HttpxClientInjector
 from openhands.app_server.services.injector import InjectorState
 from openhands.app_server.services.jwt_service import JwtService, JwtServiceInjector
+from openhands.app_server.settings.server_managed_llm import load_server_managed_llm
 from openhands.app_server.user.trusted_identity import (
     TrustedIdentityService,
     TrustedIdentityServiceInjector,
@@ -215,6 +216,7 @@ class AppServerConfig(OpenHandsModel):
         default_factory=get_default_tavily_api_key,
         description='Tavily API key for search integration (proxied via MCP server)',
     )
+    allow_user_llm_configuration: bool = True
     # Dependency Injection Injectors
     llm_model: LLMModelServiceInjector | None = None
     event: EventServiceInjector | None = None
@@ -427,7 +429,8 @@ def config_from_env() -> AppServerConfig:
         config.pending_message = SQLPendingMessageServiceInjector()
 
     if config.user is None:
-        config.user = AuthUserContextInjector()
+        managed_llm = load_server_managed_llm(config.allow_user_llm_configuration)
+        config.user = AuthUserContextInjector(managed_llm=managed_llm)
 
     if config.trusted_identity is None:
         assertion_secret = os.getenv('OH_TRUSTED_IDENTITY_ASSERTION_SECRET')

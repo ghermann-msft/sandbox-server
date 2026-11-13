@@ -60,6 +60,30 @@ Use the standard Azure Identity environment variables when needed, including
 `AZURE_CLIENT_ID` to select a user-assigned workload identity. Leave
 `DB_AZURE_IDENTITY` unset or false to preserve static `DB_PASS` authentication.
 
+### Server-managed LLM
+
+Set `OH_ALLOW_USER_LLM_CONFIGURATION=false` to make the app server's `LLM_*`
+configuration authoritative for OpenHands conversation launches. This also hides
+the BYOK editing UI. The default is true, which preserves existing OSS and Cloud
+behavior and uses each user's persisted LLM settings.
+
+Managed mode requires `LLM_MODEL`. It also accepts `LLM_API_KEY`,
+`LLM_BASE_URL`, `LLM_API_VERSION`, and `LLM_AUTH_TYPE`. Halo's Azure OpenAI
+workload-identity configuration is:
+
+```bash
+OH_ALLOW_USER_LLM_CONFIGURATION=false
+LLM_MODEL=azure/gpt-5.6-sol
+LLM_BASE_URL=https://<resource>.openai.azure.com
+LLM_API_VERSION=<azure-openai-api-version>
+LLM_AUTH_TYPE=azure_workload_identity
+```
+
+Azure authentication uses the workload identity available to the process making
+the LLM call; both app-server and agent-server pods must receive the intended
+identity. No per-user API key or settings row is required. The agent-server image
+must support the `azure_workload_identity` LLM authentication mode.
+
 Pod-level concerns live in the `SandboxTemplate` rather than here. That covers the
 image, CPU and memory, `runtimeClassName`, network policy and volumes.
 

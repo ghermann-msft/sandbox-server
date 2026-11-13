@@ -1,11 +1,14 @@
 import logging
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Any, AsyncGenerator, cast
 from uuid import UUID
 
 from fastapi import Request
+from openhands.sdk.llm import LLM
+from openhands.sdk.secret import SecretSource, StaticSecret
+from openhands.sdk.settings import OpenHandsAgentSettings
 from pydantic import PrivateAttr, SecretStr
 
 from openhands.app_server.errors import AuthError
@@ -20,7 +23,6 @@ from openhands.app_server.user.specifiy_user_context import USER_CONTEXT_ATTR
 from openhands.app_server.user.user_context import UserContext, UserContextInjector
 from openhands.app_server.user.user_models import UserInfo
 from openhands.app_server.user_auth.user_auth import UserAuth, get_user_auth
-from openhands.sdk.secret import SecretSource, StaticSecret
 
 USER_AUTH_ATTR = 'user_auth'
 _logger = logging.getLogger(__name__)
@@ -35,6 +37,7 @@ class AuthUserContext(UserContext):
     _user_info: UserInfo | None = None
     _resolved_user_info: UserInfo | None = None
     _provider_handler: ProviderHandler | None = None
+    managed_llm: LLM | None = field(default=None, kw_only=True)
 
     async def get_user_id(self) -> str | None:
         # If you have an auth object here you are logged in. If user_id is None
@@ -45,14 +48,23 @@ class AuthUserContext(UserContext):
     async def get_user_email(self) -> str | None:
         return await self.user_auth.get_user_email()
 
-    @staticmethod
-    def _user_info_from_settings(user_id: str | None, settings: Any | None) -> UserInfo:
+    def _user_info_from_settings(
+        self, user_id: str | None, settings: Any | None
+    ) -> UserInfo:
         if settings is None:
-            return UserInfo(id=user_id)
-        return UserInfo(
-            id=user_id,
-            **settings.model_dump(context={'expose_secrets': True}),
-        )
+            user_info = UserInfo(id=user_id)
+        else:
+            user_info = UserInfo(
+                id=user_id,
+                **settings.model_dump(context={'expose_secrets': True}),
+            )
+        if self.managed_llm is not None and isinstance(
+            user_info.agent_settings, OpenHandsAgentSettings
+        ):
+            user_info.agent_settings = user_info.agent_settings.model_copy(
+                update={'llm': self.managed_llm}
+            )
+        return user_info
 
     async def get_user_info(
         self,
@@ -193,6 +205,9 @@ USER_ID_ATTR = 'user_id'
 class AuthUserContextInjector(UserContextInjector):
     _user_auth_class: Any = PrivateAttr(default=None)
 
+    def __init__(self, managed_llm: LLM | None = None):
+        self.managed_llm = managed_llm
+
     async def inject(
         self, state: InjectorState, request: Request | None = None
     ) -> AsyncGenerator[UserContext, None]:
@@ -201,7 +216,10 @@ class AuthUserContextInjector(UserContextInjector):
             if request is None:
                 raise AuthError()
             user_auth = await get_user_auth(request)
-            user_context = AuthUserContext(user_auth=user_auth)
+            user_context = AuthUserContext(
+                user_auth=user_auth,
+                managed_llm=self.managed_llm,
+            )
             setattr(state, USER_CONTEXT_ATTR, user_context)
 
         yield user_context
