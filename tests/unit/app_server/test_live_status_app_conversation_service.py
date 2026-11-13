@@ -320,6 +320,21 @@ class TestLiveStatusAppConversationService:
         self.service._load_hooks_from_workspace = AsyncMock(return_value=None)
 
     @pytest.mark.asyncio
+    async def test_start_task_uses_authenticated_user_context_id(self):
+        object_id = '708bbdc7-c90e-4ac8-a3a0-e15e6c4db5c4'
+        self.mock_user_context.get_user_id = AsyncMock(return_value=object_id)
+        self.mock_app_conversation_start_task_service.save_app_conversation_start_task = AsyncMock()
+
+        start = self.service.start_app_conversation(AppConversationStartRequest())
+        task = await anext(start)
+        await start.aclose()
+
+        assert task.created_by_user_id == object_id
+        self.mock_app_conversation_start_task_service.save_app_conversation_start_task.assert_awaited_once_with(
+            task
+        )
+
+    @pytest.mark.asyncio
     async def test_seed_sandbox_profiles_upserts_resolved_keys_and_prunes(self):
         """Pushes each profile to the sandbox with its key resolved (managed key
         injected, BYOR key kept), then deletes profiles that no longer exist on

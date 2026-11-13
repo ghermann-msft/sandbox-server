@@ -1,11 +1,15 @@
 import os
+from contextlib import asynccontextmanager
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 from pydantic import ValidationError
+from starlette.requests import Request
 
 from openhands.agent_server.env_parser import from_env
 from openhands.app_server.config import AppServerConfig
+from openhands.app_server.errors import AuthError
 from openhands.app_server.settings.server_managed_llm import (
     AZURE_OPENAI_SCOPE,
     ServerManagedLLM,
@@ -16,6 +20,7 @@ from openhands.app_server.user.auth_user_context import (
     AuthUserContext,
     AuthUserContextInjector,
 )
+from openhands.app_server.user.trusted_identity import TrustedIdentity
 from openhands.sdk.llm import LLM
 from openhands.sdk.tool import SUB_AGENT_TOOL_NAME, Tool
 
@@ -94,6 +99,103 @@ def test_auth_user_context_injector_accepts_managed_llm():
     injector = AuthUserContextInjector.with_managed_llm(managed_llm)
 
     assert injector.managed_llm is managed_llm
+
+
+@pytest.mark.asyncio
+async def test_auth_user_context_injector_uses_verified_trusted_identity():
+    object_id = '708bbdc7-c90e-4ac8-a3a0-e15e6c4db5c4'
+    identity_service = Mock()
+    identity_service.verify_request.return_value = TrustedIdentity(
+        tenant_id='11111111-1111-1111-1111-111111111111',
+        object_id=object_id,
+    )
+
+    @asynccontextmanager
+    async def trusted_identity_context(state, request):
+        yield identity_service
+
+    user_auth = Mock()
+    user_auth.get_user_id = AsyncMock(return_value=None)
+    request = Request({'type': 'http', 'headers': [], 'state': {}})
+    injector = AuthUserContextInjector()
+
+    with (
+        patch(
+            'openhands.app_server.config.get_global_config',
+            return_value=SimpleNamespace(trusted_identity=object()),
+        ),
+        patch(
+            'openhands.app_server.config.get_trusted_identity_service',
+            side_effect=trusted_identity_context,
+        ),
+        patch(
+            'openhands.app_server.user.auth_user_context.get_user_auth',
+            AsyncMock(return_value=user_auth),
+        ),
+    ):
+        async with injector.context(request.state, request) as user_context:
+            assert await user_context.get_user_id() == object_id
+
+    identity_service.verify_request.assert_called_once_with(request)
+    user_auth.get_user_id.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_auth_user_context_injector_preserves_standard_auth_without_assertions():
+    user_auth = Mock()
+    user_auth.get_user_id = AsyncMock(return_value='standard-user')
+    request = Request({'type': 'http', 'headers': [], 'state': {}})
+    injector = AuthUserContextInjector()
+
+    with (
+        patch(
+            'openhands.app_server.config.get_global_config',
+            return_value=SimpleNamespace(trusted_identity=None),
+        ),
+        patch(
+            'openhands.app_server.user.auth_user_context.get_user_auth',
+            AsyncMock(return_value=user_auth),
+        ),
+    ):
+        async with injector.context(request.state, request) as user_context:
+            assert await user_context.get_user_id() == 'standard-user'
+
+    user_auth.get_user_id.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_auth_user_context_injector_rejects_invalid_trusted_identity():
+    identity_service = Mock()
+    identity_service.verify_request.side_effect = AuthError(
+        'Invalid trusted identity assertion'
+    )
+
+    @asynccontextmanager
+    async def trusted_identity_context(state, request):
+        yield identity_service
+
+    request = Request({'type': 'http', 'headers': [], 'state': {}})
+    injector = AuthUserContextInjector()
+
+    with (
+        patch(
+            'openhands.app_server.config.get_global_config',
+            return_value=SimpleNamespace(trusted_identity=object()),
+        ),
+        patch(
+            'openhands.app_server.config.get_trusted_identity_service',
+            side_effect=trusted_identity_context,
+        ),
+        patch(
+            'openhands.app_server.user.auth_user_context.get_user_auth',
+            AsyncMock(),
+        ) as get_user_auth,
+        pytest.raises(AuthError, match='Invalid trusted identity assertion'),
+    ):
+        async with injector.context(request.state, request):
+            pass
+
+    get_user_auth.assert_not_awaited()
 
 
 def test_azure_workload_identity_uses_cached_default_credential_provider():

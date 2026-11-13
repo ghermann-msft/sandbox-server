@@ -39,8 +39,11 @@ class AuthUserContext(UserContext):
     _resolved_user_info: UserInfo | None = None
     _provider_handler: ProviderHandler | None = None
     managed_llm: LLM | None = field(default=None, kw_only=True)
+    trusted_user_id: str | None = field(default=None, kw_only=True)
 
     async def get_user_id(self) -> str | None:
+        if self.trusted_user_id is not None:
+            return self.trusted_user_id
         # If you have an auth object here you are logged in. If user_id is None
         # it means we are in OpenHands (OSS mode).
         user_id = await self.user_auth.get_user_id()
@@ -230,10 +233,22 @@ class AuthUserContextInjector(UserContextInjector):
         if user_context is None:
             if request is None:
                 raise AuthError()
+            from openhands.app_server.config import (
+                get_global_config,
+                get_trusted_identity_service,
+            )
+
+            trusted_user_id = None
+            if get_global_config().trusted_identity is not None:
+                async with get_trusted_identity_service(
+                    state, request
+                ) as identity_service:
+                    trusted_user_id = identity_service.verify_request(request).object_id
             user_auth = await get_user_auth(request)
             user_context = AuthUserContext(
                 user_auth=user_auth,
                 managed_llm=self.managed_llm,
+                trusted_user_id=trusted_user_id,
             )
             setattr(state, USER_CONTEXT_ATTR, user_context)
 
