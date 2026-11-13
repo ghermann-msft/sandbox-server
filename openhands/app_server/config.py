@@ -430,16 +430,14 @@ def config_from_env() -> AppServerConfig:
 
     if config.user is None:
         managed_llm = load_server_managed_llm(config.allow_user_llm_configuration)
-        config.user = AuthUserContextInjector(managed_llm=managed_llm)
+        config.user = AuthUserContextInjector.with_managed_llm(managed_llm)
 
     if config.trusted_identity is None:
         assertion_secret = os.getenv('OH_TRUSTED_IDENTITY_ASSERTION_SECRET')
         if assertion_secret:
             config.trusted_identity = TrustedIdentityServiceInjector(
                 secret=SecretStr(assertion_secret),
-                issuer=os.getenv(
-                    'OH_TRUSTED_IDENTITY_ASSERTION_ISSUER', 'halo-bff'
-                ),
+                issuer=os.getenv('OH_TRUSTED_IDENTITY_ASSERTION_ISSUER', 'halo-bff'),
                 audience=os.getenv(
                     'OH_TRUSTED_IDENTITY_ASSERTION_AUDIENCE',
                     'openhands-sandbox-server',

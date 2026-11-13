@@ -2,9 +2,10 @@ import os
 from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
-from openhands.sdk.llm import LLM
 from pydantic import ValidationError
 
+from openhands.agent_server.env_parser import from_env
+from openhands.app_server.config import AppServerConfig
 from openhands.app_server.settings.server_managed_llm import (
     AZURE_OPENAI_SCOPE,
     ServerManagedLLM,
@@ -15,6 +16,7 @@ from openhands.app_server.user.auth_user_context import (
     AuthUserContext,
     AuthUserContextInjector,
 )
+from openhands.sdk.llm import LLM
 
 
 def _managed_llm() -> ServerManagedLLM:
@@ -37,12 +39,15 @@ def _clean_env() -> dict[str, str]:
             'TMPDIR',
             'TMP',
             'TEMP',
+            'USERPROFILE',
+            'HOMEDRIVE',
+            'HOMEPATH',
         ]
         if key in os.environ
     }
 
 
-def test_managed_mode_builds_server_managed_llm_from_environment():
+def test_managed_mode_parses_app_config_and_builds_injector():
     env = _clean_env()
     env.update(
         {
@@ -55,13 +60,18 @@ def test_managed_mode_builds_server_managed_llm_from_environment():
     )
 
     with patch.dict(os.environ, env, clear=True):
-        managed_llm = load_server_managed_llm(False)
+        config = from_env(AppServerConfig, 'OH')
+        managed_llm = load_server_managed_llm(config.allow_user_llm_configuration)
+        injector = AuthUserContextInjector.with_managed_llm(managed_llm)
 
+    assert config.allow_user_llm_configuration is False
     assert managed_llm is not None
     assert managed_llm.model == 'azure/gpt-5.6-sol'
     assert managed_llm.base_url == 'https://halo.openai.azure.com'
     assert managed_llm.api_version == '2025-04-01-preview'
     assert managed_llm.auth_type == 'azure_workload_identity'
+    assert injector.managed_llm is managed_llm
+    assert 'managed_llm' not in AuthUserContextInjector.model_fields
 
 
 def test_user_managed_mode_does_not_load_deployment_llm():
@@ -80,7 +90,7 @@ def test_managed_mode_requires_deployment_model():
 def test_auth_user_context_injector_accepts_managed_llm():
     managed_llm = _managed_llm()
 
-    injector = AuthUserContextInjector(managed_llm=managed_llm)
+    injector = AuthUserContextInjector.with_managed_llm(managed_llm)
 
     assert injector.managed_llm is managed_llm
 

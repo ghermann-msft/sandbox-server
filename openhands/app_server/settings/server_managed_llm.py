@@ -2,9 +2,10 @@ from collections.abc import Callable
 from typing import Any, Literal
 
 from azure.identity import DefaultAzureCredential, get_bearer_token_provider
+from pydantic import BaseModel, Field, PrivateAttr, SecretStr
+
 from openhands.agent_server.env_parser import from_env
 from openhands.sdk.llm import LLM
-from pydantic import BaseModel, Field, PrivateAttr, SecretStr
 
 AZURE_OPENAI_SCOPE = 'https://cognitiveservices.azure.com/.default'
 
@@ -20,7 +21,7 @@ class ServerManagedLLMEnvironment(BaseModel):
 class ServerManagedLLM(LLM):
     """Deployment-managed LLM configuration for app-server launches."""
 
-    auth_type: Literal['api_key', 'subscription', 'azure_workload_identity'] = Field(
+    auth_type: Literal['api_key', 'subscription', 'azure_workload_identity'] = Field(  # type: ignore[assignment]
         default='api_key', description='Authentication mode for the LLM.'
     )
     _azure_ad_token_provider: Callable[[], str] | None = PrivateAttr(default=None)

@@ -6,9 +6,6 @@ from typing import Any, AsyncGenerator, cast
 from uuid import UUID
 
 from fastapi import Request
-from openhands.sdk.llm import LLM
-from openhands.sdk.secret import SecretSource, StaticSecret
-from openhands.sdk.settings import OpenHandsAgentSettings
 from pydantic import PrivateAttr, SecretStr
 
 from openhands.app_server.errors import AuthError
@@ -23,6 +20,9 @@ from openhands.app_server.user.specifiy_user_context import USER_CONTEXT_ATTR
 from openhands.app_server.user.user_context import UserContext, UserContextInjector
 from openhands.app_server.user.user_models import UserInfo
 from openhands.app_server.user_auth.user_auth import UserAuth, get_user_auth
+from openhands.sdk.llm import LLM
+from openhands.sdk.secret import SecretSource, StaticSecret
+from openhands.sdk.settings import OpenHandsAgentSettings
 
 USER_AUTH_ATTR = 'user_auth'
 _logger = logging.getLogger(__name__)
@@ -204,7 +204,17 @@ USER_ID_ATTR = 'user_id'
 
 class AuthUserContextInjector(UserContextInjector):
     _user_auth_class: Any = PrivateAttr(default=None)
-    managed_llm: LLM | None = None
+    _managed_llm: LLM | None = PrivateAttr(default=None)
+
+    @classmethod
+    def with_managed_llm(cls, managed_llm: LLM | None) -> 'AuthUserContextInjector':
+        injector = cls()
+        injector._managed_llm = managed_llm
+        return injector
+
+    @property
+    def managed_llm(self) -> LLM | None:
+        return self._managed_llm
 
     async def inject(
         self, state: InjectorState, request: Request | None = None
