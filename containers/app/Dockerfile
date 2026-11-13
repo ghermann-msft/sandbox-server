@@ -22,6 +22,7 @@ RUN apt-get update -y \
 COPY pyproject.toml poetry.lock ./
 RUN touch README.md \
     && poetry install --no-root \
+    && mkdir -p /tmp/runtime-openhands/openhands \
     && if [ -n "${SOFTWARE_AGENT_SDK_REF}" ]; then \
         git init /tmp/software-agent-sdk \
         && git -C /tmp/software-agent-sdk remote add origin "${SOFTWARE_AGENT_SDK_REPOSITORY}" \
@@ -34,17 +35,19 @@ RUN touch README.md \
         && uv pip install --python /app/.venv/bin/python \
             --requirements sdk-requirements.txt \
             --reinstall-package fastmcp --reinstall-package fastmcp-slim --strict \
-        && /app/.venv/bin/python -c \
-            "from fastmcp import Client; import openhands.sdk.mcp.client; import openhands.agent_server.models" \
+        && uv pip install --python /app/.venv/bin/python \
+            --target /tmp/runtime-openhands --no-deps \
+            /tmp/software-agent-sdk/openhands-sdk \
+            /tmp/software-agent-sdk/openhands-tools \
+            /tmp/software-agent-sdk/openhands-agent-server \
+        && test -d /tmp/runtime-openhands/openhands/sdk \
+        && test -d /tmp/runtime-openhands/openhands/agent_server \
+        && rm -f /tmp/runtime-openhands/openhands/__init__.py \
+        && rm -rf /tmp/software-agent-sdk \
         && cd /app \
-        && rm -rf /tmp/software-agent-sdk; \
+        && PYTHONPATH=/tmp/runtime-openhands /app/.venv/bin/python -c \
+            "from fastmcp import Client; import openhands.sdk.mcp.client; import openhands.agent_server.models"; \
     fi \
-    && OPENHANDS_NAMESPACE_DIR=$(/app/.venv/bin/python -c \
-        "import site; print(f'{site.getsitepackages()[0]}/openhands')") \
-    && test -d "${OPENHANDS_NAMESPACE_DIR}" \
-    && mkdir -p /tmp/runtime-openhands \
-    && cp -a "${OPENHANDS_NAMESPACE_DIR}/." /tmp/runtime-openhands/ \
-    && rm -f /tmp/runtime-openhands/__init__.py \
     && rm -rf "${POETRY_CACHE_DIR}"
 
 FROM base AS openhands-sandbox-server
@@ -89,7 +92,7 @@ RUN python -m pip install --no-cache-dir "pip==${PIP_VERSION}" \
 
 COPY --chown=openhands:openhands --chmod=770 skills skills
 COPY --chown=openhands:openhands --chmod=770 openhands openhands
-COPY --chown=openhands:openhands --chmod=770 --from=backend-builder /tmp/runtime-openhands/ openhands/
+COPY --chown=openhands:openhands --chmod=770 --from=backend-builder /tmp/runtime-openhands/openhands/ openhands/
 COPY --chown=openhands:openhands pyproject.toml poetry.lock README.md MANIFEST.in LICENSE ./
 COPY --chown=openhands:openhands --chmod=770 containers/app/entrypoint.sh /app/entrypoint.sh
 

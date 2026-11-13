@@ -5,6 +5,9 @@ DOCKERFILE = Path(__file__).parents[2] / 'containers' / 'app' / 'Dockerfile'
 
 def test_software_agent_sdk_override_is_opt_in_and_uses_one_checkout():
     dockerfile = DOCKERFILE.read_text()
+    checkout_removal = 'rm -rf /tmp/software-agent-sdk'
+    app_workdir = 'cd /app'
+    builder_smoke = 'PYTHONPATH=/tmp/runtime-openhands /app/.venv/bin/python -c'
 
     assert (
         'ARG SOFTWARE_AGENT_SDK_REPOSITORY='
@@ -22,9 +25,19 @@ def test_software_agent_sdk_override_is_opt_in_and_uses_one_checkout():
     assert '--reinstall-package fastmcp --reinstall-package fastmcp-slim' in dockerfile
     assert '/app/.venv/bin/python -c' in dockerfile
     assert 'poetry run python -c' not in dockerfile
+    assert '--target /tmp/runtime-openhands --no-deps' in dockerfile
+    assert '/tmp/software-agent-sdk/openhands-sdk' in dockerfile
+    assert '/tmp/software-agent-sdk/openhands-tools' in dockerfile
+    assert '/tmp/software-agent-sdk/openhands-agent-server' in dockerfile
+    assert 'test -d /tmp/runtime-openhands/openhands/sdk' in dockerfile
+    assert 'test -d /tmp/runtime-openhands/openhands/agent_server' in dockerfile
+    assert checkout_removal in dockerfile
+    assert builder_smoke in dockerfile
     assert 'from fastmcp import Client' in dockerfile
     assert 'import openhands.sdk.mcp.client' in dockerfile
     assert 'import openhands.agent_server.models' in dockerfile
+    assert dockerfile.index(checkout_removal) < dockerfile.index(app_workdir)
+    assert dockerfile.index(app_workdir) < dockerfile.index(builder_smoke)
 
 
 def test_runtime_image_merges_and_imports_the_openhands_namespace():
@@ -33,16 +46,15 @@ def test_runtime_image_merges_and_imports_the_openhands_namespace():
     source_copy = 'COPY --chown=openhands:openhands --chmod=770 openhands openhands'
     namespace_copy = (
         'COPY --chown=openhands:openhands --chmod=770 '
-        '--from=backend-builder /tmp/runtime-openhands/ openhands/'
+        '--from=backend-builder /tmp/runtime-openhands/openhands/ openhands/'
     )
     final_smoke = (
         '"import openhands.app_server.app; import openhands.sdk; '
         'import openhands.agent_server.models"'
     )
 
-    assert 'OPENHANDS_NAMESPACE_DIR=$(/app/.venv/bin/python -c' in dockerfile
-    assert 'cp -a "${OPENHANDS_NAMESPACE_DIR}/." /tmp/runtime-openhands/' in dockerfile
-    assert 'rm -f /tmp/runtime-openhands/__init__.py' in dockerfile
+    assert 'cp -a "${OPENHANDS_NAMESPACE_DIR}/."' not in dockerfile
+    assert 'rm -f /tmp/runtime-openhands/openhands/__init__.py' in dockerfile
     assert source_copy in dockerfile
     assert namespace_copy in dockerfile
     assert final_smoke in dockerfile
