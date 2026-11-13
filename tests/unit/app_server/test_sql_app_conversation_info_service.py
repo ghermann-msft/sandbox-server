@@ -10,6 +10,7 @@ from typing import AsyncGenerator
 from uuid import uuid4
 
 import pytest
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.pool import StaticPool
 
@@ -20,6 +21,7 @@ from openhands.app_server.app_conversation.app_conversation_models import (
 )
 from openhands.app_server.app_conversation.sql_app_conversation_info_service import (
     SQLAppConversationInfoService,
+    StoredConversationMetadata,
 )
 from openhands.app_server.integrations.service_types import ProviderType
 from openhands.app_server.user.specifiy_user_context import SpecifyUserContext
@@ -152,6 +154,10 @@ class TestSQLAppConversationInfoService:
         # Verify the retrieved info matches the original
         assert retrieved_info is not None
         assert retrieved_info.id == sample_conversation_info.id
+        assert (
+            retrieved_info.created_by_user_id
+            == sample_conversation_info.created_by_user_id
+        )
         assert retrieved_info.sandbox_id == sample_conversation_info.sandbox_id
         assert (
             retrieved_info.selected_repository
@@ -1377,3 +1383,60 @@ class TestCreatedAtPreservation:
         stored = await service.get_app_conversation_info(conversation_id)
         assert stored is not None
         assert stored.created_at == created_at
+
+
+class TestCreatedByUserPreservation:
+    @pytest.mark.asyncio
+    async def test_created_by_user_id_is_persisted_and_hydrated(
+        self,
+        service: SQLAppConversationInfoService,
+        async_session: AsyncSession,
+    ):
+        conversation_id = uuid4()
+        await service.save_app_conversation_info(
+            AppConversationInfo(
+                id=conversation_id,
+                created_by_user_id='owner-123',
+                sandbox_id='sandbox-123',
+            )
+        )
+
+        stored_user_id = await async_session.scalar(
+            select(StoredConversationMetadata.user_id).where(
+                StoredConversationMetadata.conversation_id == str(conversation_id)
+            )
+        )
+        assert stored_user_id == 'owner-123'
+
+        info = await service.get_app_conversation_info(conversation_id)
+        assert info is not None
+        assert info.created_by_user_id == 'owner-123'
+
+    @pytest.mark.asyncio
+    async def test_lifecycle_upsert_preserves_created_by_user_id(
+        self,
+        service: SQLAppConversationInfoService,
+    ):
+        conversation_id = uuid4()
+        await service.save_app_conversation_info(
+            AppConversationInfo(
+                id=conversation_id,
+                created_by_user_id='owner-123',
+                sandbox_id='sandbox-123',
+                title='Original',
+            )
+        )
+
+        await service.save_app_conversation_info(
+            AppConversationInfo(
+                id=conversation_id,
+                created_by_user_id=None,
+                sandbox_id='sandbox-123',
+                title='Updated by lifecycle webhook',
+            )
+        )
+
+        info = await service.get_app_conversation_info(conversation_id)
+        assert info is not None
+        assert info.created_by_user_id == 'owner-123'
+        assert info.title == 'Updated by lifecycle webhook'

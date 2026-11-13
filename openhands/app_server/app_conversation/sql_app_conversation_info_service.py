@@ -135,6 +135,7 @@ class StoredConversationMetadata(Base):
     conversation_id: Mapped[str] = mapped_column(
         String, primary_key=True, default=lambda: str(uuid.uuid4())
     )
+    user_id: Mapped[str | None] = mapped_column(String, nullable=True)
     selected_repository: Mapped[str | None] = mapped_column(String, nullable=True)
     selected_branch: Mapped[str | None] = mapped_column(String, nullable=True)
     git_provider: Mapped[str | None] = mapped_column(
@@ -457,16 +458,23 @@ class SQLAppConversationInfoService(AppConversationInfoService):
         # stored value directly by primary key (not via ``_secure_select``) so
         # this works under the ADMIN webhook context as well.
         created_at = info.created_at
-        existing_created_at = await self.db_session.scalar(
-            select(StoredConversationMetadata.created_at).where(
-                StoredConversationMetadata.conversation_id == str(info.id)
+        created_by_user_id = info.created_by_user_id
+        existing = (
+            await self.db_session.execute(
+                select(
+                    StoredConversationMetadata.created_at,
+                    StoredConversationMetadata.user_id,
+                ).where(StoredConversationMetadata.conversation_id == str(info.id))
             )
-        )
-        if existing_created_at is not None:
-            created_at = existing_created_at
+        ).one_or_none()
+        if existing is not None:
+            created_at = existing.created_at
+            if created_by_user_id is None:
+                created_by_user_id = existing.user_id
 
         stored = StoredConversationMetadata(
             conversation_id=str(info.id),
+            user_id=created_by_user_id,
             selected_repository=info.selected_repository,
             selected_branch=info.selected_branch,
             git_provider=info.git_provider.value if info.git_provider else None,
@@ -790,7 +798,7 @@ class SQLAppConversationInfoService(AppConversationInfoService):
 
         return AppConversationInfo(
             id=UUID(stored.conversation_id),
-            created_by_user_id=None,  # User ID is now stored in ConversationMetadataSaas
+            created_by_user_id=stored.user_id,
             sandbox_id=sandbox_id,  # Use the asserted non-None value
             selected_repository=stored.selected_repository,
             selected_branch=stored.selected_branch,

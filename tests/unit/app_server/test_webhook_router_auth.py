@@ -380,6 +380,31 @@ class TestValidConversation:
             )
 
     @pytest.mark.asyncio
+    async def test_valid_conversation_missing_owner_raises_auth_error(self):
+        conversation_id = uuid4()
+        sandbox_record = SandboxRecord(
+            id='sandbox-123',
+            created_by_user_id='user-123',
+        )
+        missing_owner_info = MagicMock()
+        missing_owner_info.created_by_user_id = None
+        missing_owner_info.sandbox_id = sandbox_record.id
+
+        mock_service = AsyncMock()
+        mock_service.get_app_conversation_info = AsyncMock(
+            return_value=missing_owner_info
+        )
+
+        from openhands.app_server.errors import AuthError
+
+        with pytest.raises(AuthError):
+            await call_valid_conversation(
+                conversation_id,
+                sandbox_record,
+                mock_service,
+            )
+
+    @pytest.mark.asyncio
     async def test_valid_conversation_same_user_succeeds(self):
         """Test that conversation from same user succeeds."""
         # Arrange
