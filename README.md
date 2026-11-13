@@ -60,7 +60,9 @@ docker build \
 ```
 
 `SOFTWARE_AGENT_SDK_REF` is opt-in. When it is empty, the Docker build uses the
-locked release packages without cloning software-agent-sdk.
+locked release packages without cloning software-agent-sdk. When set, the build
+uses that revision's `uv.lock` for the complete Agent Server dependency graph
+and runs an Agent Server/SDK import smoke test.
 
 ## Extraction provenance
 

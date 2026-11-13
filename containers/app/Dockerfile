@@ -12,11 +12,12 @@ ENV PYTHONPATH=/app \
     POETRY_CACHE_DIR=/tmp/poetry_cache
 
 ARG POETRY_VERSION=2.3.4
+ARG UV_VERSION=0.13.7
 ARG SOFTWARE_AGENT_SDK_REPOSITORY=https://github.com/OpenHands/software-agent-sdk.git
 ARG SOFTWARE_AGENT_SDK_REF=
 RUN apt-get update -y \
     && apt-get install -y curl make git build-essential jq gettext \
-    && python3 -m pip install "poetry==${POETRY_VERSION}" --break-system-packages
+    && python3 -m pip install "poetry==${POETRY_VERSION}" "uv==${UV_VERSION}" --break-system-packages
 
 COPY pyproject.toml poetry.lock ./
 RUN touch README.md \
@@ -26,11 +27,16 @@ RUN touch README.md \
         && git -C /tmp/software-agent-sdk remote add origin "${SOFTWARE_AGENT_SDK_REPOSITORY}" \
         && git -C /tmp/software-agent-sdk fetch --depth 1 origin "${SOFTWARE_AGENT_SDK_REF}" \
         && git -C /tmp/software-agent-sdk checkout --detach FETCH_HEAD \
-        && poetry run python -m pip install --upgrade \
-            /tmp/software-agent-sdk/openhands-sdk \
-            /tmp/software-agent-sdk/openhands-tools \
-            /tmp/software-agent-sdk/openhands-agent-server \
-        && poetry run python -m pip check \
+        && cd /tmp/software-agent-sdk \
+        && uv export --frozen --no-dev \
+            --package openhands-agent-server --no-editable --no-hashes \
+            --output-file sdk-requirements.txt \
+        && uv pip install --python /app/.venv/bin/python \
+            --requirements sdk-requirements.txt \
+            --reinstall-package fastmcp --reinstall-package fastmcp-slim --strict \
+        && poetry run python -c \
+            "from fastmcp import Client; import openhands.sdk.mcp.client; import openhands.agent_server.models" \
+        && cd /app \
         && rm -rf /tmp/software-agent-sdk; \
     fi \
     && rm -rf "${POETRY_CACHE_DIR}"
