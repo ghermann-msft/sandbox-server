@@ -39,6 +39,12 @@ RUN touch README.md \
         && cd /app \
         && rm -rf /tmp/software-agent-sdk; \
     fi \
+    && OPENHANDS_NAMESPACE_DIR=$(/app/.venv/bin/python -c \
+        "import site; print(f'{site.getsitepackages()[0]}/openhands')") \
+    && test -d "${OPENHANDS_NAMESPACE_DIR}" \
+    && mkdir -p /tmp/runtime-openhands \
+    && cp -a "${OPENHANDS_NAMESPACE_DIR}/." /tmp/runtime-openhands/ \
+    && rm -f /tmp/runtime-openhands/__init__.py \
     && rm -rf "${POETRY_CACHE_DIR}"
 
 FROM base AS openhands-sandbox-server
@@ -83,8 +89,12 @@ RUN python -m pip install --no-cache-dir "pip==${PIP_VERSION}" \
 
 COPY --chown=openhands:openhands --chmod=770 skills skills
 COPY --chown=openhands:openhands --chmod=770 openhands openhands
+COPY --chown=openhands:openhands --chmod=770 --from=backend-builder /tmp/runtime-openhands/ openhands/
 COPY --chown=openhands:openhands pyproject.toml poetry.lock README.md MANIFEST.in LICENSE ./
 COPY --chown=openhands:openhands --chmod=770 containers/app/entrypoint.sh /app/entrypoint.sh
+
+RUN /app/.venv/bin/python -c \
+    "import openhands.app_server.app; import openhands.sdk; import openhands.agent_server.models"
 
 ENTRYPOINT ["/app/entrypoint.sh"]
 CMD ["uvicorn", "openhands.app_server.app:app", "--host", "0.0.0.0", "--port", "3000"]
