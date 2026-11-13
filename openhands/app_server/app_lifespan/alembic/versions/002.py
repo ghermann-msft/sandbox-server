@@ -26,13 +26,20 @@ class EventCallbackStatus(Enum):
     ERROR = 'ERROR'
 
 
+event_callback_status = sa.Enum(
+    EventCallbackStatus,
+    name='eventcallbackstatus',
+)
+
+
 def upgrade() -> None:
     """Upgrade schema."""
+    event_callback_status.create(op.get_bind(), checkfirst=True)
     op.add_column(
         'event_callback',
         sa.Column(
             'status',
-            sa.Enum(EventCallbackStatus),
+            event_callback_status,
             nullable=False,
             server_default='ACTIVE',
         ),
@@ -59,6 +66,7 @@ def upgrade() -> None:
 def downgrade() -> None:
     """Downgrade schema."""
     op.drop_column('event_callback', 'status')
+    event_callback_status.drop(op.get_bind(), checkfirst=True)
     op.drop_column('event_callback', 'updated_at')
     op.drop_index('ix_event_callback_result_event_id')
     op.drop_column('event_callback_result', 'event_id')
