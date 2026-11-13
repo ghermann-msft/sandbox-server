@@ -33,6 +33,7 @@ from openhands.app_server.sandbox.sandbox_models import AGENT_SERVER, SandboxSta
 from openhands.app_server.sandbox.sandbox_service import (
     SESSION_API_KEY_VARIABLE,
     WEBHOOK_CALLBACK_VARIABLE,
+    WEBHOOK_HEADERS_VARIABLE,
 )
 
 
@@ -255,6 +256,9 @@ async def test_start_sandbox_creates_claim(service, custom_objects):
     assert env['LOG_JSON'] == 'true'
     assert env[WEBHOOK_CALLBACK_VARIABLE] == 'http://app-server:3000/api/v1/webhooks'
     assert env[SESSION_API_KEY_VARIABLE]
+    assert env[WEBHOOK_HEADERS_VARIABLE] == (
+        f'{{"X-Session-API-Key": "{env[SESSION_API_KEY_VARIABLE]}"}}'
+    )
 
     # A brand new sandbox is not reachable yet.
     assert info.status == SandboxStatus.STARTING

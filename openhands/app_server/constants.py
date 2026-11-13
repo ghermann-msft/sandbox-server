@@ -53,6 +53,7 @@ BLOCKED_SECRET_NAMES: frozenset[str] = frozenset(
         'ENV_LOG_LEVEL',
         # Webhook and CORS - overriding could redirect callbacks to malicious endpoints
         'OH_WEBHOOKS_0_BASE_URL',
+        'OH_WEBHOOKS_0_HEADERS',
         'OH_ALLOW_CORS_ORIGINS_0',
         # Worker ports - could break web application functionality
         'WORKER_1',

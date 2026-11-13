@@ -20,6 +20,7 @@ the agent server.
 import asyncio
 import hashlib
 import hmac
+import json
 import logging
 import os
 import re
@@ -53,6 +54,7 @@ from openhands.app_server.sandbox.sandbox_models import (
 from openhands.app_server.sandbox.sandbox_service import (
     SESSION_API_KEY_VARIABLE,
     WEBHOOK_CALLBACK_VARIABLE,
+    WEBHOOK_HEADERS_VARIABLE,
     SandboxService,
     SandboxServiceInjector,
 )
@@ -609,6 +611,9 @@ class KubernetesSandboxService(SandboxService):
         if self.inject_session_key:
             session_api_key = base62.encodebytes(os.urandom(32))
             env_vars[SESSION_API_KEY_VARIABLE] = session_api_key
+            env_vars[WEBHOOK_HEADERS_VARIABLE] = json.dumps(
+                {'X-Session-API-Key': session_api_key}
+            )
             labels[SESSION_KEY_HASH_LABEL] = self._session_key_hash(session_api_key)
 
         # The warm pool selects the SandboxTemplate (and therefore the image); when
