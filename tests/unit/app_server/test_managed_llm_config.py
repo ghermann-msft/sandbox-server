@@ -13,6 +13,7 @@ from openhands.app_server.settings.server_managed_llm import (
 from openhands.app_server.settings.settings_models import Settings
 from openhands.app_server.user.auth_user_context import (
     AuthUserContext,
+    AuthUserContextInjector,
 )
 
 
@@ -74,6 +75,14 @@ def test_managed_mode_requires_deployment_model():
         pytest.raises(ValidationError),
     ):
         load_server_managed_llm(False)
+
+
+def test_auth_user_context_injector_accepts_managed_llm():
+    managed_llm = _managed_llm()
+
+    injector = AuthUserContextInjector(managed_llm=managed_llm)
+
+    assert injector.managed_llm is managed_llm
 
 
 def test_azure_workload_identity_uses_cached_default_credential_provider():

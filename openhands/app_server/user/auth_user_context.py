@@ -204,9 +204,7 @@ USER_ID_ATTR = 'user_id'
 
 class AuthUserContextInjector(UserContextInjector):
     _user_auth_class: Any = PrivateAttr(default=None)
-
-    def __init__(self, managed_llm: LLM | None = None):
-        self.managed_llm = managed_llm
+    managed_llm: LLM | None = None
 
     async def inject(
         self, state: InjectorState, request: Request | None = None
