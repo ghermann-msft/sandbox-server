@@ -34,7 +34,7 @@ RUN touch README.md \
         && uv pip install --python /app/.venv/bin/python \
             --requirements sdk-requirements.txt \
             --reinstall-package fastmcp --reinstall-package fastmcp-slim --strict \
-        && poetry run python -c \
+        && /app/.venv/bin/python -c \
             "from fastmcp import Client; import openhands.sdk.mcp.client; import openhands.agent_server.models" \
         && cd /app \
         && rm -rf /tmp/software-agent-sdk; \

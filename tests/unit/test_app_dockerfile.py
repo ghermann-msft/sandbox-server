@@ -20,6 +20,8 @@ def test_software_agent_sdk_override_is_opt_in_and_uses_one_checkout():
     assert 'uv export --frozen --no-dev' in dockerfile
     assert '--package openhands-agent-server --no-editable --no-hashes' in dockerfile
     assert '--reinstall-package fastmcp --reinstall-package fastmcp-slim' in dockerfile
+    assert '/app/.venv/bin/python -c' in dockerfile
+    assert 'poetry run python -c' not in dockerfile
     assert 'from fastmcp import Client' in dockerfile
     assert 'import openhands.sdk.mcp.client' in dockerfile
     assert 'import openhands.agent_server.models' in dockerfile
