@@ -1790,6 +1790,7 @@ class TestLiveStatusAppConversationService:
         """Built-in sub-agents are registered when the user setting is on."""
         from openhands.sdk.settings import OpenHandsAgentSettings
         from openhands.sdk.subagent.schema import AgentDefinition
+        from openhands.sdk.tool import SUB_AGENT_TOOL_NAME, Tool
 
         agent_definition = AgentDefinition(
             name='general-purpose',
@@ -1798,10 +1799,14 @@ class TestLiveStatusAppConversationService:
         )
         mock_get_agent_definitions.return_value = [agent_definition]
 
-        agent_settings = OpenHandsAgentSettings(
-            llm={'model': 'gpt-4', 'api_key': 'test-key'},
-            enable_sub_agents=True,
-        )
+        agent_settings_kwargs = {
+            'llm': {'model': 'gpt-4', 'api_key': 'test-key'},
+        }
+        if 'enable_sub_agents' in OpenHandsAgentSettings.model_fields:
+            agent_settings_kwargs['enable_sub_agents'] = True
+        else:
+            agent_settings_kwargs['tools'] = [Tool(name=SUB_AGENT_TOOL_NAME)]
+        agent_settings = OpenHandsAgentSettings(**agent_settings_kwargs)
         self.mock_user.agent_settings = agent_settings
         self.mock_user_context.get_user_info.return_value = self.mock_user
 
@@ -1821,7 +1826,12 @@ class TestLiveStatusAppConversationService:
 
         mock_register_builtins.assert_called_once_with(enable_browser=True)
         mock_get_agent_definitions.assert_called_once_with()
-        mock_tools.assert_called_once_with(enable_browser=True, enable_sub_agents=True)
+        if 'enable_sub_agents' in OpenHandsAgentSettings.model_fields:
+            mock_tools.assert_called_once_with(
+                enable_browser=True, enable_sub_agents=True
+            )
+        else:
+            mock_tools.assert_not_called()
         assert result.agent_definitions == [agent_definition]
 
     @patch(
@@ -1840,11 +1850,16 @@ class TestLiveStatusAppConversationService:
     ):
         """Built-in sub-agents are registered but not forwarded when disabled."""
         from openhands.sdk.settings import OpenHandsAgentSettings
+        from openhands.sdk.tool import Tool
 
-        agent_settings = OpenHandsAgentSettings(
-            llm={'model': 'gpt-4', 'api_key': 'test-key'},
-            enable_sub_agents=False,
-        )
+        agent_settings_kwargs = {
+            'llm': {'model': 'gpt-4', 'api_key': 'test-key'},
+        }
+        if 'enable_sub_agents' in OpenHandsAgentSettings.model_fields:
+            agent_settings_kwargs['enable_sub_agents'] = False
+        else:
+            agent_settings_kwargs['tools'] = [Tool(name='terminal')]
+        agent_settings = OpenHandsAgentSettings(**agent_settings_kwargs)
         self.mock_user.agent_settings = agent_settings
         self.mock_user_context.get_user_info.return_value = self.mock_user
 
@@ -1864,7 +1879,12 @@ class TestLiveStatusAppConversationService:
 
         mock_register_builtins.assert_called_once_with(enable_browser=True)
         mock_get_agent_definitions.assert_not_called()
-        mock_tools.assert_called_once_with(enable_browser=True, enable_sub_agents=False)
+        if 'enable_sub_agents' in OpenHandsAgentSettings.model_fields:
+            mock_tools.assert_called_once_with(
+                enable_browser=True, enable_sub_agents=False
+            )
+        else:
+            mock_tools.assert_not_called()
         assert result.agent_definitions == []
 
     @patch(

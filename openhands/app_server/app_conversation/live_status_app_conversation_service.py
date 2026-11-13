@@ -96,6 +96,7 @@ from openhands.app_server.sandbox.sandbox_spec_service import (
 )
 from openhands.app_server.services.injector import InjectorState
 from openhands.app_server.services.jwt_service import JwtService
+from openhands.app_server.settings.agent_tools import effective_agent_tools
 from openhands.app_server.settings.llm_profiles import resolve_profile_llm
 from openhands.app_server.settings.marketplace_composition import (
     load_composed_marketplaces,
@@ -2056,11 +2057,16 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
             tools = get_planning_tools(plan_path=plan_path)
         else:
             register_builtins_agents(enable_browser=True)
-            tools = get_default_tools(
-                enable_browser=True,
-                enable_sub_agents=user.agent_settings.enable_sub_agents,
-            )
-            if user.agent_settings.enable_sub_agents:
+            effective_tools = effective_agent_tools(user.agent_settings)
+            if effective_tools.use_default_tools:
+                tools = get_default_tools(
+                    enable_browser=True,
+                    enable_sub_agents=effective_tools.sub_agents_enabled,
+                )
+            else:
+                assert effective_tools.tools is not None
+                tools = effective_tools.tools
+            if effective_tools.sub_agents_enabled:
                 agent_definitions = list(get_registered_agent_definitions())
 
         # --- build AgentSettings and create agent ---------------------------

@@ -17,6 +17,7 @@ from openhands.app_server.user.auth_user_context import (
     AuthUserContextInjector,
 )
 from openhands.sdk.llm import LLM
+from openhands.sdk.tool import SUB_AGENT_TOOL_NAME, Tool
 
 
 def _managed_llm() -> ServerManagedLLM:
@@ -161,6 +162,10 @@ async def test_absent_settings_use_server_managed_llm():
     assert user_info.agent_settings.llm is managed_llm
     assert user_info.agent_settings.llm.model == 'azure/gpt-5.6-sol'
     assert user_info.agent_settings.llm.auth_type == 'azure_workload_identity'
+    assert any(
+        tool.name == SUB_AGENT_TOOL_NAME
+        for tool in user_info.agent_settings.tools or []
+    )
 
 
 @pytest.mark.asyncio
@@ -178,6 +183,35 @@ async def test_managed_llm_is_authoritative_over_persisted_settings():
     user_info = await ctx.get_user_info(resolve_agent_profile=True)
 
     assert user_info.agent_settings.llm is managed_llm
+    if 'enable_sub_agents' in user_info.agent_settings.model_fields:
+        assert user_info.agent_settings.enable_sub_agents is True
+    else:
+        assert any(
+            tool.name == SUB_AGENT_TOOL_NAME
+            for tool in user_info.agent_settings.tools or []
+        )
+
+
+@pytest.mark.asyncio
+async def test_managed_llm_does_not_overwrite_user_managed_profile_tools():
+    user_auth = AsyncMock()
+    user_auth.get_user_id = AsyncMock(return_value='entra-object-id')
+    user_auth.get_user_settings = AsyncMock(
+        return_value=Settings(
+            active_agent_profile_id='00000000-0000-0000-0000-000000000001',
+            agent_settings={
+                'llm': {'model': 'user/model', 'api_key': 'secret'},
+                'tools': [Tool(name='terminal')],
+            },
+        )
+    )
+    managed_llm = _managed_llm()
+    ctx = AuthUserContext(user_auth=user_auth, managed_llm=managed_llm)
+
+    user_info = await ctx.get_user_info(resolve_agent_profile=True)
+
+    assert user_info.agent_settings.llm is managed_llm
+    assert [tool.name for tool in user_info.agent_settings.tools or []] == ['terminal']
 
 
 @pytest.mark.asyncio
