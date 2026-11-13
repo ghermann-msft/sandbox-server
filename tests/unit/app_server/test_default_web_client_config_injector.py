@@ -4,7 +4,40 @@ This module tests environment variable handling in DefaultWebClientConfigInjecto
 """
 
 import os
+from dataclasses import asdict, fields
 from unittest.mock import patch
+
+
+def test_acp_provider_config_matches_installed_sdk_schema():
+    from openhands.app_server.web_client.default_web_client_config_injector import (
+        DefaultWebClientConfigInjector,
+        _to_acp_provider_config,
+    )
+    from openhands.sdk.settings import ACP_PROVIDERS
+
+    provider = next(iter(ACP_PROVIDERS.values()))
+    config = _to_acp_provider_config(provider)
+    provider_fields = {field.name for field in fields(provider)}
+
+    assert config.key == provider.key
+    assert config.display_name == provider.display_name
+    assert config.default_command == list(provider.default_command)
+    assert config.api_key_env_var == provider.api_key_env_var
+    assert config.base_url_env_var == provider.base_url_env_var
+
+    if {'default_model', 'available_models'} <= provider_fields:
+        provider_data = asdict(provider)
+        assert config.default_model == provider_data['default_model']
+        assert [model.model_dump() for model in config.available_models] == [
+            {'id': model['id'], 'label': model['label']}
+            for model in provider_data['available_models']
+        ]
+    else:
+        assert config.default_model is None
+        assert config.available_models == []
+
+    injector = DefaultWebClientConfigInjector()
+    assert injector.acp_providers
 
 
 class TestGetPosthogClientKey:

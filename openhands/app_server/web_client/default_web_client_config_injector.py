@@ -1,9 +1,9 @@
 import os
+from dataclasses import asdict
 from datetime import datetime
 from urllib.parse import urlparse
 
-from openhands.sdk.settings import ACP_PROVIDERS
-from pydantic import Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from openhands.app_server.integrations.jira_dc.config import (
     get_jira_dc_service_account_env_config,
@@ -19,6 +19,7 @@ from openhands.app_server.web_client.web_client_models import (
     WebClientConfig,
     WebClientFeatureFlags,
 )
+from openhands.sdk.settings import ACP_PROVIDERS, ACPProviderInfo
 
 
 def _get_recaptcha_site_key() -> str | None:
@@ -29,6 +30,60 @@ def _get_recaptcha_site_key() -> str | None:
 
 # OSS default PostHog key - used when no environment variable is configured
 _OSS_POSTHOG_KEY = 'phc_3ESMmY9SgqEAGBB6sMGK5ayYHkeUuknH2vP6FmWH9RA'
+
+
+class _ACPModelOptionSource(BaseModel):
+    id: str
+    label: str
+
+
+class _ACPProviderSource(BaseModel):
+    model_config = ConfigDict(extra='ignore')
+
+    key: str
+    display_name: str
+    default_command: tuple[str, ...]
+    api_key_env_var: str | None
+    base_url_env_var: str | None
+
+
+class _LegacyACPProviderSource(_ACPProviderSource):
+    default_model: str | None
+    available_models: tuple[_ACPModelOptionSource, ...]
+
+
+def _to_acp_provider_config(provider: ACPProviderInfo) -> ACPProviderConfig:
+    provider_data = asdict(provider)
+    legacy_fields = {'default_model', 'available_models'}
+    present_legacy_fields = legacy_fields.intersection(provider_data)
+
+    if present_legacy_fields == legacy_fields:
+        legacy_source = _LegacyACPProviderSource.model_validate(provider_data)
+        source: _ACPProviderSource = legacy_source
+        default_model = legacy_source.default_model
+        available_models = [
+            ACPModelOption(id=model.id, label=model.label)
+            for model in legacy_source.available_models
+        ]
+    elif not present_legacy_fields:
+        source = _ACPProviderSource.model_validate(provider_data)
+        default_model = None
+        available_models = []
+    else:
+        raise ValueError(
+            'ACP provider schema must define both default_model and '
+            'available_models, or neither'
+        )
+
+    return ACPProviderConfig(
+        key=source.key,
+        display_name=source.display_name,
+        default_command=list(source.default_command),
+        default_model=default_model,
+        available_models=available_models,
+        api_key_env_var=source.api_key_env_var,
+        base_url_env_var=source.base_url_env_var,
+    )
 
 
 def _get_posthog_client_key() -> str:
@@ -242,19 +297,7 @@ class DefaultWebClientConfigInjector(WebClientConfigInjector):
     )
     acp_providers: list[ACPProviderConfig] = Field(
         default_factory=lambda: [
-            ACPProviderConfig(
-                key=provider.key,
-                display_name=provider.display_name,
-                default_command=list(provider.default_command),
-                default_model=provider.default_model or None,
-                available_models=[
-                    ACPModelOption(id=m.id, label=m.label)
-                    for m in (provider.available_models or [])
-                ],
-                api_key_env_var=provider.api_key_env_var,
-                base_url_env_var=provider.base_url_env_var,
-            )
-            for provider in ACP_PROVIDERS.values()
+            _to_acp_provider_config(provider) for provider in ACP_PROVIDERS.values()
         ]
     )
 
