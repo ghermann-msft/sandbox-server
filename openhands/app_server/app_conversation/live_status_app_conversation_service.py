@@ -107,9 +107,6 @@ from openhands.app_server.settings.settings_models import (
 )
 from openhands.app_server.user.user_context import UserContext
 from openhands.app_server.user.user_models import UserInfo
-from openhands.app_server.utils.docker_utils import (
-    replace_localhost_hostname_for_docker,
-)
 from openhands.app_server.utils.git import ensure_valid_git_branch_name
 from openhands.app_server.utils.import_utils import get_impl
 from openhands.app_server.utils.llm_metadata import (
@@ -420,7 +417,7 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
             assert sandbox_id is not None
             sandbox = await self.sandbox_service.get_sandbox(sandbox_id)
             assert sandbox is not None
-            agent_server_url = self._get_agent_server_url(sandbox)
+            agent_server_url = await self.sandbox_service.get_agent_server_url(sandbox)
 
             # Mirror the user's LLM profiles into the sandbox so the agent's
             # built-in switch_llm tool can resolve them (in SaaS profiles live
@@ -720,7 +717,7 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
         if not conversation_ids:
             return []
 
-        agent_server_url = self._get_agent_server_url(sandbox)
+        agent_server_url = await self.sandbox_service.get_agent_server_url(sandbox)
         headers: dict[str, str] = {}
         if sandbox.session_api_key:
             headers['X-Session-API-Key'] = sandbox.session_api_key
@@ -1070,18 +1067,6 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
                 )
         except Exception:
             _logger.warning('Failed to prune sandbox profiles', exc_info=True)
-
-    def _get_agent_server_url(self, sandbox: SandboxInfo) -> str:
-        """Get agent server url for running sandbox."""
-        exposed_urls = sandbox.exposed_urls
-        assert exposed_urls is not None
-        agent_server_url = next(
-            exposed_url.url
-            for exposed_url in exposed_urls
-            if exposed_url.name == AGENT_SERVER
-        )
-        agent_server_url = replace_localhost_hostname_for_docker(agent_server_url)
-        return agent_server_url
 
     def _inherit_configuration_from_parent(
         self, request: AppConversationStartRequest, parent_info: AppConversationInfo
@@ -2613,12 +2598,7 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
         assert sandbox is not None, (
             f'Sandbox {app_conversation_info.sandbox_id} not found for conversation {conversation_id}'
         )
-        assert sandbox.exposed_urls is not None, (
-            f'Sandbox {app_conversation_info.sandbox_id} has no exposed URLs for conversation {conversation_id}'
-        )
-
-        # Use the existing method to get the agent-server URL
-        agent_server_url = self._get_agent_server_url(sandbox)
+        agent_server_url = await self.sandbox_service.get_agent_server_url(sandbox)
 
         # Prepare the request
         url = f'{agent_server_url.rstrip("/")}/api/conversations/{conversation_id}'
@@ -2839,8 +2819,10 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
             sandbox = await self.sandbox_service.get_sandbox(
                 app_conversation.sandbox_id
             )
-            if sandbox and sandbox.exposed_urls:
-                agent_server_url = self._get_agent_server_url(sandbox)
+            if sandbox:
+                agent_server_url = await self.sandbox_service.get_agent_server_url(
+                    sandbox
+                )
 
                 # Call agent server delete API
                 response = await self.httpx_client.delete(

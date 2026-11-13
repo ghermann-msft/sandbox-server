@@ -976,14 +976,17 @@ class TestRunEndLiveStatsPull:
         mock_info_service = AsyncMock()
         mock_event_service = AsyncMock()
 
-        conversation = SimpleNamespace(
-            conversation_url='http://localhost:12345/api/conversations/abc',
+        sandbox = SimpleNamespace(
             session_api_key='key123',
+            exposed_urls=[
+                SimpleNamespace(url='https://front-door/sandboxes/sb1', name='agent')
+            ],
         )
-        app_conv_service = AsyncMock()
-        app_conv_service.get_app_conversation.return_value = conversation
+        sandbox_service = AsyncMock()
+        sandbox_service.get_sandbox.return_value = sandbox
+        sandbox_service.get_agent_server_url.return_value = 'http://10.1.2.3:8000'
         service_ctx = MagicMock()
-        service_ctx.__aenter__ = AsyncMock(return_value=app_conv_service)
+        service_ctx.__aenter__ = AsyncMock(return_value=sandbox_service)
         service_ctx.__aexit__ = AsyncMock(return_value=False)
 
         pulled_stats = ConversationStats.model_validate(
@@ -1005,13 +1008,10 @@ class TestRunEndLiveStatsPull:
 
         with (
             patch.object(
-                webhook_router, 'get_app_conversation_service', return_value=service_ctx
-            ) as mock_get_app_conversation_service,
-            patch.object(
                 webhook_router,
-                'replace_localhost_hostname_for_docker',
-                side_effect=lambda url: url.replace('localhost', 'docker-host'),
-            ) as mock_normalize,
+                'get_sandbox_service',
+                return_value=service_ctx,
+            ) as mock_get_sandbox_service,
             patch.object(webhook_router.httpx, 'AsyncClient', return_value=client_ctx),
             patch.object(webhook_router, 'ConversationInfo') as mock_ci,
             patch(
@@ -1028,11 +1028,7 @@ class TestRunEndLiveStatsPull:
                 event_service=mock_event_service,
             )
 
-        # URL was normalized for docker-local sandboxes and used for the GET
-        mock_normalize.assert_called_once_with(
-            'http://localhost:12345/api/conversations/abc'
-        )
-        service_state = mock_get_app_conversation_service.call_args.args[0]
+        service_state = mock_get_sandbox_service.call_args.args[0]
         service_user_context = getattr(service_state, USER_CONTEXT_ATTR)
         assert service_user_context == SandboxUserContext(
             user_id=mock_info.created_by_user_id,
@@ -1040,11 +1036,13 @@ class TestRunEndLiveStatsPull:
         )
         http_client.get.assert_awaited_once()
         assert http_client.get.await_args.args[0] == (
-            'http://docker-host:12345/api/conversations/abc'
+            f'http://10.1.2.3:8000/api/conversations/{conversation_id.hex}'
         )
         assert http_client.get.await_args.kwargs['headers'] == {
             'X-Session-API-Key': 'key123'
         }
+        sandbox_service.get_agent_server_url.assert_awaited_once_with(sandbox)
+        assert sandbox.exposed_urls[0].url == 'https://front-door/sandboxes/sb1'
         # Pulled combined stats were persisted
         mock_info_service.update_conversation_statistics.assert_awaited_once_with(
             conversation_id, pulled_stats
@@ -1063,7 +1061,7 @@ class TestRunEndLiveStatsPull:
         mock_info_service = AsyncMock()
 
         with (
-            patch.object(webhook_router, 'get_app_conversation_service') as mock_svc,
+            patch.object(webhook_router, 'get_sandbox_service') as mock_svc,
             patch(
                 'openhands.app_server.event_callback.webhook_router._run_callbacks_in_bg_and_close'
             ),

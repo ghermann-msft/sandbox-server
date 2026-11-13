@@ -18,9 +18,6 @@ from openhands.app_server.event_callback.event_callback_models import (
 from openhands.app_server.event_callback.set_title_callback_processor import (
     SetTitleCallbackProcessor,
 )
-from openhands.app_server.utils.docker_utils import (
-    replace_localhost_hostname_for_docker,
-)
 from openhands.sdk import Message, MessageEvent, TextContent
 
 
@@ -51,8 +48,22 @@ async def _ctx(obj):
     yield obj
 
 
+@pytest.fixture(autouse=True)
+def sandbox_control_plane():
+    sandbox_service = AsyncMock()
+    sandbox_service.get_sandbox.return_value = object()
+    sandbox_service.get_agent_server_url.return_value = 'http://10.1.2.3:8000'
+    with patch(
+        'openhands.app_server.config.get_sandbox_service',
+        side_effect=lambda _state: _ctx(sandbox_service),
+    ):
+        yield sandbox_service
+
+
 @pytest.mark.asyncio
-async def test_set_title_callback_processor_fetches_title_from_conversation():
+async def test_set_title_callback_processor_fetches_title_from_conversation(
+    sandbox_control_plane,
+):
     conversation_id = uuid4()
     session_api_key = 'test-session-key'
     conversation_url = f'http://localhost:8000/api/conversations/{conversation_id.hex}'
@@ -121,9 +132,11 @@ async def test_set_title_callback_processor_fetches_title_from_conversation():
     assert result is not None
 
     assert len(httpx_client.calls) == 4
-    expected_url = replace_localhost_hostname_for_docker(conversation_url)
+    expected_url = f'http://10.1.2.3:8000/api/conversations/{conversation_id.hex}'
     assert httpx_client.calls[0][0] == expected_url
     assert httpx_client.calls[0][1] == {'X-Session-API-Key': session_api_key}
+    sandbox_control_plane.get_agent_server_url.assert_awaited_once()
+    assert app_conversation.conversation_url == conversation_url
 
     app_conversation_info_service.save_app_conversation_info.assert_called_once()
     saved_info = app_conversation_info_service.save_app_conversation_info.call_args[0][
@@ -376,7 +389,8 @@ async def test_set_title_callback_processor_request_errors_return_none():
         httpx.RequestError(
             'boom',
             request=httpx.Request(
-                'GET', replace_localhost_hostname_for_docker(conversation_url)
+                'GET',
+                f'http://10.1.2.3:8000/api/conversations/{conversation_id.hex}',
             ),
         )
     )

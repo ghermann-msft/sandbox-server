@@ -456,49 +456,58 @@ class KubernetesSandboxService(SandboxService):
             return None
         return await self._claim_to_sandbox_info(claim)
 
+    async def get_agent_server_url(self, sandbox: SandboxInfo) -> str:
+        """Resolve the ready backing pod for server-side control-plane calls."""
+        claim = await asyncio.to_thread(self._get_claim_sync, sandbox.id)
+        sandbox_name = _sandbox_name(claim or {})
+        if not sandbox_name:
+            raise SandboxError(f'No runtime found for sandbox: {sandbox.id}')
+
+        sandbox_object = await asyncio.to_thread(
+            self._get_sandbox_object_sync, sandbox_name
+        )
+        if sandbox_object is None:
+            raise SandboxError(f'No runtime found for sandbox: {sandbox.id}')
+
+        metadata = sandbox_object.get('metadata') or {}
+        annotations = metadata.get('annotations') or {}
+        pod_name = (
+            annotations.get(SANDBOX_POD_NAME_ANNOTATION)
+            or metadata.get('name')
+            or sandbox_name
+        )
+        pod = await asyncio.to_thread(self._get_pod_sync, pod_name)
+        if pod is None or not _pod_is_ready(pod):
+            raise SandboxError(f'Sandbox pod is not ready: {sandbox.id}')
+
+        pod_ip = getattr(getattr(pod, 'status', None), 'pod_ip', None)
+        if not pod_ip:
+            raise SandboxError(f'Sandbox pod has no IP address: {sandbox.id}')
+
+        agent_server_port = next(
+            (
+                port.container_port
+                for port in self.exposed_ports
+                if port.name == AGENT_SERVER
+            ),
+            None,
+        )
+        if agent_server_port is None:
+            raise SandboxError(
+                f'No agent server port configured for sandbox: {sandbox.id}'
+            )
+
+        host = f'[{pod_ip}]' if ':' in pod_ip else pod_ip
+        return f'http://{host}:{agent_server_port}'
+
     async def _check_agent_server_alive(
         self, sandbox: SandboxInfo, httpx_client: httpx.AsyncClient
     ) -> bool:
         """Probe Agent Server directly through the ready Sandbox pod."""
         url = None
         try:
-            claim = await asyncio.to_thread(self._get_claim_sync, sandbox.id)
-            sandbox_name = _sandbox_name(claim or {})
-            if not sandbox_name:
-                return False
-            sandbox_object = await asyncio.to_thread(
-                self._get_sandbox_object_sync, sandbox_name
-            )
-            if sandbox_object is None:
-                return False
-
-            metadata = sandbox_object.get('metadata') or {}
-            annotations = metadata.get('annotations') or {}
-            pod_name = (
-                annotations.get(SANDBOX_POD_NAME_ANNOTATION)
-                or metadata.get('name')
-                or sandbox_name
-            )
-            pod = await asyncio.to_thread(self._get_pod_sync, pod_name)
-            if pod is None or not _pod_is_ready(pod):
-                return False
-
-            pod_ip = getattr(getattr(pod, 'status', None), 'pod_ip', None)
-            if not pod_ip:
-                return False
-            agent_server_port = next(
-                (
-                    port.container_port
-                    for port in self.exposed_ports
-                    if port.name == AGENT_SERVER
-                ),
-                None,
-            )
-            if agent_server_port is None:
-                return False
-
-            host = f'[{pod_ip}]' if ':' in pod_ip else pod_ip
-            url = f'http://{host}:{agent_server_port}/alive'
+            agent_server_url = await self.get_agent_server_url(sandbox)
+            url = f'{agent_server_url}/alive'
             headers = (
                 {'X-Session-API-Key': sandbox.session_api_key}
                 if sandbox.session_api_key

@@ -259,6 +259,9 @@ class TestLiveStatusAppConversationService:
         self.mock_user_context.get_user_email = AsyncMock(return_value=None)
         self.mock_jwt_service = Mock()
         self.mock_sandbox_service = Mock()
+        self.mock_sandbox_service.get_agent_server_url = AsyncMock(
+            return_value='http://10.1.2.3:8000'
+        )
         self.mock_sandbox_spec_service = Mock()
         self.mock_app_conversation_info_service = Mock()
         self.mock_app_conversation_start_task_service = Mock()
@@ -2548,6 +2551,7 @@ class TestLiveStatusAppConversationService:
 
         self.service._wait_for_sandbox_start = mock_wait_for_sandbox
         self.service.run_setup_scripts = mock_run_setup_scripts
+        self.service._seed_sandbox_profiles = AsyncMock()
 
         # Mock build start conversation request
         mock_agent = Mock(spec=Agent)
@@ -2586,6 +2590,15 @@ class TestLiveStatusAppConversationService:
             pass
 
         # Assert
+        self.mock_sandbox_service.get_agent_server_url.assert_awaited_with(
+            self.mock_sandbox
+        )
+        create_call = self.mock_httpx_client.post.await_args
+        assert create_call.args[0] == 'http://10.1.2.3:8000/api/conversations'
+        assert create_call.kwargs['headers'] == {
+            'X-Session-API-Key': 'test_session_key'
+        }
+        assert self.mock_sandbox.exposed_urls[0].url == 'http://agent-server:8000'
         # Verify that save_app_conversation_info was called with the correct title format
         self.mock_app_conversation_info_service.save_app_conversation_info.assert_called_once()
         call_args = (
@@ -3314,6 +3327,9 @@ class TestPluginHandling:
         self.mock_user_context.get_user_email = AsyncMock(return_value=None)
         self.mock_jwt_service = Mock()
         self.mock_sandbox_service = Mock()
+        self.mock_sandbox_service.get_agent_server_url = AsyncMock(
+            return_value='http://10.1.2.3:8000'
+        )
         self.mock_sandbox_spec_service = Mock()
         self.mock_app_conversation_info_service = Mock()
         self.mock_app_conversation_start_task_service = Mock()
@@ -3976,6 +3992,9 @@ class TestLoadHooksFromWorkspace:
         self.mock_user_context = Mock(spec=UserContext)
         self.mock_jwt_service = Mock()
         self.mock_sandbox_service = Mock()
+        self.mock_sandbox_service.get_agent_server_url = AsyncMock(
+            return_value='http://10.1.2.3:8000'
+        )
         self.mock_sandbox_spec_service = Mock()
         self.mock_app_conversation_info_service = Mock()
         self.mock_app_conversation_start_task_service = Mock()

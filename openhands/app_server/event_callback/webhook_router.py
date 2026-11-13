@@ -38,7 +38,6 @@ from openhands.app_server.config import (
     depends_event_service,
     depends_jwt_service,
     get_app_conversation_info_service,
-    get_app_conversation_service,
     get_event_callback_service,
     get_global_config,
     get_sandbox_service,
@@ -71,9 +70,6 @@ from openhands.app_server.user.specifiy_user_context import (
 from openhands.app_server.user_auth.default_user_auth import DefaultUserAuth
 from openhands.app_server.user_auth.user_auth import (
     get_for_user as get_user_auth_for_user,
-)
-from openhands.app_server.utils.docker_utils import (
-    replace_localhost_hostname_for_docker,
 )
 from openhands.sdk import ConversationExecutionStatus, Event
 from openhands.sdk.event import ConversationStateUpdateEvent, ObservationEvent
@@ -508,20 +504,17 @@ async def _sync_live_conversation_stats(
             sandbox_id=app_conversation_info.sandbox_id,
         ),
     )
-    async with get_app_conversation_service(state) as app_conversation_service:
-        conversation = await app_conversation_service.get_app_conversation(
-            conversation_id
-        )
-    if conversation is None or not conversation.conversation_url:
+    async with get_sandbox_service(state) as sandbox_service:
+        sandbox = await sandbox_service.get_sandbox(app_conversation_info.sandbox_id)
+        if sandbox is None:
+            return
+        agent_server_url = await sandbox_service.get_agent_server_url(sandbox)
+    if not sandbox.session_api_key:
         return
-    # Local-docker sandboxes advertise localhost URLs; normalize like the
-    # title processor so the pull reaches the host, not this container.
-    conversation_url = replace_localhost_hostname_for_docker(
-        conversation.conversation_url
+    conversation_url = (
+        f'{agent_server_url.rstrip("/")}/api/conversations/{conversation_id.hex}'
     )
-    headers = {}
-    if conversation.session_api_key:
-        headers['X-Session-API-Key'] = conversation.session_api_key
+    headers = {'X-Session-API-Key': sandbox.session_api_key}
     async with httpx.AsyncClient(timeout=10.0) as client:
         response = await client.get(conversation_url, headers=headers)
         response.raise_for_status()

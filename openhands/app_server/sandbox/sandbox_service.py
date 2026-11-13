@@ -4,8 +4,6 @@ import time
 from abc import ABC, abstractmethod
 
 import httpx
-from openhands.sdk.utils.models import DiscriminatedUnionMixin
-from openhands.sdk.utils.paging import page_iterator
 
 from openhands.app_server.errors import SandboxError
 from openhands.app_server.sandbox.sandbox_models import (
@@ -21,6 +19,8 @@ from openhands.app_server.services.injector import Injector
 from openhands.app_server.utils.docker_utils import (
     replace_localhost_hostname_for_docker,
 )
+from openhands.sdk.utils.models import DiscriminatedUnionMixin
+from openhands.sdk.utils.paging import page_iterator
 
 _logger = logging.getLogger(__name__)
 
@@ -250,7 +250,7 @@ class SandboxService(ABC):
         """
         url = None
         try:
-            agent_server_url = self._get_agent_server_url(sandbox)
+            agent_server_url = await self.get_agent_server_url(sandbox)
             url = f'{agent_server_url.rstrip("/")}/alive'
             response = await httpx_client.get(url, timeout=5.0)
             return response.is_success
@@ -261,8 +261,8 @@ class SandboxService(ABC):
             )
             return False
 
-    def _get_agent_server_url(self, sandbox: SandboxInfo) -> str:
-        """Get agent server URL from sandbox exposed URLs.
+    async def get_agent_server_url(self, sandbox: SandboxInfo) -> str:
+        """Get the URL used for server-side Agent Server control-plane calls.
 
         Args:
             sandbox: The sandbox info containing exposed URLs

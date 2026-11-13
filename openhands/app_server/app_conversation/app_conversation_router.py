@@ -66,11 +66,8 @@ from openhands.app_server.config import (
     depends_user_context,
     get_app_conversation_service,
 )
-from openhands.app_server.sandbox.sandbox_models import (
-    AGENT_SERVER,
-    SandboxInfo,
-    SandboxStatus,
-)
+from openhands.app_server.errors import SandboxError
+from openhands.app_server.sandbox.sandbox_models import SandboxInfo, SandboxStatus
 from openhands.app_server.sandbox.sandbox_service import SandboxService
 from openhands.app_server.sandbox.sandbox_spec_models import SandboxSpecInfo
 from openhands.app_server.sandbox.sandbox_spec_service import SandboxSpecService
@@ -86,9 +83,6 @@ from openhands.app_server.user.specifiy_user_context import USER_CONTEXT_ATTR
 from openhands.app_server.user.user_context import UserContext
 from openhands.app_server.user_auth import get_user_settings
 from openhands.app_server.utils.dependencies import get_dependencies
-from openhands.app_server.utils.docker_utils import (
-    replace_localhost_hostname_for_docker,
-)
 from openhands.sdk.skills import KeywordTrigger, TaskTrigger
 from openhands.sdk.workspace.remote.async_remote_workspace import AsyncRemoteWorkspace
 
@@ -187,26 +181,13 @@ async def _get_agent_server_context(
         logger.warning('Sandbox spec not found - using default.')
         sandbox_spec = await sandbox_spec_service.get_default_sandbox_spec()
 
-    # Get the agent server URL
-    if not sandbox.exposed_urls:
-        return JSONResponse(
-            status_code=status.HTTP_404_NOT_FOUND,
-            content={'error': 'No agent server URL found for sandbox'},
-        )
-
-    agent_server_url = None
-    for exposed_url in sandbox.exposed_urls:
-        if exposed_url.name == AGENT_SERVER:
-            agent_server_url = exposed_url.url
-            break
-
-    if not agent_server_url:
+    try:
+        agent_server_url = await sandbox_service.get_agent_server_url(sandbox)
+    except SandboxError:
         return JSONResponse(
             status_code=status.HTTP_404_NOT_FOUND,
             content={'error': 'Agent server URL not found in sandbox'},
         )
-
-    agent_server_url = replace_localhost_hostname_for_docker(agent_server_url)
 
     return AgentServerContext(
         conversation=conversation,
@@ -529,26 +510,13 @@ async def send_message_to_conversation(
             ),
         )
 
-    # Get agent server URL from sandbox
-    if not sandbox.exposed_urls:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail='No agent server URL found for sandbox.',
-        )
-
-    agent_server_url = None
-    for exposed_url in sandbox.exposed_urls:
-        if exposed_url.name == AGENT_SERVER:
-            agent_server_url = exposed_url.url
-            break
-
-    if not agent_server_url:
+    try:
+        agent_server_url = await sandbox_service.get_agent_server_url(sandbox)
+    except SandboxError as exc:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail='Agent server URL not found in sandbox.',
-        )
-
-    agent_server_url = replace_localhost_hostname_for_docker(agent_server_url)
+        ) from exc
 
     # Send message to agent server
     try:
@@ -1165,20 +1133,10 @@ async def read_conversation_file(
     if not sandbox_spec:
         return ''
 
-    # Get the agent server URL
-    if not sandbox.exposed_urls:
+    try:
+        agent_server_url = await sandbox_service.get_agent_server_url(sandbox)
+    except SandboxError:
         return ''
-
-    agent_server_url = None
-    for exposed_url in sandbox.exposed_urls:
-        if exposed_url.name == AGENT_SERVER:
-            agent_server_url = exposed_url.url
-            break
-
-    if not agent_server_url:
-        return ''
-
-    agent_server_url = replace_localhost_hostname_for_docker(agent_server_url)
 
     # Create remote workspace
     remote_workspace = AsyncRemoteWorkspace(

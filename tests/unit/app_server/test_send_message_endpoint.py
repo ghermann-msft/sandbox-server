@@ -22,6 +22,7 @@ from openhands.app_server.app_conversation.app_conversation_models import (
 from openhands.app_server.app_conversation.app_conversation_router import (
     send_message_to_conversation,
 )
+from openhands.app_server.errors import SandboxError
 from openhands.app_server.sandbox.sandbox_models import (
     AGENT_SERVER,
     ExposedUrl,
@@ -82,6 +83,12 @@ def _make_mock_sandbox_service(sandbox=None):
     """Create a mock SandboxService for testing."""
     service = MagicMock()
     service.get_sandbox = AsyncMock(return_value=sandbox)
+    if sandbox and sandbox.exposed_urls:
+        service.get_agent_server_url = AsyncMock(return_value='http://10.1.2.3:8000')
+    else:
+        service.get_agent_server_url = AsyncMock(
+            side_effect=SandboxError('No agent server URL')
+        )
     return service
 
 
@@ -139,7 +146,12 @@ class TestSendMessageToConversation:
         assert result.message is None
         mock_httpx_client.post.assert_called_once()
         call_kwargs = mock_httpx_client.post.call_args
-        assert f'/api/conversations/{conversation_id}/events' in call_kwargs[0][0]
+        assert (
+            call_kwargs[0][0]
+            == f'http://10.1.2.3:8000/api/conversations/{conversation_id}/events'
+        )
+        assert call_kwargs.kwargs['headers'] == {'X-Session-API-Key': 'test-api-key'}
+        assert sandbox.exposed_urls[0].url == 'http://localhost:3000'
 
     async def test_returns_404_for_nonexistent_conversation(self):
         """Test that 404 is returned when conversation doesn't exist.

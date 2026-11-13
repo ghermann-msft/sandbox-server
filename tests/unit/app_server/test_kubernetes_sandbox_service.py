@@ -143,10 +143,11 @@ async def test_readiness_uses_internal_pod_ip_and_session_key(
     info = await service.get_sandbox('sb1')
     assert info is not None
     assert info.exposed_urls[0].url == 'https://sb-1.example.com:8000'
+    assert await service.get_agent_server_url(info) == 'http://10.1.2.3:8000'
 
     assert await service._check_agent_server_alive(info, httpx_client) is True
 
-    core_v1.read_namespaced_pod.assert_called_once_with(
+    core_v1.read_namespaced_pod.assert_called_with(
         name='warm-pod-7', namespace='agents'
     )
     httpx_client.get.assert_awaited_once_with(

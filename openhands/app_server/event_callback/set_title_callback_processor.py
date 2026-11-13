@@ -17,9 +17,6 @@ from openhands.app_server.event_callback.event_callback_result_models import (
 )
 from openhands.app_server.services.injector import InjectorState
 from openhands.app_server.user.specifiy_user_context import ADMIN, USER_CONTEXT_ATTR
-from openhands.app_server.utils.docker_utils import (
-    replace_localhost_hostname_for_docker,
-)
 from openhands.sdk import Event, MessageEvent
 from openhands.sdk.utils.redact import redact_text_secrets
 
@@ -122,6 +119,7 @@ class SetTitleCallbackProcessor(EventCallbackProcessor):
             get_app_conversation_service,
             get_event_callback_service,
             get_httpx_client,
+            get_sandbox_service,
         )
 
         _logger.info(
@@ -137,12 +135,15 @@ class SetTitleCallbackProcessor(EventCallbackProcessor):
                 conversation_id
             )
             assert app_conversation is not None
-            app_conversation_url = app_conversation.conversation_url
-            assert app_conversation_url is not None
-            app_conversation_url = replace_localhost_hostname_for_docker(
-                app_conversation_url
-            )
             session_api_key = app_conversation.session_api_key
+
+        sandbox_state = InjectorState()
+        setattr(sandbox_state, USER_CONTEXT_ATTR, ADMIN)
+        async with get_sandbox_service(sandbox_state) as sandbox_service:
+            sandbox = await sandbox_service.get_sandbox(app_conversation.sandbox_id)
+            assert sandbox is not None
+            agent_server_url = await sandbox_service.get_agent_server_url(sandbox)
+            app_conversation_url = f'{agent_server_url.rstrip("/")}/api/conversations/{conversation_id.hex}'
 
         http_state = InjectorState()
         setattr(http_state, USER_CONTEXT_ATTR, ADMIN)
