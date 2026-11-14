@@ -20,18 +20,37 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
-from fastapi import HTTPException, status
+from fastapi import Depends, HTTPException, Request, status
+from fastapi.security import (
+    APIKeyHeader,
+    HTTPAuthorizationCredentials,
+    HTTPBearer,
+)
 
 from openhands.app_server.config import get_global_config, get_sandbox_service
 from openhands.app_server.config_api.config_models import AppMode
 from openhands.app_server.sandbox.sandbox_models import SandboxInfo, SandboxStatus
 from openhands.app_server.services.injector import InjectorState
+from openhands.app_server.user.auth_user_context import (
+    USER_AUTH_ATTR,
+    AuthUserContext,
+    AuthUserContextInjector,
+)
 from openhands.app_server.user.specifiy_user_context import ADMIN, USER_CONTEXT_ATTR
+from openhands.app_server.user_auth.user_auth import get_user_auth
+from openhands.app_server.utils.dependencies import (
+    _SESSION_API_KEY as _STATIC_SESSION_API_KEY,
+)
+from openhands.app_server.utils.dependencies import check_session_api_key
 
 if TYPE_CHECKING:
     from openhands.app_server.user.user_context import UserContext
 
 _logger = logging.getLogger(__name__)
+_APP_API_BEARER = HTTPBearer(auto_error=False)
+_STATIC_SESSION_API_KEY_HEADER = APIKeyHeader(
+    name='X-Session-API-Key', auto_error=False
+)
 
 
 async def validate_session_key(session_api_key: str | None) -> SandboxInfo:
@@ -137,3 +156,56 @@ async def validate_session_key_ownership(
             status.HTTP_403_FORBIDDEN,
             detail='Session API key does not belong to the authenticated user',
         )
+
+
+async def authenticate_app_conversation_request(
+    request: Request,
+    bearer: HTTPAuthorizationCredentials | None = Depends(_APP_API_BEARER),
+    static_session_api_key: str | None = Depends(_STATIC_SESSION_API_KEY_HEADER),
+) -> None:
+    """Authenticate app-conversation routes without changing global auth.
+
+    A bearer credential that maps to a running sandbox acts as the sandbox
+    owner's app API credential. Other bearer credentials continue through the
+    existing Cloud/Entra user-auth path. When the deployment configures the
+    namespace-static ``SESSION_API_KEY``, requests that are not authenticated by
+    a sandbox bearer must still provide that key.
+    """
+    if bearer is not None:
+        try:
+            sandbox_info = await validate_session_key(bearer.credentials)
+        except HTTPException as exc:
+            if not (
+                exc.status_code == status.HTTP_401_UNAUTHORIZED
+                and exc.detail == 'Invalid session API key'
+            ):
+                raise
+        else:
+            owner_id = sandbox_info.created_by_user_id
+            if not owner_id:
+                raise HTTPException(
+                    status.HTTP_401_UNAUTHORIZED,
+                    detail='Sandbox has no associated user',
+                )
+
+            user_auth = await get_user_auth(request)
+            user_injector = get_global_config().user
+            managed_llm = (
+                user_injector.managed_llm
+                if isinstance(user_injector, AuthUserContextInjector)
+                else None
+            )
+            setattr(request.state, USER_AUTH_ATTR, user_auth)
+            setattr(
+                request.state,
+                USER_CONTEXT_ATTR,
+                AuthUserContext(
+                    user_auth=user_auth,
+                    managed_llm=managed_llm,
+                    trusted_user_id=owner_id,
+                ),
+            )
+            return
+
+    if _STATIC_SESSION_API_KEY:
+        check_session_api_key(static_session_api_key)

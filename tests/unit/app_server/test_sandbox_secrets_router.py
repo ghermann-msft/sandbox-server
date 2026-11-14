@@ -9,10 +9,12 @@ Tests:
 """
 
 import contextlib
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import pytest
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.security import HTTPAuthorizationCredentials
 from fastapi.testclient import TestClient
 from pydantic import SecretStr
 
@@ -28,10 +30,16 @@ from openhands.app_server.sandbox.sandbox_router import (
     list_secret_names,
 )
 from openhands.app_server.sandbox.session_auth import (
+    authenticate_app_conversation_request,
     validate_session_key,
     validate_session_key_ownership,
 )
-from openhands.app_server.user.auth_user_context import AuthUserContext
+from openhands.app_server.user.auth_user_context import (
+    USER_AUTH_ATTR,
+    AuthUserContext,
+    AuthUserContextInjector,
+)
+from openhands.app_server.user.specifiy_user_context import USER_CONTEXT_ATTR
 from openhands.app_server.user.user_models import UserInfo
 from openhands.app_server.user.user_router import get_current_user
 from openhands.sdk.llm import LLM
@@ -242,6 +250,114 @@ class TestValidateSessionKey:
             result = await validate_session_key('valid-key')
         assert result.id == SANDBOX_ID
         assert result.status == SandboxStatus.RUNNING
+
+
+@pytest.mark.asyncio
+class TestAuthenticateAppConversationRequest:
+    async def test_valid_bearer_sets_sandbox_owner_context(self):
+        sandbox = _make_sandbox_info(user_id='owner-a')
+        user_auth = AsyncMock()
+        managed_llm = LLM(model='managed/model', api_key=SecretStr('managed-key'))
+        user_injector = AuthUserContextInjector.with_managed_llm(managed_llm)
+        ctx, mock_svc = _patch_sandbox_service(sandbox)
+        with (
+            ctx as mock_get,
+            patch(
+                'openhands.app_server.sandbox.session_auth.get_user_auth',
+                new=AsyncMock(return_value=user_auth),
+            ) as mock_get_user_auth,
+            patch(
+                'openhands.app_server.sandbox.session_auth.get_global_config',
+                return_value=SimpleNamespace(user=user_injector),
+            ),
+        ):
+            mock_get.return_value.__aenter__ = AsyncMock(return_value=mock_svc)
+            mock_get.return_value.__aexit__ = AsyncMock(return_value=False)
+            request = Request({'type': 'http'})
+
+            await authenticate_app_conversation_request(
+                request,
+                HTTPAuthorizationCredentials(
+                    scheme='Bearer', credentials='sandbox-key'
+                ),
+                None,
+            )
+
+        context = getattr(request.state, USER_CONTEXT_ATTR)
+        assert isinstance(context, AuthUserContext)
+        assert await context.get_user_id() == 'owner-a'
+        assert context.managed_llm is managed_llm
+        assert getattr(request.state, USER_AUTH_ATTR) is user_auth
+        mock_get_user_auth.assert_awaited_once_with(request)
+
+    async def test_invalid_bearer_still_requires_static_key(self):
+        ctx, mock_svc = _patch_sandbox_service(None)
+        with (
+            ctx as mock_get,
+            patch(
+                'openhands.app_server.sandbox.session_auth._STATIC_SESSION_API_KEY',
+                'static-key',
+            ),
+            patch(
+                'openhands.app_server.utils.dependencies._SESSION_API_KEY',
+                'static-key',
+            ),
+        ):
+            mock_get.return_value.__aenter__ = AsyncMock(return_value=mock_svc)
+            mock_get.return_value.__aexit__ = AsyncMock(return_value=False)
+
+            with pytest.raises(HTTPException) as exc_info:
+                await authenticate_app_conversation_request(
+                    Request({'type': 'http'}),
+                    HTTPAuthorizationCredentials(
+                        scheme='Bearer', credentials='wrong-key'
+                    ),
+                    None,
+                )
+
+        assert exc_info.value.status_code == 401
+
+    async def test_non_running_sandbox_bearer_is_rejected(self):
+        sandbox = _make_sandbox_info()
+        sandbox.status = SandboxStatus.PAUSED
+        ctx, mock_svc = _patch_sandbox_service(sandbox)
+        with ctx as mock_get:
+            mock_get.return_value.__aenter__ = AsyncMock(return_value=mock_svc)
+            mock_get.return_value.__aexit__ = AsyncMock(return_value=False)
+
+            with pytest.raises(HTTPException) as exc_info:
+                await authenticate_app_conversation_request(
+                    Request({'type': 'http'}),
+                    HTTPAuthorizationCredentials(
+                        scheme='Bearer', credentials='paused-key'
+                    ),
+                    None,
+                )
+
+        assert exc_info.value.status_code == 401
+        assert exc_info.value.detail == 'Sandbox is not running'
+
+    async def test_static_key_path_does_not_replace_existing_identity(self):
+        request = Request({'type': 'http'})
+        existing_context = object()
+        setattr(request.state, USER_CONTEXT_ATTR, existing_context)
+        with (
+            patch(
+                'openhands.app_server.sandbox.session_auth._STATIC_SESSION_API_KEY',
+                'static-key',
+            ),
+            patch(
+                'openhands.app_server.utils.dependencies._SESSION_API_KEY',
+                'static-key',
+            ),
+        ):
+            await authenticate_app_conversation_request(
+                request,
+                None,
+                'static-key',
+            )
+
+        assert getattr(request.state, USER_CONTEXT_ATTR) is existing_context
 
 
 # ---------------------------------------------------------------------------

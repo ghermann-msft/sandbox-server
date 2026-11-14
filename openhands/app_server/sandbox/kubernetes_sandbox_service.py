@@ -52,6 +52,8 @@ from openhands.app_server.sandbox.sandbox_models import (
     SandboxStatus,
 )
 from openhands.app_server.sandbox.sandbox_service import (
+    OPENHANDS_API_KEY_VARIABLE,
+    OPENHANDS_CLOUD_API_URL_VARIABLE,
     SESSION_API_KEY_VARIABLE,
     WEBHOOK_CALLBACK_VARIABLE,
     WEBHOOK_HEADERS_VARIABLE,
@@ -587,9 +589,8 @@ class KubernetesSandboxService(SandboxService):
         await self.pause_old_sandboxes(self.max_num_sandboxes - 1)
 
         env_vars = dict(sandbox_spec.initial_env)
-        env_vars[WEBHOOK_CALLBACK_VARIABLE] = (
-            f'{self.webhook_base_url.rstrip("/")}/api/v1/webhooks'
-        )
+        webhook_callback_url = f'{self.webhook_base_url.rstrip("/")}/api/v1/webhooks'
+        env_vars[WEBHOOK_CALLBACK_VARIABLE] = webhook_callback_url
         for port in self.exposed_ports:
             env_vars[port.name] = str(port.container_port)
 
@@ -611,6 +612,10 @@ class KubernetesSandboxService(SandboxService):
         if self.inject_session_key:
             session_api_key = base62.encodebytes(os.urandom(32))
             env_vars[SESSION_API_KEY_VARIABLE] = session_api_key
+            env_vars[OPENHANDS_API_KEY_VARIABLE] = session_api_key
+            env_vars[OPENHANDS_CLOUD_API_URL_VARIABLE] = (
+                webhook_callback_url.removesuffix('/api/v1/webhooks')
+            )
             env_vars[WEBHOOK_HEADERS_VARIABLE] = json.dumps(
                 {'X-Session-API-Key': session_api_key}
             )

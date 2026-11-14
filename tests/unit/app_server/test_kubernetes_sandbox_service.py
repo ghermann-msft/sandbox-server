@@ -31,6 +31,8 @@ from openhands.app_server.sandbox.kubernetes_sandbox_service import (
 )
 from openhands.app_server.sandbox.sandbox_models import AGENT_SERVER, SandboxStatus
 from openhands.app_server.sandbox.sandbox_service import (
+    OPENHANDS_API_KEY_VARIABLE,
+    OPENHANDS_CLOUD_API_URL_VARIABLE,
     SESSION_API_KEY_VARIABLE,
     WEBHOOK_CALLBACK_VARIABLE,
     WEBHOOK_HEADERS_VARIABLE,
@@ -256,6 +258,8 @@ async def test_start_sandbox_creates_claim(service, custom_objects):
     assert env['LOG_JSON'] == 'true'
     assert env[WEBHOOK_CALLBACK_VARIABLE] == 'http://app-server:3000/api/v1/webhooks'
     assert env[SESSION_API_KEY_VARIABLE]
+    assert env[OPENHANDS_API_KEY_VARIABLE] == env[SESSION_API_KEY_VARIABLE]
+    assert env[OPENHANDS_CLOUD_API_URL_VARIABLE] == 'http://app-server:3000'
     assert env[WEBHOOK_HEADERS_VARIABLE] == (
         f'{{"X-Session-API-Key": "{env[SESSION_API_KEY_VARIABLE]}"}}'
     )
@@ -287,6 +291,8 @@ async def test_start_sandbox_can_skip_session_key_injection(
     body = custom_objects.create_namespaced_custom_object.call_args.kwargs['body']
     env = {item['name']: item['value'] for item in body['spec']['env']}
     assert SESSION_API_KEY_VARIABLE not in env
+    assert OPENHANDS_API_KEY_VARIABLE not in env
+    assert OPENHANDS_CLOUD_API_URL_VARIABLE not in env
     # An explicitly configured pool wins over the spec id.
     assert body['spec']['warmPoolRef'] == {'name': 'pinned-pool'}
 

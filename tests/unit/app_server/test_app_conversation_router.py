@@ -5,18 +5,23 @@ focusing on UUID string parsing, validation, and error handling.
 """
 
 import json
+from contextlib import asynccontextmanager
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 from uuid import uuid4
 
 import httpx
 import pytest
-from fastapi import HTTPException, status
+from fastapi import FastAPI, HTTPException, Request, status
 from fastapi.responses import JSONResponse
+from fastapi.testclient import TestClient
 
+from openhands.app_server.app_conversation import app_conversation_router
 from openhands.app_server.app_conversation.app_conversation_models import (
     AppConversation,
     AppConversationInfo,
     AppConversationPage,
+    AppConversationStartTask,
     SwitchProfileRequest,
 )
 from openhands.app_server.app_conversation.app_conversation_router import (
@@ -30,8 +35,12 @@ from openhands.app_server.app_conversation.app_conversation_router import (
     switch_conversation_profile,
 )
 from openhands.app_server.sandbox.sandbox_models import SandboxStatus
+from openhands.app_server.sandbox.session_auth import (
+    authenticate_app_conversation_request,
+)
 from openhands.app_server.settings.llm_profiles import LLMProfiles
 from openhands.app_server.settings.settings_models import Settings
+from openhands.app_server.user.auth_user_context import AuthUserContextInjector
 from openhands.sdk.llm import LLM
 from openhands.sdk.settings import OpenHandsAgentSettings
 
@@ -67,6 +76,96 @@ def _make_mock_service(
     )
     service.count_app_conversations = AsyncMock(return_value=count_return)
     return service
+
+
+def test_app_conversation_router_uses_composite_auth_dependency():
+    dependencies = [
+        dependency.dependency
+        for dependency in app_conversation_router.router.dependencies
+    ]
+    assert dependencies == [authenticate_app_conversation_request]
+
+
+def test_start_app_conversation_uses_sandbox_owner_bearer():
+    owner_id = 'owner-a'
+    sandbox = MagicMock(
+        id='sandbox-a',
+        created_by_user_id=owner_id,
+        status=SandboxStatus.RUNNING,
+    )
+    sandbox.sandbox_spec_id = 'spec'
+    sandbox.session_api_key = 'sandbox-key'
+    sandbox.exposed_urls = []
+    user_auth = AsyncMock()
+    observed_owner: list[str | None] = []
+
+    @asynccontextmanager
+    async def sandbox_service_context(state, request=None):
+        service = AsyncMock()
+        service.get_sandbox_by_session_api_key.return_value = sandbox
+        yield service
+
+    async def user_context_override(request: Request):
+        return request.state.user_context
+
+    async def service_override(request: Request):
+        context = request.state.user_context
+        observed_owner.append(await context.get_user_id())
+        service = MagicMock()
+
+        async def start(request_body):
+            yield AppConversationStartTask(
+                created_by_user_id=await context.get_user_id(),
+                request=request_body,
+            )
+
+        service.start_app_conversation = start
+        return service
+
+    db_session = MagicMock()
+    db_session.close = AsyncMock()
+    httpx_client = MagicMock()
+    httpx_client.aclose = AsyncMock()
+
+    app = FastAPI()
+    app.include_router(app_conversation_router.router, prefix='/api/v1')
+    app.dependency_overrides[
+        app_conversation_router.user_context_dependency.dependency
+    ] = user_context_override
+    app.dependency_overrides[
+        app_conversation_router.app_conversation_service_dependency.dependency
+    ] = service_override
+    app.dependency_overrides[
+        app_conversation_router.db_session_dependency.dependency
+    ] = lambda: db_session
+    app.dependency_overrides[
+        app_conversation_router.httpx_client_dependency.dependency
+    ] = lambda: httpx_client
+
+    with (
+        patch(
+            'openhands.app_server.sandbox.session_auth.get_sandbox_service',
+            sandbox_service_context,
+        ),
+        patch(
+            'openhands.app_server.sandbox.session_auth.get_user_auth',
+            new=AsyncMock(return_value=user_auth),
+        ),
+        patch(
+            'openhands.app_server.sandbox.session_auth.get_global_config',
+            return_value=SimpleNamespace(user=AuthUserContextInjector()),
+        ),
+        TestClient(app) as client,
+    ):
+        response = client.post(
+            '/api/v1/app-conversations',
+            headers={'Authorization': 'Bearer sandbox-key'},
+            json={},
+        )
+
+    assert response.status_code == 200
+    assert response.json()['created_by_user_id'] == owner_id
+    assert observed_owner == [owner_id]
 
 
 @pytest.mark.asyncio

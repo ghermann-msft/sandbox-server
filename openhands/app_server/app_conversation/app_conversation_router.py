@@ -71,6 +71,9 @@ from openhands.app_server.sandbox.sandbox_models import SandboxInfo, SandboxStat
 from openhands.app_server.sandbox.sandbox_service import SandboxService
 from openhands.app_server.sandbox.sandbox_spec_models import SandboxSpecInfo
 from openhands.app_server.sandbox.sandbox_spec_service import SandboxSpecService
+from openhands.app_server.sandbox.session_auth import (
+    authenticate_app_conversation_request,
+)
 from openhands.app_server.services.db_session_injector import set_db_session_keep_open
 from openhands.app_server.services.httpx_client_injector import (
     set_httpx_client_keep_open,
@@ -82,7 +85,6 @@ from openhands.app_server.settings.settings_router import LITE_LLM_API_URL
 from openhands.app_server.user.specifiy_user_context import USER_CONTEXT_ATTR
 from openhands.app_server.user.user_context import UserContext
 from openhands.app_server.user_auth import get_user_settings
-from openhands.app_server.utils.dependencies import get_dependencies
 from openhands.sdk.skills import KeywordTrigger, TaskTrigger
 from openhands.sdk.workspace.remote.async_remote_workspace import AsyncRemoteWorkspace
 
@@ -96,10 +98,12 @@ else:
         return await async_iterator.__anext__()
 
 
-# We use the get_dependencies method here to signal to the OpenAPI docs that this endpoint
-# is protected. The actual protection is provided by SetAuthCookieMiddleware
+# App-conversation routes accept the existing browser/BFF authentication path
+# plus a running sandbox's owner-scoped bearer credential.
 router = APIRouter(
-    prefix='/app-conversations', tags=['Conversations'], dependencies=get_dependencies()
+    prefix='/app-conversations',
+    tags=['Conversations'],
+    dependencies=[Depends(authenticate_app_conversation_request)],
 )
 logger = logging.getLogger(__name__)
 app_conversation_service_dependency = depends_app_conversation_service()
