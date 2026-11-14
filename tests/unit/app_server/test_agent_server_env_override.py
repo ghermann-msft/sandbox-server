@@ -19,6 +19,9 @@ import pytest
 from openhands.app_server.sandbox.docker_sandbox_spec_service import (
     get_default_sandbox_specs as get_default_docker_sandbox_specs,
 )
+from openhands.app_server.sandbox.kubernetes_sandbox_spec_service import (
+    get_default_sandbox_specs as get_default_kubernetes_sandbox_specs,
+)
 from openhands.app_server.sandbox.process_sandbox_spec_service import (
     get_default_sandbox_specs as get_default_process_sandbox_specs,
 )
@@ -27,6 +30,7 @@ from openhands.app_server.sandbox.remote_sandbox_spec_service import (
 )
 from openhands.app_server.sandbox.sandbox_spec_service import (
     AUTO_FORWARD_PREFIXES,
+    AUTO_FORWARD_VARIABLES,
     get_agent_server_env,
 )
 
@@ -355,6 +359,46 @@ class TestLMNRAutoForwarding:
             # Lowercase variants should not be included
             assert 'lmnr_project_api_key' not in result
             assert 'Lmnr_Project_Api_Key' not in result
+
+
+class TestExtensionsRefForwarding:
+    """The public skill revision must match across app-server and agent-server."""
+
+    def test_auto_forward_variables_contains_extensions_ref(self):
+        assert 'EXTENSIONS_REF' in AUTO_FORWARD_VARIABLES
+
+    def test_extensions_ref_auto_forwarded(self):
+        ref = '659e38188b8da6680dc1e3424cf6f2498381162f'
+        with patch.dict(os.environ, {'EXTENSIONS_REF': ref}, clear=True):
+            assert get_agent_server_env() == {'EXTENSIONS_REF': ref}
+
+    @pytest.mark.skipif(
+        os.name == 'nt', reason='Windows environment variables are case-insensitive'
+    )
+    def test_extensions_ref_is_case_sensitive(self):
+        with patch.dict(
+            os.environ,
+            {'extensions_ref': 'wrong', 'Extensions_Ref': 'also-wrong'},
+            clear=True,
+        ):
+            assert get_agent_server_env() == {}
+
+    def test_explicit_agent_server_override_takes_precedence(self):
+        with patch.dict(
+            os.environ,
+            {
+                'EXTENSIONS_REF': 'app-server-ref',
+                'OH_AGENT_SERVER_ENV': '{"EXTENSIONS_REF": "sandbox-ref"}',
+            },
+            clear=True,
+        ):
+            assert get_agent_server_env()['EXTENSIONS_REF'] == 'sandbox-ref'
+
+    def test_kubernetes_spec_forwards_extensions_ref(self):
+        ref = '659e38188b8da6680dc1e3424cf6f2498381162f'
+        with patch.dict(os.environ, {'EXTENSIONS_REF': ref}, clear=True):
+            spec = get_default_kubernetes_sandbox_specs()[0]
+            assert spec.initial_env['EXTENSIONS_REF'] == ref
 
 
 class TestDockerSandboxSpecEnvironmentOverride:

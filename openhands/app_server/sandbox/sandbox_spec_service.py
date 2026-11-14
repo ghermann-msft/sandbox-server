@@ -149,6 +149,8 @@ def is_custom_sandbox_spec(sandbox_spec_id: str) -> bool:
 # Prefixes for environment variables that should be auto-forwarded to agent-server
 # These are typically configuration variables that affect the agent's behavior
 AUTO_FORWARD_PREFIXES = ('LLM_', 'LMNR_')
+# Exact variables shared by app-server profile resolution and agent-server loading.
+AUTO_FORWARD_VARIABLES = ('EXTENSIONS_REF',)
 
 
 def get_agent_server_env() -> dict[str, str]:
@@ -156,11 +158,11 @@ def get_agent_server_env() -> dict[str, str]:
 
     This function combines two sources of environment variables:
 
-    1. **Auto-forwarded variables**: Environment variables with certain prefixes
-       (e.g., LLM_*, LMNR_*) are automatically forwarded to the agent-server container.
-       This ensures that LLM configuration like timeouts and retry settings
-       work correctly in the two-container V1 architecture, as well as
-       Laminar monitoring/analytics configuration.
+    1. **Auto-forwarded variables**: Environment variables with recognized prefixes
+       (e.g., LLM_*, LMNR_*) or exact names (EXTENSIONS_REF) are automatically
+       forwarded to the agent-server container. This ensures that app-server profile
+       resolution and agent-server workspace loading use the same public skill revision,
+       while LLM and Laminar configuration also works in the two-container V1 architecture.
 
     2. **Explicit overrides via OH_AGENT_SERVER_ENV**: A JSON string that allows
        setting arbitrary environment variables in the agent-server container.
@@ -169,6 +171,7 @@ def get_agent_server_env() -> dict[str, str]:
     Auto-forwarded prefixes:
         - LLM_* : LLM configuration (timeout, retries, model settings, etc.)
         - LMNR_* : Laminar monitoring/analytics configuration
+        - EXTENSIONS_REF : Git ref for the public OpenHands extensions catalog
 
     Usage:
         # Auto-forwarding (no action needed):
@@ -180,6 +183,9 @@ def get_agent_server_env() -> dict[str, str]:
         export LMNR_PROJECT_API_KEY=your-api-key
         export LMNR_BASE_URL=https://app.lmnr.ai
         # These will automatically be available in the agent-server
+
+        # Pin profile resolution and sandbox skill loading to the same revision:
+        export EXTENSIONS_REF=<full OpenHands/extensions commit SHA>
 
         # Explicit override via JSON:
         OH_AGENT_SERVER_ENV='{"DEBUG": "true", "CUSTOM_VAR": "value"}'
@@ -199,7 +205,9 @@ def get_agent_server_env() -> dict[str, str]:
 
     # Step 1: Auto-forward environment variables with recognized prefixes
     for key, value in os.environ.items():
-        if any(key.startswith(prefix) for prefix in AUTO_FORWARD_PREFIXES):
+        if key in AUTO_FORWARD_VARIABLES or any(
+            key.startswith(prefix) for prefix in AUTO_FORWARD_PREFIXES
+        ):
             result[key] = value
 
     # Step 2: Apply explicit overrides from OH_AGENT_SERVER_ENV

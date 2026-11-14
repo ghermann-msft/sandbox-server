@@ -419,7 +419,14 @@ def config_from_env() -> AppServerConfig:
         )
 
     if config.app_conversation is None:
-        config.app_conversation = LiveStatusAppConversationServiceInjector()
+        app_conversation_kwargs: dict = {}
+        if os.getenv('SANDBOX_STARTUP_TIMEOUT'):
+            app_conversation_kwargs['sandbox_startup_timeout'] = int(
+                os.environ['SANDBOX_STARTUP_TIMEOUT']
+            )
+        config.app_conversation = LiveStatusAppConversationServiceInjector(
+            **app_conversation_kwargs
+        )
 
     if config.pending_message is None:
         from openhands.app_server.pending_messages.pending_message_service import (

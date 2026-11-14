@@ -335,6 +335,87 @@ class TestLiveStatusAppConversationService:
             task
         )
 
+    @pytest.mark.asyncio
+    async def test_startup_failure_deletes_newly_created_sandbox(self):
+        sandbox = Mock(spec=SandboxInfo)
+        sandbox.id = uuid4()
+        sandbox.status = SandboxStatus.STARTING
+        self.service._find_running_sandbox_for_user = AsyncMock(return_value=None)
+        self.mock_sandbox_service.start_sandbox = AsyncMock(return_value=sandbox)
+        self.mock_sandbox_service.wait_for_sandbox_running = AsyncMock(
+            side_effect=SandboxError('startup timed out')
+        )
+        self.mock_sandbox_service.delete_sandbox = AsyncMock()
+        task = Mock(request=AppConversationStartRequest(), sandbox_id=None)
+
+        waiting = self.service._wait_for_sandbox_start(task)
+        assert await anext(waiting) is task
+        with pytest.raises(SandboxError, match='startup timed out'):
+            await anext(waiting)
+
+        self.mock_sandbox_service.delete_sandbox.assert_awaited_once_with(sandbox.id)
+
+    @pytest.mark.asyncio
+    async def test_startup_failure_does_not_delete_existing_sandbox(self):
+        sandbox = Mock(spec=SandboxInfo)
+        sandbox.id = uuid4()
+        sandbox.status = SandboxStatus.STARTING
+        self.mock_sandbox_service.get_sandbox = AsyncMock(return_value=sandbox)
+        self.mock_sandbox_service.wait_for_sandbox_running = AsyncMock(
+            side_effect=SandboxError('startup timed out')
+        )
+        self.mock_sandbox_service.delete_sandbox = AsyncMock()
+        task = Mock(
+            request=AppConversationStartRequest(sandbox_id=str(sandbox.id)),
+            sandbox_id=None,
+        )
+
+        waiting = self.service._wait_for_sandbox_start(task)
+        assert await anext(waiting) is task
+        with pytest.raises(SandboxError, match='startup timed out'):
+            await anext(waiting)
+
+        self.mock_sandbox_service.delete_sandbox.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_startup_failure_does_not_delete_reused_sandbox(self):
+        sandbox = Mock(spec=SandboxInfo)
+        sandbox.id = uuid4()
+        sandbox.status = SandboxStatus.STARTING
+        self.service._find_running_sandbox_for_user = AsyncMock(return_value=sandbox)
+        self.mock_sandbox_service.wait_for_sandbox_running = AsyncMock(
+            side_effect=SandboxError('startup timed out')
+        )
+        self.mock_sandbox_service.delete_sandbox = AsyncMock()
+        task = Mock(request=AppConversationStartRequest(), sandbox_id=None)
+
+        waiting = self.service._wait_for_sandbox_start(task)
+        assert await anext(waiting) is task
+        with pytest.raises(SandboxError, match='startup timed out'):
+            await anext(waiting)
+
+        self.mock_sandbox_service.delete_sandbox.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_cleanup_failure_preserves_startup_failure(self):
+        sandbox = Mock(spec=SandboxInfo)
+        sandbox.id = uuid4()
+        sandbox.status = SandboxStatus.STARTING
+        self.service._find_running_sandbox_for_user = AsyncMock(return_value=None)
+        self.mock_sandbox_service.start_sandbox = AsyncMock(return_value=sandbox)
+        self.mock_sandbox_service.wait_for_sandbox_running = AsyncMock(
+            side_effect=SandboxError('startup timed out')
+        )
+        self.mock_sandbox_service.delete_sandbox = AsyncMock(
+            side_effect=SandboxError('cleanup failed')
+        )
+        task = Mock(request=AppConversationStartRequest(), sandbox_id=None)
+
+        waiting = self.service._wait_for_sandbox_start(task)
+        assert await anext(waiting) is task
+        with pytest.raises(SandboxError, match='startup timed out'):
+            await anext(waiting)
+
     def test_inherits_parent_agent_profile_without_child_override(self):
         parent_profile_id = uuid4()
         request = AppConversationStartRequest()

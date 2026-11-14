@@ -1,6 +1,7 @@
 from pathlib import Path
 
 DOCKERFILE = Path(__file__).parents[2] / 'containers' / 'app' / 'Dockerfile'
+EXTENSIONS_REF = '659e38188b8da6680dc1e3424cf6f2498381162f'
 
 
 def test_software_agent_sdk_override_is_opt_in_and_uses_one_checkout():
@@ -38,6 +39,13 @@ def test_software_agent_sdk_override_is_opt_in_and_uses_one_checkout():
     assert 'import openhands.agent_server.models' in dockerfile
     assert dockerfile.index(checkout_removal) < dockerfile.index(app_workdir)
     assert dockerfile.index(app_workdir) < dockerfile.index(builder_smoke)
+
+
+def test_runtime_image_pins_public_extensions_revision():
+    dockerfile = DOCKERFILE.read_text()
+
+    assert f'ARG EXTENSIONS_REF={EXTENSIONS_REF}' in dockerfile
+    assert 'EXTENSIONS_REF=${EXTENSIONS_REF}' in dockerfile
 
 
 def test_runtime_image_merges_and_imports_the_openhands_namespace():

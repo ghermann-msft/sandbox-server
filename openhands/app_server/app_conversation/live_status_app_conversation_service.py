@@ -924,6 +924,7 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
         self, task: AppConversationStartTask
     ) -> AsyncGenerator[AppConversationStartTask, None]:
         """Wait for sandbox to start and return info."""
+        created_sandbox = False
         # Get or create the sandbox
         if not task.request.sandbox_id:
             # First try to find a running sandbox for the current user
@@ -941,6 +942,7 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
                 sandbox = await self.sandbox_service.start_sandbox(
                     sandbox_id=sandbox_id_str
                 )
+                created_sandbox = True
             task.sandbox_id = sandbox.id
         else:
             sandbox_info = await self.sandbox_service.get_sandbox(
@@ -983,12 +985,24 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
             raise SandboxError(f'Sandbox not startable: {sandbox.id}')
 
         # Use shared wait_for_sandbox_running utility to poll for ready state
-        await self.sandbox_service.wait_for_sandbox_running(
-            sandbox.id,
-            timeout=self.sandbox_startup_timeout,
-            poll_interval=self.sandbox_startup_poll_frequency,
-            httpx_client=self.httpx_client,
-        )
+        try:
+            await self.sandbox_service.wait_for_sandbox_running(
+                sandbox.id,
+                timeout=self.sandbox_startup_timeout,
+                poll_interval=self.sandbox_startup_poll_frequency,
+                httpx_client=self.httpx_client,
+            )
+        except Exception:
+            if created_sandbox:
+                try:
+                    await self.sandbox_service.delete_sandbox(sandbox.id)
+                except Exception:
+                    _logger.warning(
+                        'Failed to delete sandbox %s after startup failure',
+                        sandbox.id,
+                        exc_info=True,
+                    )
+            raise
 
     async def _seed_sandbox_profiles(
         self, agent_server_url: str, session_api_key: str | None
