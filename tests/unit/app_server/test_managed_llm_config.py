@@ -264,10 +264,7 @@ async def test_absent_settings_use_server_managed_llm():
     assert user_info.agent_settings.llm is managed_llm
     assert user_info.agent_settings.llm.model == 'azure/gpt-5.6-sol'
     assert user_info.agent_settings.llm.auth_type == 'azure_workload_identity'
-    assert any(
-        tool.name == SUB_AGENT_TOOL_NAME
-        for tool in user_info.agent_settings.tools or []
-    )
+    assert user_info.agent_settings.tools is None
 
 
 @pytest.mark.asyncio
@@ -285,13 +282,7 @@ async def test_managed_llm_is_authoritative_over_persisted_settings():
     user_info = await ctx.get_user_info(resolve_agent_profile=True)
 
     assert user_info.agent_settings.llm is managed_llm
-    if 'enable_sub_agents' in user_info.agent_settings.model_fields:
-        assert user_info.agent_settings.enable_sub_agents is True
-    else:
-        assert any(
-            tool.name == SUB_AGENT_TOOL_NAME
-            for tool in user_info.agent_settings.tools or []
-        )
+    assert user_info.agent_settings.tools is None
 
 
 @pytest.mark.asyncio
@@ -303,7 +294,10 @@ async def test_managed_llm_does_not_overwrite_user_managed_profile_tools():
             active_agent_profile_id='00000000-0000-0000-0000-000000000001',
             agent_settings={
                 'llm': {'model': 'user/model', 'api_key': 'secret'},
-                'tools': [Tool(name='terminal')],
+                'tools': [
+                    Tool(name='terminal'),
+                    Tool(name=SUB_AGENT_TOOL_NAME),
+                ],
             },
         )
     )
@@ -313,7 +307,10 @@ async def test_managed_llm_does_not_overwrite_user_managed_profile_tools():
     user_info = await ctx.get_user_info(resolve_agent_profile=True)
 
     assert user_info.agent_settings.llm is managed_llm
-    assert [tool.name for tool in user_info.agent_settings.tools or []] == ['terminal']
+    assert [tool.name for tool in user_info.agent_settings.tools or []] == [
+        'terminal',
+        SUB_AGENT_TOOL_NAME,
+    ]
 
 
 @pytest.mark.asyncio

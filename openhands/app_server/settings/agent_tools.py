@@ -1,12 +1,10 @@
 from dataclasses import dataclass
-from typing import TypeVar
 
 from pydantic import BaseModel, ConfigDict
 
 from openhands.sdk.settings import OpenHandsAgentSettings
-from openhands.sdk.tool import SUB_AGENT_TOOL_NAME, Tool, default_tool_specs
+from openhands.sdk.tool import SUB_AGENT_TOOL_NAME, Tool
 
-_AgentSettingsT = TypeVar('_AgentSettingsT', bound=OpenHandsAgentSettings)
 _RETIRED_TOOL_SWITCHES = {'enable_sub_agents', 'enable_switch_llm_tool'}
 
 
@@ -65,33 +63,3 @@ def effective_agent_tools(
             tool.name == SUB_AGENT_TOOL_NAME for tool in source.tools
         ),
     )
-
-
-def with_managed_subagents(
-    settings: _AgentSettingsT,
-    *,
-    enable_browser: bool,
-) -> _AgentSettingsT:
-    source = _parse_agent_tool_settings(settings)
-    if isinstance(source, _LegacyAgentToolSettings):
-        tools = (
-            list(source.tools)
-            if source.tools is not None
-            else default_tool_specs(enable_browser=enable_browser)
-        )
-        if not any(tool.name == SUB_AGENT_TOOL_NAME for tool in tools):
-            tools.append(Tool(name=SUB_AGENT_TOOL_NAME))
-        updates: dict[str, object] = {
-            'enable_sub_agents': True,
-            'tools': tools,
-        }
-    else:
-        tools = (
-            list(source.tools)
-            if source.tools is not None
-            else default_tool_specs(enable_browser=enable_browser)
-        )
-        if not any(tool.name == SUB_AGENT_TOOL_NAME for tool in tools):
-            tools.append(Tool(name=SUB_AGENT_TOOL_NAME))
-        updates = {'tools': tools}
-    return settings.model_copy(update=updates)

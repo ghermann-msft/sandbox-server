@@ -16,7 +16,6 @@ from openhands.app_server.integrations.provider import (
 )
 from openhands.app_server.integrations.service_types import UserGitInfo
 from openhands.app_server.services.injector import InjectorState
-from openhands.app_server.settings.agent_tools import with_managed_subagents
 from openhands.app_server.user.specifiy_user_context import USER_CONTEXT_ATTR
 from openhands.app_server.user.user_context import UserContext, UserContextInjector
 from openhands.app_server.user.user_models import UserInfo
@@ -65,15 +64,9 @@ class AuthUserContext(UserContext):
         if self.managed_llm is not None and isinstance(
             user_info.agent_settings, OpenHandsAgentSettings
         ):
-            agent_settings = user_info.agent_settings.model_copy(
-                update={'llm': self.managed_llm},
+            user_info.agent_settings = user_info.agent_settings.model_copy(
+                update={'llm': self.managed_llm}
             )
-            if user_info.active_agent_profile_id is None:
-                agent_settings = with_managed_subagents(
-                    agent_settings,
-                    enable_browser=True,
-                )
-            user_info.agent_settings = agent_settings
         return user_info
 
     async def get_user_info(
