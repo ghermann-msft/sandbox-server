@@ -103,6 +103,7 @@ class AppConversationServiceBase(AppConversationService, ABC):
         selected_repository: str | None,
         project_dir: str,
         agent_server_url: str,
+        load_public: bool = True,
         registered_marketplaces: list[MarketplaceRegistration] | None = None,
     ) -> list[Skill]:
         """Load skills from all sources via the agent-server.
@@ -121,6 +122,7 @@ class AppConversationServiceBase(AppConversationService, ABC):
             selected_repository: Repository name or None
             project_dir: Project root directory (resolved via get_project_dir).
             agent_server_url: Agent-server URL (required)
+            load_public: Whether to load public catalog skills.
             registered_marketplaces: Optional list of MarketplaceRegistration objects
                 from user settings. Marketplaces with auto_load=True will have
                 their plugins loaded automatically.
@@ -157,7 +159,7 @@ class AppConversationServiceBase(AppConversationService, ABC):
                 project_dir=project_dir,
                 org_configs=org_configs,
                 sandbox_config=sandbox_config,
-                load_public=True,
+                load_public=load_public,
                 load_user=True,
                 load_project=True,
                 load_org=True,
@@ -176,12 +178,18 @@ class AppConversationServiceBase(AppConversationService, ABC):
             # Return empty list on failure - skills will be loaded again later if needed
             return []
 
-    def _create_agent_with_skills(self, agent, skills: list[Skill]):
+    def _create_agent_with_skills(
+        self,
+        agent,
+        skills: list[Skill],
+        disabled_skills: list[str] | None = None,
+    ):
         """Create or update agent with skills in its context.
 
         Args:
             agent: The agent to update
             skills: List of Skill objects to add to agent context
+            disabled_skills: Skill names to exclude from the merged context.
 
         Returns:
             Updated agent with skills in context
@@ -190,6 +198,11 @@ class AppConversationServiceBase(AppConversationService, ABC):
             # Merge with existing context (new skills override existing ones)
             existing_skills = agent.agent_context.skills
             all_skills = self._merge_skills([existing_skills, skills])
+            if disabled_skills:
+                disabled_set = set(disabled_skills)
+                all_skills = [
+                    skill for skill in all_skills if skill.name not in disabled_set
+                ]
             agent = agent.model_copy(
                 update={
                     'agent_context': agent.agent_context.model_copy(
@@ -199,6 +212,9 @@ class AppConversationServiceBase(AppConversationService, ABC):
             )
         else:
             # Create new context
+            if disabled_skills:
+                disabled_set = set(disabled_skills)
+                skills = [skill for skill in skills if skill.name not in disabled_set]
             agent_context = AgentContext(skills=skills)
             agent = agent.model_copy(update={'agent_context': agent_context})
 
@@ -231,6 +247,7 @@ class AppConversationServiceBase(AppConversationService, ABC):
         selected_repository: str | None,
         project_dir: str,
         disabled_skills: list[str] | None = None,
+        load_public: bool = True,
         registered_marketplaces: list[MarketplaceRegistration] | None = None,
     ):
         """Load all skills and update agent with them.
@@ -241,6 +258,7 @@ class AppConversationServiceBase(AppConversationService, ABC):
             selected_repository: Repository name or None (used for org config)
             project_dir: Project root directory (already resolved via get_project_dir).
             disabled_skills: Optional list of skill names to exclude
+            load_public: Whether to load public catalog skills.
             registered_marketplaces: Optional composed marketplaces (instance +
                 org + user) whose auto_load plugins the agent-server should load.
 
@@ -253,16 +271,15 @@ class AppConversationServiceBase(AppConversationService, ABC):
             selected_repository,
             project_dir,
             agent_server_url,
+            load_public=load_public,
             registered_marketplaces=registered_marketplaces,
         )
 
-        # Filter out disabled skills
-        if disabled_skills:
-            disabled_set = set(disabled_skills)
-            all_skills = [s for s in all_skills if s.name not in disabled_set]
-
-        # Update agent with skills
-        agent = self._create_agent_with_skills(agent, all_skills)
+        # Update agent with skills, applying the deny-list to both resolved
+        # profile skills and workspace-discovered skills.
+        agent = self._create_agent_with_skills(
+            agent, all_skills, disabled_skills=disabled_skills
+        )
 
         return agent
 

@@ -19,6 +19,8 @@ from openhands.app_server.app_conversation.app_conversation_service_base import 
 from openhands.app_server.integrations.service_types import ProviderType
 from openhands.app_server.sandbox.sandbox_models import SandboxInfo, SandboxStatus
 from openhands.app_server.user.user_context import UserContext
+from openhands.sdk.context import AgentContext
+from openhands.sdk.settings import OpenHandsAgentSettings
 from openhands.sdk.skills import Skill
 
 
@@ -1279,6 +1281,7 @@ class TestLoadAndMergeAllSkills:
             assert call_kwargs['agent_server_url'] == 'http://localhost:8000'
             assert call_kwargs['session_api_key'] == 'test-api-key'
             assert call_kwargs['project_dir'] == '/workspace/repo'
+            assert call_kwargs['load_public'] is True
             # Verify registered_marketplaces is passed (can be None or a list)
             assert 'registered_marketplaces' in call_kwargs
 
@@ -1466,6 +1469,150 @@ class TestLoadAndMergeAllSkills:
 
 class TestLoadSkillsAndUpdateAgent:
     """_load_skills_and_update_agent threads marketplaces into skill loading."""
+
+    @staticmethod
+    def _skill(name: str) -> Skill:
+        return Skill(name=name, content=f'{name} content')
+
+    @staticmethod
+    def _agent(skills: list[Skill]):
+        return OpenHandsAgentSettings(
+            agent_context=AgentContext(skills=skills)
+        ).create_agent()
+
+    @pytest.mark.asyncio
+    async def test_null_public_selection_preserves_all_resolved_public_skills(self):
+        """A resolved null allow-list embeds all public skills and reloads no public."""
+        mock_user_context = Mock(spec=UserContext)
+        with patch.object(AppConversationServiceBase, '__abstractmethods__', set()):
+            service = AppConversationServiceBase(
+                init_git_in_empty_workspace=True, user_context=mock_user_context
+            )
+            service.load_and_merge_all_skills = AsyncMock(
+                return_value=[self._skill('user-skill')]
+            )
+
+            agent = await service._load_skills_and_update_agent(
+                Mock(spec=SandboxInfo),
+                self._agent([self._skill('public-one'), self._skill('public-two')]),
+                Mock(host='http://agent:8000'),
+                'owner/repo',
+                '/workspace/repo',
+                load_public=False,
+            )
+
+            assert [skill.name for skill in agent.agent_context.skills] == [
+                'public-one',
+                'public-two',
+                'user-skill',
+            ]
+            assert (
+                service.load_and_merge_all_skills.call_args.kwargs['load_public']
+                is False
+            )
+
+    @pytest.mark.asyncio
+    async def test_explicit_public_subset_preserves_only_resolved_selection(self):
+        mock_user_context = Mock(spec=UserContext)
+        with patch.object(AppConversationServiceBase, '__abstractmethods__', set()):
+            service = AppConversationServiceBase(
+                init_git_in_empty_workspace=True, user_context=mock_user_context
+            )
+            service.load_and_merge_all_skills = AsyncMock(return_value=[])
+
+            agent = await service._load_skills_and_update_agent(
+                Mock(spec=SandboxInfo),
+                self._agent([self._skill('selected-public')]),
+                Mock(host='http://agent:8000'),
+                None,
+                '/workspace',
+                load_public=False,
+            )
+
+            assert [skill.name for skill in agent.agent_context.skills] == [
+                'selected-public'
+            ]
+
+    @pytest.mark.asyncio
+    async def test_empty_public_selection_loads_no_public_skills(self):
+        mock_user_context = Mock(spec=UserContext)
+        with patch.object(AppConversationServiceBase, '__abstractmethods__', set()):
+            service = AppConversationServiceBase(
+                init_git_in_empty_workspace=True, user_context=mock_user_context
+            )
+            service.load_and_merge_all_skills = AsyncMock(return_value=[])
+
+            agent = await service._load_skills_and_update_agent(
+                Mock(spec=SandboxInfo),
+                self._agent([]),
+                Mock(host='http://agent:8000'),
+                None,
+                '/workspace',
+                load_public=False,
+            )
+
+            assert agent.agent_context.skills == []
+
+    @pytest.mark.asyncio
+    async def test_disabled_skills_veto_resolved_and_discovered_skills(self):
+        mock_user_context = Mock(spec=UserContext)
+        with patch.object(AppConversationServiceBase, '__abstractmethods__', set()):
+            service = AppConversationServiceBase(
+                init_git_in_empty_workspace=True, user_context=mock_user_context
+            )
+            service.load_and_merge_all_skills = AsyncMock(
+                return_value=[
+                    self._skill('blocked-discovered'),
+                    self._skill('allowed-user'),
+                ]
+            )
+
+            agent = await service._load_skills_and_update_agent(
+                Mock(spec=SandboxInfo),
+                self._agent(
+                    [self._skill('blocked-resolved'), self._skill('allowed-public')]
+                ),
+                Mock(host='http://agent:8000'),
+                None,
+                '/workspace',
+                disabled_skills=['blocked-resolved', 'blocked-discovered'],
+                load_public=False,
+            )
+
+            assert [skill.name for skill in agent.agent_context.skills] == [
+                'allowed-public',
+                'allowed-user',
+            ]
+
+    @pytest.mark.asyncio
+    async def test_non_public_skills_load_when_public_loading_is_disabled(self):
+        mock_user_context = Mock(spec=UserContext)
+        with patch.object(AppConversationServiceBase, '__abstractmethods__', set()):
+            service = AppConversationServiceBase(
+                init_git_in_empty_workspace=True, user_context=mock_user_context
+            )
+            service.load_and_merge_all_skills = AsyncMock(
+                return_value=[
+                    self._skill('user-skill'),
+                    self._skill('org-skill'),
+                    self._skill('project-skill'),
+                ]
+            )
+
+            agent = await service._load_skills_and_update_agent(
+                Mock(spec=SandboxInfo),
+                self._agent([]),
+                Mock(host='http://agent:8000'),
+                'owner/repo',
+                '/workspace/repo',
+                load_public=False,
+            )
+
+            assert [skill.name for skill in agent.agent_context.skills] == [
+                'user-skill',
+                'org-skill',
+                'project-skill',
+            ]
 
     @pytest.mark.asyncio
     async def test_forwards_registered_marketplaces(self):

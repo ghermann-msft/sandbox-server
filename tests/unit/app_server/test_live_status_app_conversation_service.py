@@ -58,6 +58,7 @@ from openhands.sdk import Agent, AgentContext, Event
 from openhands.sdk.llm import LLM
 from openhands.sdk.secret import LookupSecret, StaticSecret
 from openhands.sdk.settings import ConversationSettings, OpenHandsAgentSettings
+from openhands.sdk.skills import Skill
 from openhands.sdk.workspace.remote.async_remote_workspace import AsyncRemoteWorkspace
 
 
@@ -333,6 +334,38 @@ class TestLiveStatusAppConversationService:
         self.mock_app_conversation_start_task_service.save_app_conversation_start_task.assert_awaited_once_with(
             task
         )
+
+    def test_inherits_parent_agent_profile_without_child_override(self):
+        parent_profile_id = uuid4()
+        request = AppConversationStartRequest()
+        parent = SimpleNamespace(
+            sandbox_id='sandbox-1',
+            selected_repository='owner/repo',
+            selected_branch='main',
+            git_provider=ProviderType.GITHUB,
+            llm_model='gpt-4',
+            launched_agent_profile=SimpleNamespace(agent_profile_id=parent_profile_id),
+        )
+
+        self.service._inherit_configuration_from_parent(request, parent)
+
+        assert request.agent_profile_id == str(parent_profile_id)
+
+    def test_explicit_child_agent_profile_overrides_parent(self):
+        child_profile_id = uuid4()
+        request = AppConversationStartRequest(agent_profile_id=str(child_profile_id))
+        parent = SimpleNamespace(
+            sandbox_id='sandbox-1',
+            selected_repository=None,
+            selected_branch=None,
+            git_provider=None,
+            llm_model=None,
+            launched_agent_profile=SimpleNamespace(agent_profile_id=uuid4()),
+        )
+
+        self.service._inherit_configuration_from_parent(request, parent)
+
+        assert request.agent_profile_id == str(child_profile_id)
 
     @pytest.mark.asyncio
     async def test_seed_sandbox_profiles_upserts_resolved_keys_and_prunes(self):
@@ -1245,6 +1278,49 @@ class TestLiveStatusAppConversationService:
         assert isinstance(result, StartConversationRequest)
         assert result.conversation_id == conversation_id
         self.service._load_skills_and_update_agent.assert_called_once()
+        assert (
+            self.service._load_skills_and_update_agent.call_args.kwargs['load_public']
+            is True
+        )
+
+    @patch(
+        'openhands.app_server.app_conversation.live_status_app_conversation_service.get_default_tools',
+        return_value=[],
+    )
+    @pytest.mark.asyncio
+    async def test_build_request_uses_resolved_profile_skills_without_reloading_public(
+        self, _mock_tools
+    ):
+        selected_skill = Skill(name='selected-public', content='selected content')
+        self.mock_user.active_agent_profile_id = str(uuid4())
+        self.mock_user.agent_settings = OpenHandsAgentSettings(
+            agent_context=AgentContext(skills=[selected_skill])
+        )
+        self.mock_user_context.get_user_info.return_value = self.mock_user
+
+        real_llm = LLM(model='gpt-4', api_key=SecretStr('test-key'))
+        self.service._setup_secrets_for_git_providers = AsyncMock(return_value={})
+        self.service._configure_llm_and_mcp = AsyncMock(return_value=(real_llm, {}))
+        self.service._load_skills_and_update_agent = AsyncMock(
+            side_effect=lambda _sandbox, agent, *_args, **_kwargs: agent
+        )
+
+        await self.service._build_start_conversation_request_for_user(
+            sandbox=self.mock_sandbox,
+            conversation_id=uuid4(),
+            initial_message=None,
+            system_message_suffix=None,
+            git_provider=None,
+            working_dir='/test/dir',
+            remote_workspace=Mock(spec=AsyncRemoteWorkspace),
+            selected_repository='test_repo',
+        )
+
+        call = self.service._load_skills_and_update_agent.call_args
+        assert call.kwargs['load_public'] is False
+        assert [skill.name for skill in call.args[1].agent_context.skills] == [
+            'selected-public'
+        ]
 
     @patch(
         'openhands.app_server.app_conversation.live_status_app_conversation_service.get_default_tools',

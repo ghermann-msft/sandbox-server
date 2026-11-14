@@ -127,7 +127,7 @@ from openhands.sdk.llm.llm_profile_store import PROFILE_NAME_REGEX
 from openhands.sdk.mcp.config import MCPServer
 from openhands.sdk.plugin import PluginSource
 from openhands.sdk.secret import LookupSecret, StaticSecret
-from openhands.sdk.settings import ACPAgentSettings
+from openhands.sdk.settings import ACPAgentSettings, OpenHandsAgentSettings
 from openhands.sdk.subagent import get_registered_agent_definitions
 from openhands.sdk.tool.builtins import SwitchLLMTool
 from openhands.sdk.utils.redact import (
@@ -1078,6 +1078,7 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
         - Sandbox ID (to share the same workspace/environment)
         - Git parameters (repository, branch, provider)
         - LLM model
+        - Agent Profile
 
         Args:
             request: The conversation start request to modify
@@ -1098,6 +1099,11 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
         # Inherit LLM model from parent if not provided
         if not request.llm_model and parent_info.llm_model:
             request.llm_model = parent_info.llm_model
+
+        if not request.agent_profile_id and parent_info.launched_agent_profile:
+            request.agent_profile_id = str(
+                parent_info.launched_agent_profile.agent_profile_id
+            )
 
     def _apply_suggested_task(self, request: AppConversationStartRequest) -> None:
         """Apply suggested task defaults to the start request."""
@@ -1986,7 +1992,7 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
                     selected_repository,
                     get_project_dir(working_dir, selected_repository),
                     effective_disabled_skills(user),
-                    registered_marketplaces,
+                    registered_marketplaces=registered_marketplaces,
                 )
             return acp_request
 
@@ -2076,7 +2082,9 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
                 'tools': tools,
                 'mcp_config': mcp_config if mcp_config else {},
                 'agent_context': AgentContext(
+                    skills=user.agent_settings.agent_context.skills,
                     system_message_suffix=effective_suffix,
+                    disabled_skills=user.agent_settings.agent_context.disabled_skills,
                     secrets=secrets,
                 ),
             }
@@ -2217,6 +2225,9 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
 
         # --- skills (require remote workspace) ------------------------------
         if remote_workspace:
+            # The SDK resolver embeds the profile-selected public/user skills.
+            # Load workspace sources around them without re-adding the full
+            # public catalog.
             request = await self._load_skills_onto_request(
                 request,
                 sandbox,
@@ -2224,7 +2235,11 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
                 selected_repository,
                 project_dir,
                 effective_disabled_skills(user),
-                registered_marketplaces,
+                load_public=not (
+                    getattr(user, 'active_agent_profile_id', None)
+                    and isinstance(user.agent_settings, OpenHandsAgentSettings)
+                ),
+                registered_marketplaces=registered_marketplaces,
             )
 
         return request
@@ -2264,6 +2279,7 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
         selected_repository: str | None,
         project_dir: str,
         disabled_skills: list[str] | None,
+        load_public: bool = True,
         registered_marketplaces: list[MarketplaceRegistration] | None = None,
     ) -> StartConversationRequest:
         """Load workspace skills onto a conversation request's agent.
@@ -2280,6 +2296,7 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
                 selected_repository,
                 project_dir,
                 disabled_skills=disabled_skills,
+                load_public=load_public,
                 registered_marketplaces=registered_marketplaces,
             )
             return request.model_copy(update={'agent': updated_agent})
