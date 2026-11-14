@@ -1,7 +1,7 @@
 from pathlib import Path
 
 DOCKERFILE = Path(__file__).parents[2] / 'containers' / 'app' / 'Dockerfile'
-EXTENSIONS_REF = '659e38188b8da6680dc1e3424cf6f2498381162f'
+EXTENSIONS_REF = '40cfb779515c6cebd34ecd4df0117a436387b3ee'
 
 
 def test_software_agent_sdk_override_is_opt_in_and_uses_one_checkout():

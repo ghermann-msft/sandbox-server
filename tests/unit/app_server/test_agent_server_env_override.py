@@ -368,7 +368,7 @@ class TestExtensionsRefForwarding:
         assert 'EXTENSIONS_REF' in AUTO_FORWARD_VARIABLES
 
     def test_extensions_ref_auto_forwarded(self):
-        ref = '659e38188b8da6680dc1e3424cf6f2498381162f'
+        ref = '40cfb779515c6cebd34ecd4df0117a436387b3ee'
         with patch.dict(os.environ, {'EXTENSIONS_REF': ref}, clear=True):
             assert get_agent_server_env() == {'EXTENSIONS_REF': ref}
 
@@ -395,7 +395,7 @@ class TestExtensionsRefForwarding:
             assert get_agent_server_env()['EXTENSIONS_REF'] == 'sandbox-ref'
 
     def test_kubernetes_spec_forwards_extensions_ref(self):
-        ref = '659e38188b8da6680dc1e3424cf6f2498381162f'
+        ref = '40cfb779515c6cebd34ecd4df0117a436387b3ee'
         with patch.dict(os.environ, {'EXTENSIONS_REF': ref}, clear=True):
             spec = get_default_kubernetes_sandbox_specs()[0]
             assert spec.initial_env['EXTENSIONS_REF'] == ref
