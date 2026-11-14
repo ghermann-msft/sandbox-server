@@ -178,6 +178,25 @@ async def test_new_sandbox_is_private_to_creator(session_maker):
         assert acl.member_object_ids == []
 
 
+@pytest.mark.asyncio
+async def test_owner_identity_comes_from_stored_sandbox_access(session_maker):
+    async with session_maker() as db_session:
+        access = SandboxAccessService(
+            db_session,
+            TrustedIdentity(tenant_id=TENANT_A, object_id=OWNER_ID),
+        )
+        await access.create_personal_sandbox('source')
+        await db_session.commit()
+
+    async with session_maker() as db_session:
+        access = SandboxAccessService(db_session)
+        assert await access.owner_identity('source') == TrustedIdentity(
+            tenant_id=TENANT_A,
+            object_id=OWNER_ID,
+        )
+        assert await access.owner_identity('missing') is None
+
+
 def test_acl_rejects_non_object_id_members():
     with pytest.raises(ValidationError, match='Microsoft Entra object IDs'):
         SandboxAclUpdate(

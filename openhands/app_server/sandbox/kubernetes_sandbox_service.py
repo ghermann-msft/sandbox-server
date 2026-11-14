@@ -37,7 +37,7 @@ from kubernetes.client.rest import ApiException
 from pydantic import BaseModel, ConfigDict, Field
 
 from openhands.agent_server.utils import utc_now
-from openhands.app_server.errors import SandboxError
+from openhands.app_server.errors import PermissionsError, SandboxError
 from openhands.app_server.sandbox.sandbox_access import SandboxAccessService
 from openhands.app_server.sandbox.sandbox_models import (
     AGENT_SERVER,
@@ -832,7 +832,9 @@ class KubernetesSandboxServiceInjector(SandboxServiceInjector):
         )
         from openhands.app_server.user.specifiy_user_context import (
             ADMIN,
+            SANDBOX_USER_CONTEXT_ATTR,
             USER_CONTEXT_ATTR,
+            SandboxUserContext,
         )
 
         config = get_global_config()
@@ -843,7 +845,26 @@ class KubernetesSandboxServiceInjector(SandboxServiceInjector):
             get_db_session(state, request) as db_session,
         ):
             identity = None
-            if getattr(state, USER_CONTEXT_ATTR, None) is not ADMIN:
+            sandbox_user_context = getattr(state, SANDBOX_USER_CONTEXT_ATTR, None)
+            if sandbox_user_context is None and isinstance(
+                user_context, SandboxUserContext
+            ):
+                sandbox_user_context = user_context
+
+            access_service = SandboxAccessService(db_session=db_session)
+            if sandbox_user_context is not None:
+                identity = await access_service.owner_identity(
+                    sandbox_user_context.sandbox_id
+                )
+                if (
+                    identity is None
+                    or identity.object_id != sandbox_user_context.user_id
+                    or identity.object_id != await user_context.get_user_id()
+                ):
+                    raise PermissionsError(
+                        'Authenticated sandbox owner does not match stored ownership'
+                    )
+            elif getattr(state, USER_CONTEXT_ATTR, None) is not ADMIN:
                 if request is None:
                     raise SandboxError('Trusted sandbox identity is required')
                 async with get_trusted_identity_service(
@@ -867,7 +888,6 @@ class KubernetesSandboxServiceInjector(SandboxServiceInjector):
                     await user_context.get_default_sandbox_spec_id()
                 ),
                 access_service=SandboxAccessService(
-                    db_session=db_session,
-                    identity=identity,
+                    db_session=db_session, identity=identity
                 ),
             )

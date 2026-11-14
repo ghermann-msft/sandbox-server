@@ -169,6 +169,18 @@ class SandboxAccessService:
         )
         return result.scalar_one_or_none()
 
+    async def owner_identity(self, sandbox_id: str) -> TrustedIdentity | None:
+        result = await self.db_session.execute(
+            select(
+                StoredSandboxAccess.tenant_id,
+                StoredSandboxAccess.owner_object_id,
+            ).where(StoredSandboxAccess.sandbox_id == sandbox_id)
+        )
+        row = result.one_or_none()
+        if row is None:
+            return None
+        return TrustedIdentity(tenant_id=row.tenant_id, object_id=row.owner_object_id)
+
     async def access_type(self, sandbox_id: str) -> SandboxAccessType | None:
         result = await self.db_session.execute(
             select(StoredSandboxAccess.access_type).where(
@@ -193,14 +205,8 @@ class SandboxAccessService:
         else:
             statement = statement.outerjoin(
                 StoredSandboxMember,
-                (
-                    StoredSandboxMember.sandbox_id
-                    == StoredSandboxAccess.sandbox_id
-                )
-                & (
-                    StoredSandboxMember.tenant_id
-                    == StoredSandboxAccess.tenant_id
-                ),
+                (StoredSandboxMember.sandbox_id == StoredSandboxAccess.sandbox_id)
+                & (StoredSandboxMember.tenant_id == StoredSandboxAccess.tenant_id),
             ).where(
                 or_(
                     StoredSandboxAccess.owner_object_id == identity.object_id,

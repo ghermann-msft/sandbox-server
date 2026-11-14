@@ -4,7 +4,6 @@ This module tests the batch_get_app_conversations endpoint,
 focusing on UUID string parsing, validation, and error handling.
 """
 
-import hashlib
 import json
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
@@ -17,7 +16,6 @@ from fastapi import FastAPI, HTTPException, Request, status
 from fastapi.responses import JSONResponse
 from fastapi.testclient import TestClient
 
-from openhands.app_server import v1_router
 from openhands.app_server.app_conversation import app_conversation_router
 from openhands.app_server.app_conversation.app_conversation_models import (
     AppConversation,
@@ -36,8 +34,6 @@ from openhands.app_server.app_conversation.app_conversation_router import (
     search_app_conversations,
     switch_conversation_profile,
 )
-from openhands.app_server.errors import AuthError
-from openhands.app_server.sandbox import session_auth
 from openhands.app_server.sandbox.sandbox_models import SandboxStatus
 from openhands.app_server.sandbox.session_auth import (
     authenticate_app_conversation_request,
@@ -90,7 +86,7 @@ def test_app_conversation_router_uses_composite_auth_dependency():
     assert dependencies == [authenticate_app_conversation_request]
 
 
-def test_start_app_conversation_uses_raw_bearer_before_trusted_identity():
+def test_start_app_conversation_uses_sandbox_owner_bearer():
     owner_id = 'owner-a'
     sandbox = MagicMock(
         id='sandbox-a',
@@ -102,29 +98,15 @@ def test_start_app_conversation_uses_raw_bearer_before_trusted_identity():
     sandbox.exposed_urls = []
     user_auth = AsyncMock()
     observed_owner: list[str | None] = []
-    sandbox_service = AsyncMock()
-    sandbox_service.get_sandbox_by_session_api_key.return_value = sandbox
 
     @asynccontextmanager
     async def sandbox_service_context(state, request=None):
-        yield sandbox_service
+        service = AsyncMock()
+        service.get_sandbox_by_session_api_key.return_value = sandbox
+        yield service
 
-    real_user_injector = (
-        app_conversation_router.user_context_dependency.dependency.__self__
-    )
-    assert isinstance(real_user_injector, AuthUserContextInjector)
-    config = SimpleNamespace(
-        user=real_user_injector,
-        trusted_identity=object(),
-    )
-    identity_service = MagicMock()
-    identity_service.verify_request.side_effect = AuthError(
-        'Missing trusted identity assertion'
-    )
-
-    @asynccontextmanager
-    async def trusted_identity_context(state, request=None):
-        yield identity_service
+    async def user_context_override(request: Request):
+        return request.state.user_context
 
     async def service_override(request: Request):
         context = request.state.user_context
@@ -146,8 +128,10 @@ def test_start_app_conversation_uses_raw_bearer_before_trusted_identity():
     httpx_client.aclose = AsyncMock()
 
     app = FastAPI()
-    app.include_router(v1_router.router)
-    app.dependency_overrides[session_auth._APP_API_BEARER] = lambda: None
+    app.include_router(app_conversation_router.router, prefix='/api/v1')
+    app.dependency_overrides[
+        app_conversation_router.user_context_dependency.dependency
+    ] = user_context_override
     app.dependency_overrides[
         app_conversation_router.app_conversation_service_dependency.dependency
     ] = service_override
@@ -169,23 +153,8 @@ def test_start_app_conversation_uses_raw_bearer_before_trusted_identity():
         ),
         patch(
             'openhands.app_server.sandbox.session_auth.get_global_config',
-            return_value=config,
+            return_value=SimpleNamespace(user=AuthUserContextInjector()),
         ),
-        patch(
-            'openhands.app_server.sandbox.session_auth._STATIC_SESSION_API_KEY',
-            'static-service-key',
-        ),
-        patch(
-            'openhands.app_server.config.get_global_config',
-            return_value=config,
-        ),
-        patch(
-            'openhands.app_server.config.get_trusted_identity_service',
-            side_effect=trusted_identity_context,
-        ),
-        patch(
-            'openhands.app_server.sandbox.session_auth._logger.warning'
-        ) as bearer_warning,
         TestClient(app) as client,
     ):
         response = client.post(
@@ -197,22 +166,6 @@ def test_start_app_conversation_uses_raw_bearer_before_trusted_identity():
     assert response.status_code == 200
     assert response.json()['created_by_user_id'] == owner_id
     assert observed_owner == [owner_id]
-    sandbox_service.get_sandbox_by_session_api_key.assert_awaited_once_with(
-        'sandbox-key'
-    )
-    identity_service.verify_request.assert_not_called()
-    bearer_warning.assert_called_once()
-    assert bearer_warning.call_args.args == (
-        'HTTPBearer dependency differed from request Authorization header',
-    )
-    diagnostic = bearer_warning.call_args.kwargs['extra']
-    assert diagnostic['request_bearer_length'] == len('sandbox-key')
-    assert (
-        diagnostic['request_bearer_sha256_prefix']
-        == hashlib.sha256(b'sandbox-key').hexdigest()[:12]
-    )
-    assert diagnostic['injected_bearer_present'] is False
-    assert 'sandbox-key' not in repr(bearer_warning.call_args)
 
 
 @pytest.mark.asyncio

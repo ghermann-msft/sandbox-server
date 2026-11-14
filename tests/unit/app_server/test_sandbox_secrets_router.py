@@ -39,7 +39,11 @@ from openhands.app_server.user.auth_user_context import (
     AuthUserContext,
     AuthUserContextInjector,
 )
-from openhands.app_server.user.specifiy_user_context import USER_CONTEXT_ATTR
+from openhands.app_server.user.specifiy_user_context import (
+    SANDBOX_USER_CONTEXT_ATTR,
+    USER_CONTEXT_ATTR,
+    SandboxUserContext,
+)
 from openhands.app_server.user.user_models import UserInfo
 from openhands.app_server.user.user_router import get_current_user
 from openhands.sdk.llm import LLM
@@ -288,6 +292,10 @@ class TestAuthenticateAppConversationRequest:
         assert await context.get_user_id() == 'owner-a'
         assert context.managed_llm is managed_llm
         assert getattr(request.state, USER_AUTH_ATTR) is user_auth
+        assert getattr(request.state, SANDBOX_USER_CONTEXT_ATTR) == SandboxUserContext(
+            user_id='owner-a',
+            sandbox_id=SANDBOX_ID,
+        )
         mock_get_user_auth.assert_awaited_once_with(request)
 
     async def test_invalid_bearer_still_requires_static_key(self):

@@ -17,7 +17,6 @@ Security Note:
 
 from __future__ import annotations
 
-import hashlib
 import logging
 from typing import TYPE_CHECKING
 
@@ -27,7 +26,6 @@ from fastapi.security import (
     HTTPAuthorizationCredentials,
     HTTPBearer,
 )
-from fastapi.security.utils import get_authorization_scheme_param
 
 from openhands.app_server.config import get_global_config, get_sandbox_service
 from openhands.app_server.config_api.config_models import AppMode
@@ -38,7 +36,12 @@ from openhands.app_server.user.auth_user_context import (
     AuthUserContext,
     AuthUserContextInjector,
 )
-from openhands.app_server.user.specifiy_user_context import ADMIN, USER_CONTEXT_ATTR
+from openhands.app_server.user.specifiy_user_context import (
+    ADMIN,
+    SANDBOX_USER_CONTEXT_ATTR,
+    USER_CONTEXT_ATTR,
+    SandboxUserContext,
+)
 from openhands.app_server.user_auth.user_auth import get_user_auth
 from openhands.app_server.utils.dependencies import (
     _SESSION_API_KEY as _STATIC_SESSION_API_KEY,
@@ -53,47 +56,6 @@ _APP_API_BEARER = HTTPBearer(auto_error=False)
 _STATIC_SESSION_API_KEY_HEADER = APIKeyHeader(
     name='X-Session-API-Key', auto_error=False
 )
-
-
-def _request_bearer_credentials(
-    request: Request,
-    injected_bearer: HTTPAuthorizationCredentials | None,
-) -> str | None:
-    authorization = (
-        request.headers.get('Authorization') if 'headers' in request.scope else None
-    )
-    scheme, request_credentials = get_authorization_scheme_param(authorization)
-    if scheme.lower() != 'bearer' or not request_credentials:
-        request_credentials = None
-
-    injected_credentials = (
-        injected_bearer.credentials if injected_bearer is not None else None
-    )
-    if request_credentials is not None and request_credentials != injected_credentials:
-        _logger.warning(
-            'HTTPBearer dependency differed from request Authorization header',
-            extra={
-                'request_bearer_length': len(request_credentials),
-                'request_bearer_sha256_prefix': hashlib.sha256(
-                    request_credentials.encode()
-                ).hexdigest()[:12],
-                'injected_bearer_present': injected_credentials is not None,
-                'injected_bearer_length': (
-                    len(injected_credentials)
-                    if injected_credentials is not None
-                    else None
-                ),
-                'injected_bearer_sha256_prefix': (
-                    hashlib.sha256(injected_credentials.encode()).hexdigest()[:12]
-                    if injected_credentials is not None
-                    else None
-                ),
-            },
-        )
-
-    return (
-        request_credentials if request_credentials is not None else injected_credentials
-    )
 
 
 async def validate_session_key(session_api_key: str | None) -> SandboxInfo:
@@ -214,10 +176,9 @@ async def authenticate_app_conversation_request(
     namespace-static ``SESSION_API_KEY``, requests that are not authenticated by
     a sandbox bearer must still provide that key.
     """
-    bearer_credentials = _request_bearer_credentials(request, bearer)
-    if bearer_credentials is not None:
+    if bearer is not None:
         try:
-            sandbox_info = await validate_session_key(bearer_credentials)
+            sandbox_info = await validate_session_key(bearer.credentials)
         except HTTPException as exc:
             if not (
                 exc.status_code == status.HTTP_401_UNAUTHORIZED
@@ -240,6 +201,11 @@ async def authenticate_app_conversation_request(
                 else None
             )
             setattr(request.state, USER_AUTH_ATTR, user_auth)
+            setattr(
+                request.state,
+                SANDBOX_USER_CONTEXT_ATTR,
+                SandboxUserContext(user_id=owner_id, sandbox_id=sandbox_info.id),
+            )
             setattr(
                 request.state,
                 USER_CONTEXT_ATTR,

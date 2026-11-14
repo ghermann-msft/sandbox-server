@@ -10,11 +10,14 @@ No cluster is required: the CustomObjectsApi is mocked.
 """
 
 import re
+from contextlib import asynccontextmanager
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
+from fastapi import APIRouter, Depends, FastAPI
+from fastapi.testclient import TestClient
 from kubernetes.client.rest import ApiException
 from pydantic import ValidationError
 
@@ -29,7 +32,12 @@ from openhands.app_server.sandbox.kubernetes_sandbox_service import (
     KubernetesSandboxService,
     KubernetesSandboxServiceInjector,
 )
-from openhands.app_server.sandbox.sandbox_models import AGENT_SERVER, SandboxStatus
+from openhands.app_server.sandbox.sandbox_access import StoredSandboxAccess
+from openhands.app_server.sandbox.sandbox_models import (
+    AGENT_SERVER,
+    SandboxInfo,
+    SandboxStatus,
+)
 from openhands.app_server.sandbox.sandbox_service import (
     OPENHANDS_API_KEY_VARIABLE,
     OPENHANDS_CLOUD_API_URL_VARIABLE,
@@ -37,6 +45,10 @@ from openhands.app_server.sandbox.sandbox_service import (
     WEBHOOK_CALLBACK_VARIABLE,
     WEBHOOK_HEADERS_VARIABLE,
 )
+from openhands.app_server.sandbox.session_auth import (
+    authenticate_app_conversation_request,
+)
+from openhands.app_server.user.auth_user_context import AuthUserContextInjector
 
 
 @pytest.fixture
@@ -295,6 +307,186 @@ async def test_start_sandbox_can_skip_session_key_injection(
     assert OPENHANDS_CLOUD_API_URL_VARIABLE not in env
     # An explicitly configured pool wins over the spec id.
     assert body['spec']['warmPoolRef'] == {'name': 'pinned-pool'}
+
+
+def _sandbox_bearer_start_app(stored_owner_id: str):
+    source_owner_id = '33333333-3333-3333-3333-333333333333'
+    tenant_id = '11111111-1111-1111-1111-111111111111'
+    source_sandbox = SandboxInfo(
+        id='source-sandbox',
+        created_by_user_id=source_owner_id,
+        sandbox_spec_id='pool',
+        status=SandboxStatus.RUNNING,
+        session_api_key='source-key',
+    )
+    lookup_service = AsyncMock()
+    lookup_service.get_sandbox_by_session_api_key.return_value = source_sandbox
+
+    @asynccontextmanager
+    async def lookup_service_context(state, request=None):
+        yield lookup_service
+
+    sandbox_spec_service = AsyncMock()
+    sandbox_spec = SimpleNamespace(
+        id='pool',
+        initial_env={},
+        command=None,
+        working_dir='/workspace',
+    )
+    sandbox_spec_service.get_default_sandbox_spec.return_value = sandbox_spec
+    sandbox_spec_service.get_sandbox_spec.return_value = sandbox_spec
+
+    @asynccontextmanager
+    async def sandbox_spec_context(state, request=None):
+        yield sandbox_spec_service
+
+    @asynccontextmanager
+    async def user_context_context(state, request=None):
+        yield state.user_context
+
+    owner_result = MagicMock()
+    owner_result.one_or_none.return_value = SimpleNamespace(
+        tenant_id=tenant_id,
+        owner_object_id=stored_owner_id,
+    )
+    accessible_result = MagicMock()
+    accessible_result.scalars.return_value.all.return_value = []
+    db_session = MagicMock()
+    db_session.execute = AsyncMock(side_effect=[owner_result, accessible_result])
+    db_session.flush = AsyncMock()
+
+    @asynccontextmanager
+    async def db_context(state, request=None):
+        yield db_session
+
+    trusted_identity_service = MagicMock()
+
+    @asynccontextmanager
+    async def trusted_identity_context(state, request=None):
+        yield trusted_identity_service
+
+    custom_objects = MagicMock()
+    custom_objects.list_namespaced_custom_object.return_value = {'items': []}
+    injector = KubernetesSandboxServiceInjector(
+        namespace='agents',
+        warm_pool='pool',
+        webhook_base_url='http://app-server:3000',
+        exposed_ports=[],
+    )
+    config = SimpleNamespace(
+        user=AuthUserContextInjector(),
+        trusted_identity=object(),
+        web_url=None,
+        permitted_cors_origins=[],
+    )
+    user_auth = AsyncMock()
+    user_auth.get_user_settings.return_value = None
+
+    child_router = APIRouter(
+        prefix='/app-conversations',
+        dependencies=[Depends(authenticate_app_conversation_request)],
+    )
+
+    @child_router.post('')
+    async def start_child(
+        sandbox_service=Depends(injector.depends),
+    ):
+        sandbox_service._custom_objects = custom_objects
+        info = await sandbox_service.start_sandbox(
+            sandbox_spec_id='pool',
+            sandbox_id='child-sandbox',
+        )
+        return {
+            'created_by_user_id': info.created_by_user_id,
+            'tenant_id': sandbox_service.access_service.identity.tenant_id,
+        }
+
+    parent_router = APIRouter(prefix='/api/v1')
+    parent_router.include_router(child_router)
+    app = FastAPI()
+    app.include_router(parent_router)
+
+    with (
+        patch(
+            'openhands.app_server.sandbox.session_auth.get_sandbox_service',
+            lookup_service_context,
+        ),
+        patch(
+            'openhands.app_server.sandbox.session_auth.get_user_auth',
+            new=AsyncMock(return_value=user_auth),
+        ),
+        patch(
+            'openhands.app_server.sandbox.session_auth.get_global_config',
+            return_value=config,
+        ),
+        patch(
+            'openhands.app_server.config.get_global_config',
+            return_value=config,
+        ),
+        patch(
+            'openhands.app_server.config.get_sandbox_spec_service',
+            side_effect=sandbox_spec_context,
+        ),
+        patch(
+            'openhands.app_server.config.get_user_context',
+            side_effect=user_context_context,
+        ),
+        patch(
+            'openhands.app_server.config.get_db_session',
+            side_effect=db_context,
+        ),
+        patch(
+            'openhands.app_server.config.get_trusted_identity_service',
+            side_effect=trusted_identity_context,
+        ),
+        patch.object(KubernetesSandboxService, '__post_init__', return_value=None),
+        TestClient(app, raise_server_exceptions=False) as client,
+    ):
+        response = client.post(
+            '/api/v1/app-conversations',
+            headers={'Authorization': 'Bearer source-key'},
+        )
+
+    return (
+        response,
+        db_session,
+        trusted_identity_service,
+        source_owner_id,
+        tenant_id,
+    )
+
+
+def test_sandbox_bearer_child_preserves_owner_and_tenant():
+    owner_id = '33333333-3333-3333-3333-333333333333'
+
+    response, db_session, identity_service, _, tenant_id = _sandbox_bearer_start_app(
+        owner_id
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        'created_by_user_id': owner_id,
+        'tenant_id': tenant_id,
+    }
+    identity_service.verify_request.assert_not_called()
+    child_access = db_session.add.call_args.args[0]
+    assert isinstance(child_access, StoredSandboxAccess)
+    assert child_access.sandbox_id == 'child-sandbox'
+    assert child_access.tenant_id == tenant_id
+    assert child_access.owner_object_id == owner_id
+
+
+def test_sandbox_bearer_child_rejects_stored_owner_mismatch():
+    response, db_session, identity_service, _, _ = _sandbox_bearer_start_app(
+        '55555555-5555-5555-5555-555555555555'
+    )
+
+    assert response.status_code == 403
+    assert response.json()['detail'] == (
+        'Authenticated sandbox owner does not match stored ownership'
+    )
+    identity_service.verify_request.assert_not_called()
+    db_session.add.assert_not_called()
 
 
 async def test_claim_name_is_dns_safe(service, custom_objects):

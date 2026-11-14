@@ -64,6 +64,7 @@ class SandboxUserContext(SpecifyUserContext):
 
 
 USER_CONTEXT_ATTR = 'user_context'
+SANDBOX_USER_CONTEXT_ATTR = 'sandbox_user_context'
 ADMIN = SpecifyUserContext(user_id=None)
 
 
