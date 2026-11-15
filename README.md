@@ -148,6 +148,15 @@ docker compose up --build
 The Compose setup mounts the Docker socket and a local workspace so the server
 can manage sandbox containers.
 
+Azure Database for PostgreSQL can use federated workload identity instead of a
+static password. Set `DB_AZURE_IDENTITY=true`, `DB_HOST`, `DB_PORT`, `DB_NAME`,
+`DB_USER`, and `DB_SSL_MODE=require`, together with the standard
+`AZURE_CLIENT_ID`, `AZURE_TENANT_ID`, and `AZURE_FEDERATED_TOKEN_FILE`
+variables. `AZURE_AUTHORITY_HOST` is honored by Azure Identity when needed.
+`DB_PASS` is not used in this mode. Each new pooled database connection obtains
+a token for `https://ossrdbms-aad.database.windows.net/.default`, allowing
+Azure Identity to refresh credentials without restarting the server.
+
 ## Extraction provenance
 
 The extraction is based on:
