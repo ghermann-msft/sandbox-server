@@ -15,7 +15,7 @@ ARG POETRY_VERSION=2.3.4
 # Keep the Sandbox control plane on the same SDK source as the hosted Agent
 # Server until the workload-identity auth contract is available in a release.
 ARG SOFTWARE_AGENT_SDK_REPOSITORY=https://github.com/ghermann-msft/software-agent-sdk.git
-ARG SOFTWARE_AGENT_SDK_REF=2c3cf01f05b9bbeb40b1aff96f7d5166d3d26bc9
+ARG SOFTWARE_AGENT_SDK_REF=cb6974d484cdf9e85d7e1940a43bea3f360686d6
 RUN apt-get update -y \
     && apt-get install -y curl make git build-essential jq gettext \
     && python3 -m pip install "poetry==${POETRY_VERSION}" --break-system-packages

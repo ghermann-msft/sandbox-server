@@ -7,7 +7,7 @@ def test_sandbox_image_pins_workload_identity_sdk_runtime():
     ).read_text()
 
     assert (
-        'SOFTWARE_AGENT_SDK_REF=2c3cf01f05b9bbeb40b1aff96f7d5166d3d26bc9' in dockerfile
+        'SOFTWARE_AGENT_SDK_REF=cb6974d484cdf9e85d7e1940a43bea3f360686d6' in dockerfile
     )
     assert (
         'SOFTWARE_AGENT_SDK_REPOSITORY=https://github.com/ghermann-msft/'
