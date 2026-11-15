@@ -15,6 +15,8 @@ import pytest
 
 from openhands.app_server.errors import SandboxError
 from openhands.app_server.sandbox.sandbox_models import (
+    AGENT_SERVER,
+    ExposedUrl,
     SandboxInfo,
     SandboxPage,
     SandboxRecord,
@@ -104,6 +106,69 @@ class TestWaitForSandboxRunning:
     reaches the user, so internal infra details (registry hosts, secret names,
     node taints/labels, cluster size, ...) can't leak.
     """
+
+    @pytest.mark.asyncio
+    async def test_agent_server_health_check_uses_session_api_key(
+        self, mock_sandbox_service
+    ):
+        sandbox = SandboxInfo(
+            id='sb1',
+            created_by_user_id=None,
+            sandbox_spec_id='test-spec',
+            status=SandboxStatus.RUNNING,
+            session_api_key='session-key',
+            exposed_urls=[
+                ExposedUrl(
+                    name=AGENT_SERVER,
+                    url='https://agent.example.com/',
+                    port=443,
+                )
+            ],
+        )
+        response = AsyncMock()
+        response.is_success = True
+        httpx_client = AsyncMock()
+        httpx_client.get.return_value = response
+
+        assert await mock_sandbox_service._check_agent_server_alive(
+            sandbox, httpx_client
+        )
+        httpx_client.get.assert_awaited_once_with(
+            'https://agent.example.com/alive',
+            headers={'X-Session-API-Key': 'session-key'},
+            timeout=5.0,
+        )
+
+    @pytest.mark.asyncio
+    async def test_agent_server_health_check_omits_header_without_session_api_key(
+        self, mock_sandbox_service
+    ):
+        sandbox = SandboxInfo(
+            id='sb1',
+            created_by_user_id=None,
+            sandbox_spec_id='test-spec',
+            status=SandboxStatus.RUNNING,
+            session_api_key=None,
+            exposed_urls=[
+                ExposedUrl(
+                    name=AGENT_SERVER,
+                    url='https://agent.example.com',
+                    port=443,
+                )
+            ],
+        )
+        response = AsyncMock()
+        response.is_success = True
+        httpx_client = AsyncMock()
+        httpx_client.get.return_value = response
+
+        assert await mock_sandbox_service._check_agent_server_alive(
+            sandbox, httpx_client
+        )
+        httpx_client.get.assert_awaited_once_with(
+            'https://agent.example.com/alive',
+            timeout=5.0,
+        )
 
     def _sandbox(self, status, detail):
         return SandboxInfo(

@@ -250,7 +250,14 @@ class SandboxService(ABC):
         try:
             agent_server_url = self._get_agent_server_url(sandbox)
             url = f'{agent_server_url.rstrip("/")}/alive'
-            response = await httpx_client.get(url, timeout=5.0)
+            if sandbox.session_api_key:
+                response = await httpx_client.get(
+                    url,
+                    headers={'X-Session-API-Key': sandbox.session_api_key},
+                    timeout=5.0,
+                )
+            else:
+                response = await httpx_client.get(url, timeout=5.0)
             return response.is_success
         except Exception as exc:
             _logger.debug(
