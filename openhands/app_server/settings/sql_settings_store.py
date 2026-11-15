@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from typing import Any
 
 from sqlalchemy import Integer, String, Text, update
 from sqlalchemy.exc import IntegrityError
@@ -11,31 +12,62 @@ from openhands.app_server.settings.settings_models import Settings
 from openhands.app_server.settings.settings_store import SettingsStore
 from openhands.app_server.utils.sql_utils import Base
 from openhands.sdk.llm import LLM
+from openhands.sdk.mcp.config import MCPServer
 
 _DEFAULT_LLM_PROFILE = 'default'
+_FOUNDRY_WEB_SEARCH_MCP_NAME = 'foundry-web-search'
+_FOUNDRY_WEB_SEARCH_MCP_AUTH_TYPE = 'azure_workload_identity'
 
 
 def _default_hosted_settings() -> Settings:
     settings = Settings()
+    agent_updates: dict[str, Any] = {}
+
     model = os.getenv('LLM_MODEL')
-    if not model:
-        return settings
+    if model:
+        llm_updates = {'model': model}
+        for env_name, field_name in (
+            ('LLM_BASE_URL', 'base_url'),
+            ('LLM_API_VERSION', 'api_version'),
+            ('LLM_AUTH_TYPE', 'auth_type'),
+        ):
+            value = os.getenv(env_name)
+            if value:
+                llm_updates[field_name] = value
 
-    llm_updates = {'model': model}
-    for env_name, field_name in (
-        ('LLM_BASE_URL', 'base_url'),
-        ('LLM_API_VERSION', 'api_version'),
-        ('LLM_AUTH_TYPE', 'auth_type'),
-    ):
-        value = os.getenv(env_name)
-        if value:
-            llm_updates[field_name] = value
+        llm = LLM.model_validate(llm_updates)
+        agent_updates['llm'] = llm
+        settings.llm_profiles.save(_DEFAULT_LLM_PROFILE, llm)
+        settings.llm_profiles.active = _DEFAULT_LLM_PROFILE
+        settings.title_llm_profile = _DEFAULT_LLM_PROFILE
 
-    llm = LLM.model_validate(llm_updates)
-    settings.agent_settings = settings.agent_settings.model_copy(update={'llm': llm})
-    settings.llm_profiles.save(_DEFAULT_LLM_PROFILE, llm)
-    settings.llm_profiles.active = _DEFAULT_LLM_PROFILE
-    settings.title_llm_profile = _DEFAULT_LLM_PROFILE
+    mcp_endpoint = os.getenv('FOUNDRY_WEB_SEARCH_MCP_ENDPOINT')
+    mcp_auth_type = os.getenv('FOUNDRY_WEB_SEARCH_MCP_AUTH_TYPE')
+    if bool(mcp_endpoint) != bool(mcp_auth_type):
+        raise ValueError(
+            'FOUNDRY_WEB_SEARCH_MCP_ENDPOINT and '
+            'FOUNDRY_WEB_SEARCH_MCP_AUTH_TYPE must be configured together'
+        )
+    if mcp_endpoint:
+        if mcp_auth_type != _FOUNDRY_WEB_SEARCH_MCP_AUTH_TYPE:
+            raise ValueError(
+                'FOUNDRY_WEB_SEARCH_MCP_AUTH_TYPE must be '
+                f'{_FOUNDRY_WEB_SEARCH_MCP_AUTH_TYPE!r}'
+            )
+        agent_updates['mcp_config'] = {
+            _FOUNDRY_WEB_SEARCH_MCP_NAME: MCPServer.model_validate(
+                {
+                    'url': mcp_endpoint,
+                    'transport': 'streamable-http',
+                    'auth': {'strategy': 'azure_workload_identity'},
+                }
+            )
+        }
+
+    if agent_updates:
+        settings.agent_settings = settings.agent_settings.model_copy(
+            update=agent_updates
+        )
     return settings
 
 

@@ -17,8 +17,16 @@ from openhands.app_server.services.jwt_service import JwtService
 from openhands.app_server.settings.sql_settings_store import (
     SQLSettingsStore,
     StoredUserSettings,
+    _default_hosted_settings,
 )
 from openhands.app_server.utils.encryption_key import EncryptionKey
+from openhands.sdk.mcp.config import MCPServer
+
+FOUNDRY_WEB_SEARCH_MCP_ENDPOINT = (
+    'https://azureaieastus21665416127.services.ai.azure.com/api/projects/'
+    'studio-ai-agents-project/toolboxes/openhands-web-search/versions/1/mcp'
+    '?api-version=v1'
+)
 
 
 @pytest.fixture
@@ -85,10 +93,17 @@ async def test_settings_bootstrap_uses_deployment_llm_environment(
 
 
 @pytest.mark.asyncio
-async def test_settings_bootstrap_without_llm_environment_keeps_defaults(
+async def test_settings_bootstrap_without_deployment_environment_keeps_defaults(
     sql_dependencies, monkeypatch
 ):
-    for name in ('LLM_MODEL', 'LLM_BASE_URL', 'LLM_API_VERSION', 'LLM_AUTH_TYPE'):
+    for name in (
+        'LLM_MODEL',
+        'LLM_BASE_URL',
+        'LLM_API_VERSION',
+        'LLM_AUTH_TYPE',
+        'FOUNDRY_WEB_SEARCH_MCP_ENDPOINT',
+        'FOUNDRY_WEB_SEARCH_MCP_AUTH_TYPE',
+    ):
         monkeypatch.delenv(name, raising=False)
     dependencies = AsyncMock(return_value=sql_dependencies)
 
@@ -98,6 +113,65 @@ async def test_settings_bootstrap_without_llm_environment_keeps_defaults(
     assert settings.llm_profiles.active is None
     assert settings.llm_profiles.profiles == {}
     assert settings.title_llm_profile is None
+    assert settings.agent_settings.mcp_config == {}
+
+
+@pytest.mark.asyncio
+async def test_settings_bootstrap_uses_deployment_foundry_mcp_environment(
+    sql_dependencies, monkeypatch
+):
+    monkeypatch.setenv(
+        'FOUNDRY_WEB_SEARCH_MCP_ENDPOINT', FOUNDRY_WEB_SEARCH_MCP_ENDPOINT
+    )
+    monkeypatch.setenv('FOUNDRY_WEB_SEARCH_MCP_AUTH_TYPE', 'azure_workload_identity')
+    dependencies = AsyncMock(return_value=sql_dependencies)
+    server = MCPServer(
+        url=FOUNDRY_WEB_SEARCH_MCP_ENDPOINT,
+        transport='streamable-http',
+    )
+
+    with patch.object(SQLSettingsStore, '_dependencies', dependencies):
+        with patch.object(
+            MCPServer, 'model_validate', return_value=server
+        ) as validate_server:
+            await SQLSettingsStore('entra:t:user').load()
+        settings = await SQLSettingsStore('entra:t:user').load()
+
+    validate_server.assert_called_once_with(
+        {
+            'url': FOUNDRY_WEB_SEARCH_MCP_ENDPOINT,
+            'transport': 'streamable-http',
+            'auth': {'strategy': 'azure_workload_identity'},
+        }
+    )
+    assert set(settings.agent_settings.mcp_config) == {'foundry-web-search'}
+    persisted_server = settings.agent_settings.mcp_config['foundry-web-search']
+    assert persisted_server.url == FOUNDRY_WEB_SEARCH_MCP_ENDPOINT
+    assert persisted_server.transport == 'streamable-http'
+
+
+@pytest.mark.parametrize(
+    ('endpoint', 'auth_type'),
+    [
+        (FOUNDRY_WEB_SEARCH_MCP_ENDPOINT, None),
+        (None, 'azure_workload_identity'),
+        (FOUNDRY_WEB_SEARCH_MCP_ENDPOINT, 'bearer'),
+    ],
+)
+def test_settings_bootstrap_rejects_incomplete_foundry_mcp_environment(
+    monkeypatch, endpoint, auth_type
+):
+    for name, value in (
+        ('FOUNDRY_WEB_SEARCH_MCP_ENDPOINT', endpoint),
+        ('FOUNDRY_WEB_SEARCH_MCP_AUTH_TYPE', auth_type),
+    ):
+        if value is None:
+            monkeypatch.delenv(name, raising=False)
+        else:
+            monkeypatch.setenv(name, value)
+
+    with pytest.raises(ValueError):
+        _default_hosted_settings()
 
 
 @pytest.mark.asyncio
@@ -112,11 +186,18 @@ async def test_settings_bootstrap_does_not_replace_existing_settings(
         await store.store(settings)
 
         monkeypatch.setenv('LLM_MODEL', 'azure/gpt-5.1')
+        monkeypatch.setenv(
+            'FOUNDRY_WEB_SEARCH_MCP_ENDPOINT', FOUNDRY_WEB_SEARCH_MCP_ENDPOINT
+        )
+        monkeypatch.setenv(
+            'FOUNDRY_WEB_SEARCH_MCP_AUTH_TYPE', 'azure_workload_identity'
+        )
         reloaded = await SQLSettingsStore('entra:t:user').load()
 
     assert reloaded.language == 'fr'
     assert reloaded.llm_profiles.profiles == {}
     assert reloaded.title_llm_profile is None
+    assert reloaded.agent_settings.mcp_config == {}
 
 
 @pytest.mark.asyncio

@@ -7,7 +7,7 @@ def test_sandbox_image_pins_workload_identity_sdk_runtime():
     ).read_text()
 
     assert (
-        'SOFTWARE_AGENT_SDK_REF=87b5776c66843665ab218adf04721ae1bc99f045' in dockerfile
+        'SOFTWARE_AGENT_SDK_REF=2c3cf01f05b9bbeb40b1aff96f7d5166d3d26bc9' in dockerfile
     )
     assert (
         'SOFTWARE_AGENT_SDK_REPOSITORY=https://github.com/ghermann-msft/'
@@ -21,3 +21,8 @@ def test_sandbox_image_pins_workload_identity_sdk_runtime():
     assert 'from openhands.app_server.app import app' in dockerfile
     assert "auth_type='azure_workload_identity'" in dockerfile
     assert '_default_hosted_settings' in dockerfile
+    assert 'FOUNDRY_WEB_SEARCH_MCP_ENDPOINT=' in dockerfile
+    assert 'FOUNDRY_WEB_SEARCH_MCP_AUTH_TYPE=azure_workload_identity' in dockerfile
+    assert 'MCPAzureWorkloadIdentityAuthCredential' in dockerfile
+    assert 'Settings.model_validate_json' in dockerfile
+    assert 'persisted_settings.agent_settings.mcp_config[' in dockerfile

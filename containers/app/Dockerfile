@@ -15,7 +15,7 @@ ARG POETRY_VERSION=2.3.4
 # Keep the Sandbox control plane on the same SDK source as the hosted Agent
 # Server until the workload-identity auth contract is available in a release.
 ARG SOFTWARE_AGENT_SDK_REPOSITORY=https://github.com/ghermann-msft/software-agent-sdk.git
-ARG SOFTWARE_AGENT_SDK_REF=87b5776c66843665ab218adf04721ae1bc99f045
+ARG SOFTWARE_AGENT_SDK_REF=2c3cf01f05b9bbeb40b1aff96f7d5166d3d26bc9
 RUN apt-get update -y \
     && apt-get install -y curl make git build-essential jq gettext \
     && python3 -m pip install "poetry==${POETRY_VERSION}" --break-system-packages
@@ -80,12 +80,16 @@ RUN LLM_MODEL=azure/test-model \
     LLM_BASE_URL=https://example.openai.azure.com \
     LLM_API_VERSION=2025-04-01-preview \
     LLM_AUTH_TYPE=azure_workload_identity \
+    FOUNDRY_WEB_SEARCH_MCP_ENDPOINT=https://azureaieastus21665416127.services.ai.azure.com/api/projects/studio-ai-agents-project/toolboxes/openhands-web-search/versions/1/mcp?api-version=v1 \
+    FOUNDRY_WEB_SEARCH_MCP_AUTH_TYPE=azure_workload_identity \
     python - <<'PY'
 from fastmcp.mcp_config import MCPConfig
 
 from openhands.app_server.app import app
+from openhands.app_server.settings.settings_models import Settings
 from openhands.app_server.settings.sql_settings_store import _default_hosted_settings
 from openhands.sdk.llm import LLM
+from openhands.sdk.mcp.config import MCPAzureWorkloadIdentityAuthCredential
 
 assert MCPConfig is not None
 assert app.routes
@@ -105,6 +109,21 @@ assert settings.llm_profiles.require('default').auth_type == (
 )
 assert settings.llm_profiles.active == 'default'
 assert settings.title_llm_profile == 'default'
+persisted_settings = Settings.model_validate_json(
+    settings.model_dump_json(
+        context={'expose_secrets': True, 'persist_settings': True}
+    )
+)
+foundry_web_search = persisted_settings.agent_settings.mcp_config[
+    'foundry-web-search'
+]
+assert foundry_web_search.url.endswith(
+    '/toolboxes/openhands-web-search/versions/1/mcp?api-version=v1'
+)
+assert isinstance(
+    foundry_web_search.auth, MCPAzureWorkloadIdentityAuthCredential
+)
+assert foundry_web_search.auth.strategy == 'azure_workload_identity'
 PY
 
 ENTRYPOINT ["/app/entrypoint.sh"]
