@@ -201,6 +201,53 @@ async def test_settings_bootstrap_does_not_replace_existing_settings(
 
 
 @pytest.mark.asyncio
+async def test_managed_hosted_fields_reconcile_stale_existing_settings(
+    sql_dependencies, monkeypatch
+):
+    dependencies = AsyncMock(return_value=sql_dependencies)
+    custom_server = MCPServer(
+        url='https://custom.example.com/mcp',
+        transport='streamable-http',
+    )
+    with patch.object(SQLSettingsStore, '_dependencies', dependencies):
+        store = SQLSettingsStore('entra:t:user')
+        settings = await store.load()
+        settings.language = 'fr'
+        settings.agent_settings.mcp_config['custom'] = custom_server
+        await store.store(settings)
+
+        monkeypatch.setenv('OH_ALLOW_USER_LLM_CONFIGURATION', 'false')
+        monkeypatch.setenv('LLM_MODEL', 'azure/gpt-5.1')
+        monkeypatch.setenv(
+            'LLM_BASE_URL',
+            'https://example.openai.azure.com/openai/deployments/gpt-5.1',
+        )
+        monkeypatch.setenv('LLM_API_VERSION', '2025-04-01-preview')
+        monkeypatch.setenv('LLM_AUTH_TYPE', 'azure_workload_identity')
+        monkeypatch.setenv(
+            'FOUNDRY_WEB_SEARCH_MCP_ENDPOINT', FOUNDRY_WEB_SEARCH_MCP_ENDPOINT
+        )
+        monkeypatch.setenv(
+            'FOUNDRY_WEB_SEARCH_MCP_AUTH_TYPE', 'azure_workload_identity'
+        )
+
+        reloaded = await SQLSettingsStore('entra:t:user').load()
+        persisted = await SQLSettingsStore('entra:t:user').load()
+
+    assert reloaded.language == 'fr'
+    assert reloaded.agent_settings.llm.auth_type == 'azure_workload_identity'
+    assert reloaded.llm_profiles.active == 'default'
+    assert reloaded.llm_profiles.get('default') == reloaded.agent_settings.llm
+    assert reloaded.title_llm_profile == 'default'
+    assert set(reloaded.agent_settings.mcp_config) == {
+        'custom',
+        'foundry-web-search',
+    }
+    assert reloaded.agent_settings.mcp_config['custom'] == custom_server
+    assert persisted == reloaded
+
+
+@pytest.mark.asyncio
 async def test_settings_and_secrets_are_encrypted_at_rest(sql_dependencies):
     session_maker, _ = sql_dependencies
     dependencies = AsyncMock(return_value=sql_dependencies)

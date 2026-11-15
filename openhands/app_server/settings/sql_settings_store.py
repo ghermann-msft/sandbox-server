@@ -13,6 +13,7 @@ from openhands.app_server.settings.settings_store import SettingsStore
 from openhands.app_server.utils.sql_utils import Base
 from openhands.sdk.llm import LLM
 from openhands.sdk.mcp.config import MCPServer
+from openhands.sdk.settings import OpenHandsAgentSettings
 
 _DEFAULT_LLM_PROFILE = 'default'
 _FOUNDRY_WEB_SEARCH_MCP_NAME = 'foundry-web-search'
@@ -69,6 +70,40 @@ def _default_hosted_settings() -> Settings:
             update=agent_updates
         )
     return settings
+
+
+def _reconcile_hosted_managed_settings(settings: Settings) -> bool:
+    if os.getenv('OH_ALLOW_USER_LLM_CONFIGURATION', 'true') == 'true':
+        return False
+
+    managed = _default_hosted_settings()
+    changed = False
+    if isinstance(settings.agent_settings, OpenHandsAgentSettings) and isinstance(
+        managed.agent_settings, OpenHandsAgentSettings
+    ):
+        managed_llm = managed.agent_settings.llm
+        if os.getenv('LLM_MODEL') and settings.agent_settings.llm != managed_llm:
+            settings.agent_settings.llm = managed_llm
+            settings.llm_profiles.save(_DEFAULT_LLM_PROFILE, managed_llm)
+            settings.llm_profiles.active = _DEFAULT_LLM_PROFILE
+            settings.title_llm_profile = _DEFAULT_LLM_PROFILE
+            changed = True
+
+        managed_mcp = managed.agent_settings.mcp_config
+        foundry_server = managed_mcp.get(_FOUNDRY_WEB_SEARCH_MCP_NAME)
+        existing_foundry_server = settings.agent_settings.mcp_config.get(
+            _FOUNDRY_WEB_SEARCH_MCP_NAME
+        )
+        if foundry_server is None:
+            if existing_foundry_server is not None:
+                settings.agent_settings.mcp_config.pop(_FOUNDRY_WEB_SEARCH_MCP_NAME)
+                changed = True
+        elif existing_foundry_server != foundry_server:
+            settings.agent_settings.mcp_config[_FOUNDRY_WEB_SEARCH_MCP_NAME] = (
+                foundry_server
+            )
+            changed = True
+    return changed
 
 
 class StoredUserSettings(Base):
@@ -132,6 +167,29 @@ class SQLSettingsStore(SettingsStore):
             payload = jwt_service.decrypt_value(row.encrypted_payload)
             settings = Settings.model_validate_json(payload)
             settings.v1_enabled = True
+            if _reconcile_hosted_managed_settings(settings):
+                encrypted_payload = jwt_service.encrypt_value(
+                    settings.model_dump_json(
+                        context={'expose_secrets': True, 'persist_settings': True}
+                    )
+                )
+                result = await session.execute(
+                    update(StoredUserSettings)
+                    .where(
+                        StoredUserSettings.user_id == self.user_id,
+                        StoredUserSettings.revision == row.revision,
+                    )
+                    .values(
+                        encrypted_payload=encrypted_payload,
+                        revision=row.revision + 1,
+                    )
+                )
+                if result.rowcount != 1:
+                    await session.rollback()
+                    self._revision = None
+                    return await self.load()
+                await session.commit()
+                self._revision = row.revision + 1
             return settings
 
     async def store(self, settings: Settings) -> None:
