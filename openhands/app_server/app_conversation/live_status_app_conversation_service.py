@@ -131,7 +131,12 @@ from openhands.sdk.plugin import PluginSource
 from openhands.sdk.secret import LookupSecret, StaticSecret
 from openhands.sdk.settings import ACPAgentSettings
 from openhands.sdk.subagent import get_registered_agent_definitions
+from openhands.sdk.tool import SUB_AGENT_TOOL_NAME
 from openhands.sdk.tool.builtins import SwitchLLMTool
+from openhands.sdk.tool.defaults import (
+    launch_tool_specs,  # type: ignore[attr-defined]
+    selects_tool,  # type: ignore[attr-defined]
+)
 from openhands.sdk.utils.redact import (
     redact_api_key_literals,
     redact_text_secrets,
@@ -139,7 +144,6 @@ from openhands.sdk.utils.redact import (
 )
 from openhands.sdk.workspace.remote.async_remote_workspace import AsyncRemoteWorkspace
 from openhands.tools.preset.default import (
-    get_default_tools,
     register_builtins_agents,
 )
 from openhands.tools.preset.planning import (
@@ -2071,11 +2075,11 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
             tools = get_planning_tools(plan_path=plan_path)
         else:
             register_builtins_agents(enable_browser=True)
-            tools = get_default_tools(
-                enable_browser=True,
-                enable_sub_agents=user.agent_settings.enable_sub_agents,
+            tools = launch_tool_specs(
+                user.agent_settings.tools,
+                browser_available=True,
             )
-            if user.agent_settings.enable_sub_agents:
+            if selects_tool(tools, SUB_AGENT_TOOL_NAME):
                 agent_definitions = list(get_registered_agent_definitions())
 
         # --- build AgentSettings and create agent ---------------------------
