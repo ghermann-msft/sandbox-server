@@ -12,6 +12,10 @@ ENV PYTHONPATH=/app \
     POETRY_CACHE_DIR=/tmp/poetry_cache
 
 ARG POETRY_VERSION=2.3.4
+# Keep the Sandbox control plane on the same SDK source as the hosted Agent
+# Server until the workload-identity auth contract is available in a release.
+ARG OPENHANDS_SDK_GIT_REPOSITORY=https://github.com/ghermann-msft/software-agent-sdk.git
+ARG OPENHANDS_SDK_GIT_REF=b1d818a6078691cd765e05adbc60cd5fecb4c671
 RUN apt-get update -y \
     && apt-get install -y curl make git build-essential jq gettext \
     && python3 -m pip install "poetry==${POETRY_VERSION}" --break-system-packages
@@ -19,6 +23,11 @@ RUN apt-get update -y \
 COPY pyproject.toml poetry.lock ./
 RUN touch README.md \
     && poetry install --no-root \
+    && SDK_GIT_URL="git+${OPENHANDS_SDK_GIT_REPOSITORY}@${OPENHANDS_SDK_GIT_REF}" \
+    && .venv/bin/pip install --no-cache-dir --force-reinstall \
+        "${SDK_GIT_URL}#subdirectory=openhands-agent-server" \
+        "${SDK_GIT_URL}#subdirectory=openhands-sdk" \
+        "${SDK_GIT_URL}#subdirectory=openhands-tools" \
     && rm -rf "${POETRY_CACHE_DIR}"
 
 FROM base AS openhands-sandbox-server
@@ -65,6 +74,31 @@ COPY --chown=openhands:openhands --chmod=770 skills skills
 COPY --chown=openhands:openhands --chmod=770 openhands openhands
 COPY --chown=openhands:openhands pyproject.toml poetry.lock README.md MANIFEST.in LICENSE ./
 COPY --chown=openhands:openhands --chmod=770 containers/app/entrypoint.sh /app/entrypoint.sh
+
+RUN LLM_MODEL=azure/test-model \
+    LLM_BASE_URL=https://example.openai.azure.com \
+    LLM_API_VERSION=2025-04-01-preview \
+    LLM_AUTH_TYPE=azure_workload_identity \
+    python - <<'PY'
+from openhands.app_server.settings.sql_settings_store import _default_hosted_settings
+from openhands.sdk.llm import LLM
+
+llm = LLM(
+    model='azure/test-model',
+    base_url='https://example.openai.azure.com',
+    api_version='2025-04-01-preview',
+    auth_type='azure_workload_identity',
+)
+assert llm.auth_type == 'azure_workload_identity'
+
+settings = _default_hosted_settings()
+assert settings.agent_settings.llm.auth_type == 'azure_workload_identity'
+assert settings.llm_profiles.require('default').auth_type == (
+    'azure_workload_identity'
+)
+assert settings.llm_profiles.active == 'default'
+assert settings.title_llm_profile == 'default'
+PY
 
 ENTRYPOINT ["/app/entrypoint.sh"]
 CMD ["uvicorn", "openhands.app_server.app:app", "--host", "0.0.0.0", "--port", "3000"]

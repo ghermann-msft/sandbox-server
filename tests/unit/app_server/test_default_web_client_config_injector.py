@@ -4,7 +4,30 @@ This module tests environment variable handling in DefaultWebClientConfigInjecto
 """
 
 import os
+from types import SimpleNamespace
 from unittest.mock import patch
+
+
+def test_acp_provider_without_legacy_model_fields_is_supported():
+    from openhands.app_server.web_client import default_web_client_config_injector
+
+    provider = SimpleNamespace(
+        key='test',
+        display_name='Test',
+        default_command=('test-agent',),
+        api_key_env_var=None,
+        base_url_env_var=None,
+    )
+    with patch.object(
+        default_web_client_config_injector,
+        'ACP_PROVIDERS',
+        {'test': provider},
+    ):
+        injector = default_web_client_config_injector.DefaultWebClientConfigInjector()
+
+    assert len(injector.acp_providers) == 1
+    assert injector.acp_providers[0].default_model is None
+    assert injector.acp_providers[0].available_models == []
 
 
 class TestGetPosthogClientKey:
