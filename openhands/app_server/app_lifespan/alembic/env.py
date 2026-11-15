@@ -28,8 +28,17 @@ from openhands.app_server.config import get_global_config  # noqa: E402
 from openhands.app_server.event_callback.sql_event_callback_service import (  # noqa: E402
     StoredEventCallback,  # noqa: F401
 )
+from openhands.app_server.integrations.github.oauth_router import (  # noqa: E402
+    StoredGitHubOAuthState,  # noqa: F401
+)
 from openhands.app_server.sandbox.remote_sandbox_service import (  # noqa: E402
     StoredRemoteSandbox,  # noqa: F401
+)
+from openhands.app_server.secrets.sql_secrets_store import (  # noqa: E402
+    StoredUserSecrets,  # noqa: F401
+)
+from openhands.app_server.settings.sql_settings_store import (  # noqa: E402
+    StoredUserSettings,  # noqa: F401
 )
 from openhands.app_server.utils.sql_utils import Base  # noqa: E402
 

@@ -46,6 +46,38 @@ docker compose up --build
 The Compose setup mounts the Docker socket and a local workspace so the server
 can manage sandbox containers.
 
+## Hosted identity and GitHub
+
+Standalone behavior remains the default. Setting
+`OH_TRUSTED_IDENTITY_ASSERTION_SECRET` enables the hosted, per-user storage
+path and requires:
+
+- `OH_TRUSTED_IDENTITY_ASSERTION_ISSUER`
+- `OH_TRUSTED_IDENTITY_ASSERTION_AUDIENCE`
+- `JWT_SECRET` (shared by every server replica)
+- the existing `DB_HOST`, `DB_PORT`, `DB_NAME`, `DB_USER`, and `DB_PASS`
+  variables for PostgreSQL
+
+The assertion header defaults to `X-OpenHands-Identity-Assertion` and can be
+changed with `OH_TRUSTED_IDENTITY_ASSERTION_HEADER`. Lifetime and clock-skew
+limits default to 300 and 30 seconds and can be changed with
+`OH_TRUSTED_IDENTITY_ASSERTION_MAX_LIFETIME_SECONDS` and
+`OH_TRUSTED_IDENTITY_ASSERTION_CLOCK_SKEW_SECONDS`.
+
+GitHub App linking additionally requires:
+
+- `GITHUB_APP_CLIENT_ID`
+- `GITHUB_APP_CLIENT_SECRET`
+- `GITHUB_APP_SLUG`
+- `OH_GITHUB_OAUTH_CALLBACK_URL`
+- `OH_GITHUB_OAUTH_SUCCESS_URL`
+
+The Canvas-compatible endpoints are `GET /oauth/git-providers` and
+`POST /oauth/{provider_id}/link`. GitHub redirects to
+`GET /oauth/github/callback`; the server persists the resulting user token for
+the existing `/api/v1/git/installations/search` and
+`/api/v1/git/repositories/search` APIs.
+
 ## Extraction provenance
 
 The extraction is based on:

@@ -640,6 +640,58 @@ class TestGetGithubAppSlug:
             assert result is None
 
 
+def test_github_oauth_feature_flags_require_complete_configuration():
+    from openhands.app_server.integrations.service_types import ProviderType
+    from openhands.app_server.web_client.default_web_client_config_injector import (
+        _get_feature_flags,
+        _get_providers_configured,
+    )
+
+    with patch.dict(
+        os.environ,
+        {
+            'GITHUB_APP_CLIENT_ID': 'client-id',
+            'GITHUB_APP_CLIENT_SECRET': 'client-secret',
+            'GITHUB_APP_SLUG': 'halo-app',
+            'OH_GITHUB_OAUTH_CALLBACK_URL': (
+                'https://halo.example/oauth/github/callback'
+            ),
+            'OH_GITHUB_OAUTH_SUCCESS_URL': (
+                'https://halo.example/settings/integrations'
+            ),
+        },
+        clear=True,
+    ):
+        flags = _get_feature_flags()
+        providers_configured = _get_providers_configured()
+
+    assert flags.enable_canvas_integrations is True
+    assert flags.enable_oauth_v2_login is True
+    assert ProviderType.GITHUB in providers_configured
+    assert (
+        flags.github_app_install_url
+        == 'https://github.com/apps/halo-app/installations/new'
+    )
+
+    with patch.dict(
+        os.environ,
+        {
+            'GITHUB_APP_CLIENT_ID': 'client-id',
+            'GITHUB_APP_CLIENT_SECRET': 'client-secret',
+            'GITHUB_APP_SLUG': 'halo-app',
+            'OH_GITHUB_OAUTH_CALLBACK_URL': (
+                'https://halo.example/oauth/github/callback'
+            ),
+        },
+        clear=True,
+    ):
+        incomplete_flags = _get_feature_flags()
+
+    assert incomplete_flags.enable_canvas_integrations is False
+    assert incomplete_flags.enable_oauth_v2_login is False
+    assert incomplete_flags.github_app_install_url is None
+
+
 class TestIsGitlabEnabled:
     """Test cases for _is_gitlab_enabled helper function."""
 
