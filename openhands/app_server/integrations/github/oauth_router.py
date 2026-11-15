@@ -38,7 +38,7 @@ _STATE_LIFETIME = timedelta(minutes=10)
 
 
 class StoredGitHubOAuthState(Base):
-    __tablename__ = 'github_oauth_state'
+    __tablename__ = 'oss_github_oauth_state'
 
     nonce: Mapped[str] = mapped_column(String, primary_key=True)
     user_id: Mapped[str] = mapped_column(String, nullable=False, index=True)

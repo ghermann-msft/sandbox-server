@@ -40,7 +40,7 @@ def _default_hosted_settings() -> Settings:
 
 
 class StoredUserSettings(Base):
-    __tablename__ = 'user_settings'
+    __tablename__ = 'oss_user_settings'
 
     user_id: Mapped[str] = mapped_column(String, primary_key=True)
     encrypted_payload: Mapped[str] = mapped_column(Text, nullable=False)

@@ -12,7 +12,7 @@ from openhands.app_server.utils.sql_utils import Base
 
 
 class StoredUserSecrets(Base):
-    __tablename__ = 'user_secrets'
+    __tablename__ = 'oss_user_secrets'
 
     user_id: Mapped[str] = mapped_column(String, primary_key=True)
     encrypted_payload: Mapped[str] = mapped_column(Text, nullable=False)

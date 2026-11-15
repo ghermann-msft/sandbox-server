@@ -2,8 +2,10 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 from pydantic import SecretStr
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
+from openhands.app_server.integrations.github.oauth_router import StoredGitHubOAuthState
 from openhands.app_server.integrations.provider import ProviderToken
 from openhands.app_server.integrations.service_types import ProviderType
 from openhands.app_server.secrets.secrets_models import Secrets
@@ -48,6 +50,12 @@ async def test_settings_bootstrap_and_cross_user_isolation(sql_dependencies):
 
     assert bob_settings.language is None
     assert alice_reloaded.language == 'fr'
+
+
+def test_sql_user_stores_use_collision_proof_oss_tables():
+    assert StoredUserSettings.__tablename__ == 'oss_user_settings'
+    assert StoredUserSecrets.__tablename__ == 'oss_user_secrets'
+    assert StoredGitHubOAuthState.__tablename__ == 'oss_github_oauth_state'
 
 
 @pytest.mark.asyncio
@@ -138,8 +146,21 @@ async def test_settings_and_secrets_are_encrypted_at_rest(sql_dependencies):
         async with session_maker() as session:
             settings_row = await session.get(StoredUserSettings, 'entra:t:user')
             secrets_row = await session.get(StoredUserSecrets, 'entra:t:user')
+            table_names = set(
+                (
+                    await session.execute(
+                        text("SELECT name FROM sqlite_master WHERE type = 'table'")
+                    )
+                )
+                .scalars()
+                .all()
+            )
         reloaded_secrets = await SQLSecretsStore('entra:t:user').load()
 
+    assert 'oss_user_settings' in table_names
+    assert 'oss_user_secrets' in table_names
+    assert 'user_settings' not in table_names
+    assert 'user_secrets' not in table_names
     assert 'settings-secret-value' not in settings_row.encrypted_payload
     assert 'github-secret-value' not in secrets_row.encrypted_payload
     assert (
