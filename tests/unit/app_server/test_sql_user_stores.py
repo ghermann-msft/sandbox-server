@@ -51,6 +51,67 @@ async def test_settings_bootstrap_and_cross_user_isolation(sql_dependencies):
 
 
 @pytest.mark.asyncio
+async def test_settings_bootstrap_uses_deployment_llm_environment(
+    sql_dependencies, monkeypatch
+):
+    monkeypatch.setenv('LLM_MODEL', 'azure/gpt-5.1')
+    monkeypatch.setenv(
+        'LLM_BASE_URL',
+        'https://example.openai.azure.com/openai/deployments/gpt-5.1',
+    )
+    monkeypatch.setenv('LLM_API_VERSION', '2025-04-01-preview')
+    monkeypatch.setenv('LLM_AUTH_TYPE', 'api_key')
+    dependencies = AsyncMock(return_value=sql_dependencies)
+
+    with patch.object(SQLSettingsStore, '_dependencies', dependencies):
+        settings = await SQLSettingsStore('entra:t:user').load()
+
+    llm = settings.agent_settings.llm
+    assert llm.model == 'azure/gpt-5.1'
+    assert llm.base_url == 'https://example.openai.azure.com/openai/deployments/gpt-5.1'
+    assert llm.api_version == '2025-04-01-preview'
+    assert llm.auth_type == 'api_key'
+    assert settings.llm_profiles.active == 'default'
+    assert settings.llm_profiles.get('default') == llm
+    assert settings.title_llm_profile == 'default'
+
+
+@pytest.mark.asyncio
+async def test_settings_bootstrap_without_llm_environment_keeps_defaults(
+    sql_dependencies, monkeypatch
+):
+    for name in ('LLM_MODEL', 'LLM_BASE_URL', 'LLM_API_VERSION', 'LLM_AUTH_TYPE'):
+        monkeypatch.delenv(name, raising=False)
+    dependencies = AsyncMock(return_value=sql_dependencies)
+
+    with patch.object(SQLSettingsStore, '_dependencies', dependencies):
+        settings = await SQLSettingsStore('entra:t:user').load()
+
+    assert settings.llm_profiles.active is None
+    assert settings.llm_profiles.profiles == {}
+    assert settings.title_llm_profile is None
+
+
+@pytest.mark.asyncio
+async def test_settings_bootstrap_does_not_replace_existing_settings(
+    sql_dependencies, monkeypatch
+):
+    dependencies = AsyncMock(return_value=sql_dependencies)
+    with patch.object(SQLSettingsStore, '_dependencies', dependencies):
+        store = SQLSettingsStore('entra:t:user')
+        settings = await store.load()
+        settings.language = 'fr'
+        await store.store(settings)
+
+        monkeypatch.setenv('LLM_MODEL', 'azure/gpt-5.1')
+        reloaded = await SQLSettingsStore('entra:t:user').load()
+
+    assert reloaded.language == 'fr'
+    assert reloaded.llm_profiles.profiles == {}
+    assert reloaded.title_llm_profile is None
+
+
+@pytest.mark.asyncio
 async def test_settings_and_secrets_are_encrypted_at_rest(sql_dependencies):
     session_maker, _ = sql_dependencies
     dependencies = AsyncMock(return_value=sql_dependencies)

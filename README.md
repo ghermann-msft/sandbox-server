@@ -73,6 +73,12 @@ variables. `AZURE_AUTHORITY_HOST` is honored by Azure Identity when needed.
 a token for `https://ossrdbms-aad.database.windows.net/.default`, allowing
 Azure Identity to refresh credentials without restarting the server.
 
+When `LLM_MODEL` is set, the first settings load for each hosted user creates
+and activates a `default` LLM profile from `LLM_MODEL` and the optional
+`LLM_BASE_URL`, `LLM_API_VERSION`, and `LLM_AUTH_TYPE` variables. The same
+profile is used for conversation titles. Existing user settings are not
+overwritten.
+
 GitHub App linking additionally requires:
 
 - `GITHUB_APP_CLIENT_ID`

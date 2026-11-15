@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 
 from sqlalchemy import Integer, String, Text, update
@@ -9,6 +10,33 @@ from sqlalchemy.orm import Mapped, mapped_column
 from openhands.app_server.settings.settings_models import Settings
 from openhands.app_server.settings.settings_store import SettingsStore
 from openhands.app_server.utils.sql_utils import Base
+from openhands.sdk.llm import LLM
+
+_DEFAULT_LLM_PROFILE = 'default'
+
+
+def _default_hosted_settings() -> Settings:
+    settings = Settings()
+    model = os.getenv('LLM_MODEL')
+    if not model:
+        return settings
+
+    llm_updates = {'model': model}
+    for env_name, field_name in (
+        ('LLM_BASE_URL', 'base_url'),
+        ('LLM_API_VERSION', 'api_version'),
+        ('LLM_AUTH_TYPE', 'auth_type'),
+    ):
+        value = os.getenv(env_name)
+        if value:
+            llm_updates[field_name] = value
+
+    llm = LLM.model_validate(llm_updates)
+    settings.agent_settings = settings.agent_settings.model_copy(update={'llm': llm})
+    settings.llm_profiles.save(_DEFAULT_LLM_PROFILE, llm)
+    settings.llm_profiles.active = _DEFAULT_LLM_PROFILE
+    settings.title_llm_profile = _DEFAULT_LLM_PROFILE
+    return settings
 
 
 class StoredUserSettings(Base):
@@ -45,7 +73,7 @@ class SQLSettingsStore(SettingsStore):
         async with session_maker() as session:
             row = await session.get(StoredUserSettings, self.user_id)
             if row is None:
-                settings = Settings()
+                settings = _default_hosted_settings()
                 encrypted_payload = jwt_service.encrypt_value(
                     settings.model_dump_json(
                         context={'expose_secrets': True, 'persist_settings': True}
