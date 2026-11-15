@@ -15,7 +15,7 @@ ARG POETRY_VERSION=2.3.4
 # Keep the Sandbox control plane on the same SDK source as the hosted Agent
 # Server until the workload-identity auth contract is available in a release.
 ARG SOFTWARE_AGENT_SDK_REPOSITORY=https://github.com/ghermann-msft/software-agent-sdk.git
-ARG SOFTWARE_AGENT_SDK_REF=b1d818a6078691cd765e05adbc60cd5fecb4c671
+ARG SOFTWARE_AGENT_SDK_REF=87b5776c66843665ab218adf04721ae1bc99f045
 RUN apt-get update -y \
     && apt-get install -y curl make git build-essential jq gettext \
     && python3 -m pip install "poetry==${POETRY_VERSION}" --break-system-packages
@@ -23,6 +23,7 @@ RUN apt-get update -y \
 COPY pyproject.toml poetry.lock ./
 RUN touch README.md \
     && poetry install --no-root \
+    && .venv/bin/pip uninstall -y fastmcp \
     && SDK_GIT_URL="git+${SOFTWARE_AGENT_SDK_REPOSITORY}@${SOFTWARE_AGENT_SDK_REF}" \
     && .venv/bin/pip install --no-cache-dir --force-reinstall \
         "${SDK_GIT_URL}#subdirectory=openhands-agent-server" \
@@ -80,8 +81,14 @@ RUN LLM_MODEL=azure/test-model \
     LLM_API_VERSION=2025-04-01-preview \
     LLM_AUTH_TYPE=azure_workload_identity \
     python - <<'PY'
+from fastmcp.mcp_config import MCPConfig
+
+from openhands.app_server.app import app
 from openhands.app_server.settings.sql_settings_store import _default_hosted_settings
 from openhands.sdk.llm import LLM
+
+assert MCPConfig is not None
+assert app.routes
 
 llm = LLM(
     model='azure/test-model',
