@@ -14,8 +14,8 @@ ENV PYTHONPATH=/app \
 ARG POETRY_VERSION=2.3.4
 # Keep the Sandbox control plane on the same SDK source as the hosted Agent
 # Server until the workload-identity auth contract is available in a release.
-ARG OPENHANDS_SDK_GIT_REPOSITORY=https://github.com/ghermann-msft/software-agent-sdk.git
-ARG OPENHANDS_SDK_GIT_REF=b1d818a6078691cd765e05adbc60cd5fecb4c671
+ARG SOFTWARE_AGENT_SDK_REPOSITORY=https://github.com/ghermann-msft/software-agent-sdk.git
+ARG SOFTWARE_AGENT_SDK_REF=b1d818a6078691cd765e05adbc60cd5fecb4c671
 RUN apt-get update -y \
     && apt-get install -y curl make git build-essential jq gettext \
     && python3 -m pip install "poetry==${POETRY_VERSION}" --break-system-packages
@@ -23,7 +23,7 @@ RUN apt-get update -y \
 COPY pyproject.toml poetry.lock ./
 RUN touch README.md \
     && poetry install --no-root \
-    && SDK_GIT_URL="git+${OPENHANDS_SDK_GIT_REPOSITORY}@${OPENHANDS_SDK_GIT_REF}" \
+    && SDK_GIT_URL="git+${SOFTWARE_AGENT_SDK_REPOSITORY}@${SOFTWARE_AGENT_SDK_REF}" \
     && .venv/bin/pip install --no-cache-dir --force-reinstall \
         "${SDK_GIT_URL}#subdirectory=openhands-agent-server" \
         "${SDK_GIT_URL}#subdirectory=openhands-sdk" \
