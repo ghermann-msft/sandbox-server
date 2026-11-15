@@ -9,12 +9,15 @@ Covers the mapping between agent-sandbox custom resources and SandboxInfo:
 No cluster is required: the CustomObjectsApi is mocked.
 """
 
+import contextlib
 import re
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
+from uuid import uuid4
 
 import pytest
 from kubernetes.client.rest import ApiException
 from pydantic import ValidationError
+from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from openhands.app_server.errors import SandboxError
 from openhands.app_server.sandbox.kubernetes_sandbox_service import (
@@ -25,6 +28,10 @@ from openhands.app_server.sandbox.kubernetes_sandbox_service import (
     SPEC_ID_ANNOTATION,
     KubernetesSandboxService,
     KubernetesSandboxServiceInjector,
+)
+from openhands.app_server.sandbox.sandbox_access import (
+    SandboxAccessService,
+    StoredSandboxAccess,
 )
 from openhands.app_server.sandbox.sandbox_models import AGENT_SERVER, SandboxStatus
 from openhands.app_server.sandbox.sandbox_service import (
@@ -320,6 +327,69 @@ async def test_get_sandbox_by_session_api_key(service, custom_objects):
     assert record is not None and record.id == 'sb1'
 
     assert await service.get_sandbox_by_session_api_key('missing') is None
+
+
+async def test_persisted_owner_authorizes_conversation_webhook(service, custom_objects):
+    engine = create_async_engine('sqlite+aiosqlite:///:memory:')
+    async with engine.begin() as connection:
+        await connection.run_sync(StoredSandboxAccess.__table__.create)
+    session_maker = async_sessionmaker(engine, expire_on_commit=False)
+
+    try:
+        async with session_maker() as db_session:
+            owner_id = 'entra:tenant-id:object-id'
+            service.access_service = SandboxAccessService(
+                db_session=db_session,
+                user_id=owner_id,
+            )
+
+            info = await service.start_sandbox(sandbox_id='owned-sandbox')
+            await db_session.commit()
+            body = custom_objects.create_namespaced_custom_object.call_args.kwargs[
+                'body'
+            ]
+            custom_objects.list_namespaced_custom_object.return_value = {
+                'items': [body]
+            }
+
+            env = {item['name']: item['value'] for item in body['spec']['env']}
+            record = await service.get_sandbox_record_by_session_api_key(
+                env[SESSION_API_KEY_VARIABLE]
+            )
+
+            assert info.created_by_user_id == owner_id
+            assert record is not None
+            assert record.created_by_user_id == owner_id
+
+            from openhands.app_server.event_callback.webhook_router import (
+                valid_conversation,
+            )
+
+            conversation_info = MagicMock(
+                created_by_user_id=owner_id,
+                sandbox_id='owned-sandbox',
+            )
+            conversation_service = AsyncMock()
+            conversation_service.get_app_conversation_info.return_value = (
+                conversation_info
+            )
+
+            @contextlib.asynccontextmanager
+            async def get_conversation_service(state):
+                yield conversation_service
+
+            with patch(
+                'openhands.app_server.event_callback.webhook_router.get_app_conversation_info_service',
+                get_conversation_service,
+            ):
+                result = await valid_conversation(
+                    conversation_id=uuid4(),
+                    sandbox_record=record,
+                )
+
+            assert result is conversation_info
+    finally:
+        await engine.dispose()
 
 
 async def test_delete_sandbox(service, custom_objects):
