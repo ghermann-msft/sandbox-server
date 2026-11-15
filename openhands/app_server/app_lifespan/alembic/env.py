@@ -111,11 +111,19 @@ def run_migrations_online() -> None:
     and associate a connection with the context.
 
     """
+    provided_connection = config.attributes.get('connection')
+    if provided_connection is not None:
+        context.configure(
+            connection=provided_connection,
+            target_metadata=target_metadata,
+        )
+        with context.begin_transaction():
+            context.run_migrations()
+        return
+
     # Use the DbSessionInjector engine instead of creating a new one
     global_config = get_global_config()
-    db_session = global_config.db_session
-    connectable = db_session.get_db_engine()
-
+    connectable = global_config.db_session.get_db_engine()
     with connectable.connect() as connection:
         context.configure(connection=connection, target_metadata=target_metadata)
 

@@ -31,10 +31,11 @@ def _parse_entra_user_id(user_id: str) -> tuple[str, str] | None:
     return tenant_id, object_id
 
 
-def upgrade() -> None:
-    access_table = op.create_table(
+def _access_table(metadata: sa.MetaData) -> sa.Table:
+    return sa.Table(
         'v1_sandbox_access',
-        sa.Column('sandbox_id', sa.String(), nullable=False),
+        metadata,
+        sa.Column('sandbox_id', sa.String(), primary_key=True),
         sa.Column('tenant_id', sa.String(), nullable=False),
         sa.Column('owner_object_id', sa.String(), nullable=False),
         sa.Column(
@@ -46,28 +47,49 @@ def upgrade() -> None:
             server_default=sa.text('(CURRENT_TIMESTAMP)'),
             nullable=False,
         ),
-        sa.PrimaryKeyConstraint('sandbox_id'),
-    )
-    op.create_index(
-        op.f('ix_v1_sandbox_access_tenant_id'),
-        'v1_sandbox_access',
-        ['tenant_id'],
-        unique=False,
-    )
-    op.create_index(
-        op.f('ix_v1_sandbox_access_owner_object_id'),
-        'v1_sandbox_access',
-        ['owner_object_id'],
-        unique=False,
-    )
-    op.create_index(
-        op.f('ix_v1_sandbox_access_created_at'),
-        'v1_sandbox_access',
-        ['created_at'],
-        unique=False,
     )
 
-    rows = op.get_bind().execute(
+
+def _ensure_access_table() -> sa.Table:
+    bind = op.get_bind()
+    inspector = sa.inspect(bind)
+    metadata = sa.MetaData()
+    expected_table = _access_table(metadata)
+    if not inspector.has_table(expected_table.name):
+        expected_table.create(bind)
+    else:
+        actual_columns = {
+            column['name'] for column in inspector.get_columns(expected_table.name)
+        }
+        expected_columns = set(expected_table.columns.keys())
+        if not expected_columns.issubset(actual_columns):
+            missing = sorted(expected_columns - actual_columns)
+            raise RuntimeError(
+                f'Existing {expected_table.name} table is missing columns: {missing}'
+            )
+        metadata.clear()
+        expected_table = sa.Table(expected_table.name, metadata, autoload_with=bind)
+
+    existing_indexes = {
+        index['name'] for index in sa.inspect(bind).get_indexes(expected_table.name)
+    }
+    for name, column in (
+        ('ix_v1_sandbox_access_tenant_id', 'tenant_id'),
+        ('ix_v1_sandbox_access_owner_object_id', 'owner_object_id'),
+        ('ix_v1_sandbox_access_created_at', 'created_at'),
+    ):
+        if name not in existing_indexes:
+            op.create_index(name, expected_table.name, [column], unique=False)
+    return expected_table
+
+
+def upgrade() -> None:
+    access_table = _ensure_access_table()
+    bind = op.get_bind()
+    existing_sandbox_ids = set(
+        bind.execute(sa.select(access_table.c.sandbox_id)).scalars()
+    )
+    rows = bind.execute(
         sa.text(
             """
             SELECT sandbox_id, MIN(created_by_user_id) AS created_by_user_id
@@ -81,6 +103,8 @@ def upgrade() -> None:
     )
     owners = []
     for row in rows:
+        if row.sandbox_id in existing_sandbox_ids:
+            continue
         identity = _parse_entra_user_id(row.created_by_user_id)
         if identity is None:
             continue
