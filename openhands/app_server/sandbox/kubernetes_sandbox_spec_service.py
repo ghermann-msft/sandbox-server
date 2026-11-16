@@ -75,9 +75,12 @@ def get_default_sandbox_specs() -> list[SandboxSpecInfo]:
             platform='linux/amd64',
             resource_class=SandboxResourceClass.STANDARD,
             image=LINUX_AGENT_SERVER_IMAGE,
+            workspace_mount_path='/workspace',
             durable_state_dir='/openhands',
+            durable_mount_path='/openhands',
             template_name='openhands-agent-server',
             warm_pool_name=DEFAULT_WARM_POOL,
+            startup_timeout_seconds=300,
             cpu_request='500m',
             cpu_limit='2',
             memory_request='1Gi',
@@ -103,9 +106,9 @@ def get_default_sandbox_specs() -> list[SandboxSpecInfo]:
             initial_env={
                 'OH_ENABLE_VNC': '0',
                 'LOG_JSON': 'true',
-                'OH_CONVERSATIONS_PATH': r'C:\OpenHands\conversations',
-                'OH_BASH_EVENTS_DIR': r'C:\OpenHands\bash_events',
-                'OH_PERSISTENCE_DIR': r'C:\OpenHands\persistence',
+                'OH_CONVERSATIONS_PATH': (r'C:\OpenHands\{sandbox_id}\conversations'),
+                'OH_BASH_EVENTS_DIR': r'C:\OpenHands\{sandbox_id}\bash_events',
+                'OH_PERSISTENCE_DIR': r'C:\OpenHands\{sandbox_id}\persistence',
                 'OH_CONVERSATION_WORKTREE_ROOT': r'C:\workspace\worktrees',
                 'OH_WORKSPACE_PATH': r'C:\workspace\project',
                 'PYTHONUNBUFFERED': '1',
@@ -118,9 +121,12 @@ def get_default_sandbox_specs() -> list[SandboxSpecInfo]:
             resource_class=SandboxResourceClass.STANDARD,
             image=WINDOWS_AGENT_SERVER_IMAGE,
             shell=['powershell.exe', '-NoLogo', '-NoProfile'],
-            durable_state_dir=r'C:\OpenHands',
+            workspace_mount_path=r'C:\workspace',
+            durable_state_dir=r'C:\OpenHands\{sandbox_id}',
+            durable_mount_path=r'C:\OpenHands',
             template_name='openhands-agent-server-windows-2025',
             warm_pool_name=WINDOWS_STANDARD_POOL,
+            startup_timeout_seconds=600,
             cpu_request='2',
             cpu_limit='4',
             memory_request='4Gi',
@@ -161,9 +167,10 @@ def get_default_sandbox_specs() -> list[SandboxSpecInfo]:
                 None
                 if WINDOWS_AGENT_SERVER_IMAGE
                 else (
-                    'Set OH_WINDOWS_AGENT_SERVER_IMAGE to a digest-pinned '
-                    'ghcr.io/openhands/agent-server:<version-or-sha>-'
-                    'windows-ltsc2025-amd64 image.'
+                    'Set OH_WINDOWS_AGENT_SERVER_IMAGE to the digest-pinned '
+                    '<registry>/<owner>/agent-server:<version-or-sha>-'
+                    'windows-ltsc2025-amd64 image deployed by the Windows '
+                    'SandboxTemplate.'
                 )
             ),
         ),

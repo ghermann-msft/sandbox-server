@@ -11,22 +11,30 @@ No cluster is required: the CustomObjectsApi is mocked.
 
 import contextlib
 import re
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 from uuid import uuid4
 
 import pytest
+import yaml
 from kubernetes.client.rest import ApiException
 from pydantic import ValidationError
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from openhands.app_server.errors import SandboxError
 from openhands.app_server.sandbox.kubernetes_sandbox_service import (
+    DURABLE_PVC_ANNOTATION,
+    DURABLE_STORAGE_CLASS_ANNOTATION,
+    DURABLE_SUB_PATH_ANNOTATION,
     MANAGED_BY_LABEL,
     MANAGED_BY_VALUE,
     SANDBOX_ID_LABEL,
     SECRET_KEY_VARIABLE,
     SESSION_KEY_HASH_LABEL,
     SPEC_ID_ANNOTATION,
+    TEMPLATE_NAME_ANNOTATION,
+    WORKSPACE_STORAGE_CLASS_ANNOTATION,
+    WORKSPACE_STORAGE_SIZE_ANNOTATION,
     KubernetesSandboxService,
     KubernetesSandboxServiceInjector,
 )
@@ -48,6 +56,7 @@ from openhands.app_server.sandbox.sandbox_service import (
 from openhands.app_server.sandbox.sandbox_spec_models import (
     SandboxOperatingSystem,
     SandboxResourceClass,
+    SandboxSpecInfo,
 )
 
 
@@ -59,6 +68,15 @@ def mock_sandbox_spec_service():
     spec.initial_env = {'LOG_JSON': 'true'}
     spec.command = None
     spec.working_dir = '/workspace/project'
+    spec.template_name = 'openhands-agent-server'
+    spec.warm_pool_name = 'openhands-pool'
+    spec.storage_class = 'managed-csi'
+    spec.storage_size = '5Gi'
+    spec.workspace_storage_class = 'managed-csi'
+    spec.workspace_storage_size = '5Gi'
+    spec.durable_storage_class = 'openhands-halo-azurefile'
+    spec.durable_volume_claim_name = 'openhands-halo-conversations'
+    spec.durable_sub_path_template = '{sandbox_id}'
     service.get_default_sandbox_spec.return_value = spec
     service.get_sandbox_spec.return_value = spec
     return service
@@ -70,7 +88,16 @@ def custom_objects():
 
 
 @pytest.fixture
-def service(mock_sandbox_spec_service, custom_objects):
+def core_v1():
+    client = MagicMock()
+    durable_pvc = MagicMock()
+    durable_pvc.spec.storage_class_name = 'openhands-halo-azurefile'
+    client.read_namespaced_persistent_volume_claim.return_value = durable_pvc
+    return client
+
+
+@pytest.fixture
+def service(mock_sandbox_spec_service, custom_objects, core_v1):
     return KubernetesSandboxService(
         sandbox_spec_service=mock_sandbox_spec_service,
         namespace='agents',
@@ -80,7 +107,9 @@ def service(mock_sandbox_spec_service, custom_objects):
         webhook_base_url='http://app-server:3000',
         exposed_ports=[],
         max_num_sandboxes=5,
+        validate_profile_infrastructure=False,
         _custom_objects=custom_objects,
+        _core_v1=core_v1,
     )
 
 
@@ -129,6 +158,24 @@ async def test_start_sandbox_creates_claim(service, custom_objects):
     assert body['metadata']['labels'][SANDBOX_ID_LABEL] == info.id
     # The warm pool falls back to the spec id when not pinned in config.
     assert body['spec']['warmPoolRef'] == {'name': 'openhands-pool'}
+    assert body['spec']['volumeClaimTemplates'] == [
+        {
+            'metadata': {'name': 'workspace'},
+            'spec': {
+                'accessModes': ['ReadWriteOnce'],
+                'volumeMode': 'Filesystem',
+                'storageClassName': 'managed-csi',
+                'resources': {'requests': {'storage': '5Gi'}},
+            },
+        }
+    ]
+    annotations = body['metadata']['annotations']
+    assert annotations[TEMPLATE_NAME_ANNOTATION] == 'openhands-agent-server'
+    assert annotations[WORKSPACE_STORAGE_CLASS_ANNOTATION] == 'managed-csi'
+    assert annotations[WORKSPACE_STORAGE_SIZE_ANNOTATION] == '5Gi'
+    assert annotations[DURABLE_PVC_ANNOTATION] == 'openhands-halo-conversations'
+    assert annotations[DURABLE_STORAGE_CLASS_ANNOTATION] == ('openhands-halo-azurefile')
+    assert annotations[DURABLE_SUB_PATH_ANNOTATION] == info.id
 
     env = {item['name']: item['value'] for item in body['spec']['env']}
     assert env['LOG_JSON'] == 'true'
@@ -141,6 +188,34 @@ async def test_start_sandbox_creates_claim(service, custom_objects):
     assert info.status == SandboxStatus.STARTING
     assert info.session_api_key is None
     assert info.exposed_urls == []
+
+
+async def test_windows_claim_uses_profile_storage_and_sandbox_scoped_durable_paths(
+    service, mock_sandbox_spec_service, custom_objects
+):
+    windows = {spec.id: spec for spec in get_default_sandbox_specs()}[
+        WINDOWS_STANDARD_POOL
+    ]
+    mock_sandbox_spec_service.get_sandbox_spec.return_value = windows
+
+    await service.start_sandbox(
+        sandbox_spec_id=WINDOWS_STANDARD_POOL, sandbox_id='windows-1'
+    )
+
+    body = custom_objects.create_namespaced_custom_object.call_args.kwargs['body']
+    assert body['spec']['warmPoolRef'] == {'name': WINDOWS_STANDARD_POOL}
+    assert (
+        body['spec']['volumeClaimTemplates'][0]['spec']['storageClassName']
+        == 'managed-csi'
+    )
+    assert body['spec']['volumeClaimTemplates'][0]['spec']['resources'] == {
+        'requests': {'storage': '20Gi'}
+    }
+    env = {item['name']: item['value'] for item in body['spec']['env']}
+    assert env['OH_CONVERSATIONS_PATH'] == (r'C:\OpenHands\windows-1\conversations')
+    assert env['OH_BASH_EVENTS_DIR'] == r'C:\OpenHands\windows-1\bash_events'
+    assert env['OH_PERSISTENCE_DIR'] == r'C:\OpenHands\windows-1\persistence'
+    assert body['metadata']['annotations'][DURABLE_SUB_PATH_ANNOTATION] == ('windows-1')
 
 
 async def test_start_sandbox_can_skip_session_key_injection(
@@ -156,6 +231,7 @@ async def test_start_sandbox_can_skip_session_key_injection(
         exposed_ports=[],
         max_num_sandboxes=5,
         inject_session_key=False,
+        validate_profile_infrastructure=False,
         _custom_objects=custom_objects,
     )
 
@@ -552,6 +628,7 @@ async def test_claim_name_fits_limit_with_a_long_prefix(
         webhook_base_url='http://app-server:3000',
         exposed_ports=[],
         max_num_sandboxes=5,
+        validate_profile_infrastructure=False,
         _custom_objects=custom_objects,
     )
 
@@ -586,7 +663,10 @@ def test_default_kubernetes_specs_include_curated_linux_and_windows_profiles():
     assert linux.operating_system == SandboxOperatingSystem.LINUX
     assert linux.resource_class == SandboxResourceClass.STANDARD
     assert linux.working_dir == '/workspace/project'
+    assert linux.workspace_mount_path == '/workspace'
     assert linux.durable_state_dir == '/openhands'
+    assert linux.durable_mount_path == '/openhands'
+    assert linux.startup_timeout_seconds == 300
     assert linux.initial_env['OH_WORKSPACE_PATH'] == '/workspace/project'
     assert linux.initial_env['OH_CONVERSATIONS_PATH'] == '/openhands/conversations'
     assert linux.initial_env['OH_CONVERSATION_WORKTREE_ROOT'] == (
@@ -597,10 +677,15 @@ def test_default_kubernetes_specs_include_curated_linux_and_windows_profiles():
     assert windows.operating_system == SandboxOperatingSystem.WINDOWS
     assert windows.resource_class == SandboxResourceClass.STANDARD
     assert windows.working_dir == r'C:\workspace\project'
+    assert windows.workspace_mount_path == r'C:\workspace'
+    assert windows.durable_state_dir == r'C:\OpenHands\{sandbox_id}'
+    assert windows.durable_mount_path == r'C:\OpenHands'
     assert windows.initial_env['OH_CONVERSATIONS_PATH'] == (
-        r'C:\OpenHands\conversations'
+        r'C:\OpenHands\{sandbox_id}\conversations'
     )
-    assert windows.initial_env['OH_PERSISTENCE_DIR'] == (r'C:\OpenHands\persistence')
+    assert windows.initial_env['OH_PERSISTENCE_DIR'] == (
+        r'C:\OpenHands\{sandbox_id}\persistence'
+    )
     assert windows.initial_env['OH_CONVERSATION_WORKTREE_ROOT'] == (
         r'C:\workspace\worktrees'
     )
@@ -609,6 +694,230 @@ def test_default_kubernetes_specs_include_curated_linux_and_windows_profiles():
     assert windows.durable_volume_claim_name == 'openhands-halo-conversations'
     assert windows.cpu_cores == 4
     assert windows.memory_gib == 8
+    assert windows.startup_timeout_seconds == 600
+
+
+def test_kubernetes_manifests_materialize_profile_storage_and_placement():
+    repo_root = Path(__file__).parents[3]
+    templates = {
+        document['metadata']['name']: document
+        for document in yaml.safe_load_all(
+            (repo_root / 'deploy/kubernetes/sandboxtemplate.yaml').read_text()
+        )
+    }
+    pools = {
+        document['metadata']['name']: document
+        for document in yaml.safe_load_all(
+            (repo_root / 'deploy/kubernetes/sandboxwarmpool.yaml').read_text()
+        )
+    }
+
+    linux = templates['openhands-agent-server']
+    assert linux['spec']['volumeClaimTemplatesPolicy'] == 'Overrides'
+    assert (
+        linux['spec']['volumeClaimTemplates'][0]['spec']['storageClassName']
+        == 'managed-csi'
+    )
+    linux_pod = linux['spec']['podTemplate']['spec']
+    assert linux_pod['containers'][0]['workingDir'] == '/workspace/project'
+    assert linux_pod['volumes'] == [
+        {
+            'name': 'openhands-state',
+            'persistentVolumeClaim': {'claimName': 'openhands-halo-conversations'},
+        }
+    ]
+    linux_mounts = linux_pod['containers'][0]['volumeMounts']
+    assert {
+        'name': 'workspace',
+        'mountPath': '/workspace',
+    } in linux_mounts
+    assert {
+        'name': 'openhands-state',
+        'mountPath': '/openhands',
+        'subPathExpr': '$(OH_SANDBOX_ID)',
+    } in linux_mounts
+
+    windows = templates['openhands-agent-server-windows-2025']
+    assert windows['spec']['volumeClaimTemplatesPolicy'] == 'Overrides'
+    windows_pod = windows['spec']['podTemplate']['spec']
+    assert windows_pod['containers'][0]['workingDir'] == r'C:\workspace\project'
+    assert windows_pod['nodeSelector'] == {
+        'kubernetes.io/os': 'windows',
+        'node.kubernetes.io/windows-build': '10.0.26100',
+    }
+    assert windows_pod['tolerations'] == [
+        {
+            'key': 'os',
+            'operator': 'Equal',
+            'value': 'windows',
+            'effect': 'NoSchedule',
+        }
+    ]
+    assert windows_pod['volumes'] == [
+        {
+            'name': 'openhands-state',
+            'persistentVolumeClaim': {'claimName': 'openhands-halo-conversations'},
+        }
+    ]
+    windows_mounts = windows_pod['containers'][0]['volumeMounts']
+    assert {
+        'name': 'workspace',
+        'mountPath': r'C:\workspace',
+    } in windows_mounts
+    assert {
+        'name': 'openhands-state',
+        'mountPath': r'C:\OpenHands',
+    } in windows_mounts
+    assert all(
+        'subPath' not in mount and 'subPathExpr' not in mount
+        for mount in windows_mounts
+    )
+
+    assert pools['openhands-pool']['spec']['sandboxTemplateRef']['name'] == (
+        'openhands-agent-server'
+    )
+    assert pools[WINDOWS_STANDARD_POOL]['spec']['sandboxTemplateRef']['name'] == (
+        'openhands-agent-server-windows-2025'
+    )
+
+
+def test_profile_infrastructure_validation_reads_selected_pool_and_template(
+    service, custom_objects, core_v1
+):
+    repo_root = Path(__file__).parents[3]
+    templates = {
+        document['metadata']['name']: document
+        for document in yaml.safe_load_all(
+            (repo_root / 'deploy/kubernetes/sandboxtemplate.yaml').read_text()
+        )
+    }
+    pools = {
+        document['metadata']['name']: document
+        for document in yaml.safe_load_all(
+            (repo_root / 'deploy/kubernetes/sandboxwarmpool.yaml').read_text()
+        )
+    }
+    windows = {spec.id: spec for spec in get_default_sandbox_specs()}[
+        WINDOWS_STANDARD_POOL
+    ].model_copy(
+        update={
+            'image': templates['openhands-agent-server-windows-2025']['spec'][
+                'podTemplate'
+            ]['spec']['containers'][0]['image']
+        }
+    )
+
+    def get_object(*, plural, name, **_):
+        if plural == 'sandboxwarmpools':
+            return pools[name]
+        if plural == 'sandboxtemplates':
+            return templates[name]
+        raise AssertionError(plural)
+
+    custom_objects.get_namespaced_custom_object.side_effect = get_object
+
+    service._validate_profile_infrastructure_sync(windows, WINDOWS_STANDARD_POOL)
+    core_v1.read_namespaced_persistent_volume_claim.assert_called_once_with(
+        name=windows.durable_volume_claim_name,
+        namespace='agents',
+    )
+
+
+def test_profile_infrastructure_validation_rejects_durable_pvc_drift(
+    service, custom_objects
+):
+    repo_root = Path(__file__).parents[3]
+    template = next(
+        document
+        for document in yaml.safe_load_all(
+            (repo_root / 'deploy/kubernetes/sandboxtemplate.yaml').read_text()
+        )
+        if document['metadata']['name'] == 'openhands-agent-server'
+    )
+    linux = {spec.id: spec for spec in get_default_sandbox_specs()}[
+        DEFAULT_WARM_POOL
+    ].model_copy(update={'durable_volume_claim_name': 'wrong-pvc'})
+    custom_objects.get_namespaced_custom_object.side_effect = [
+        {'spec': {'sandboxTemplateRef': {'name': 'openhands-agent-server'}}},
+        template,
+    ]
+
+    with pytest.raises(SandboxError, match='durable PVC'):
+        service._validate_profile_infrastructure_sync(linux, DEFAULT_WARM_POOL)
+
+
+def test_profile_infrastructure_validation_rejects_working_directory_drift(
+    service, custom_objects
+):
+    repo_root = Path(__file__).parents[3]
+    template = next(
+        document
+        for document in yaml.safe_load_all(
+            (repo_root / 'deploy/kubernetes/sandboxtemplate.yaml').read_text()
+        )
+        if document['metadata']['name'] == 'openhands-agent-server'
+    )
+    linux = {spec.id: spec for spec in get_default_sandbox_specs()}[
+        DEFAULT_WARM_POOL
+    ].model_copy(update={'working_dir': '/wrong'})
+    custom_objects.get_namespaced_custom_object.side_effect = [
+        {'spec': {'sandboxTemplateRef': {'name': 'openhands-agent-server'}}},
+        template,
+    ]
+
+    with pytest.raises(SandboxError, match='working directory'):
+        service._validate_profile_infrastructure_sync(linux, DEFAULT_WARM_POOL)
+
+
+def test_profile_infrastructure_validation_rejects_durable_storage_class_drift(
+    service, custom_objects, core_v1
+):
+    repo_root = Path(__file__).parents[3]
+    template = next(
+        document
+        for document in yaml.safe_load_all(
+            (repo_root / 'deploy/kubernetes/sandboxtemplate.yaml').read_text()
+        )
+        if document['metadata']['name'] == 'openhands-agent-server'
+    )
+    linux = {spec.id: spec for spec in get_default_sandbox_specs()}[DEFAULT_WARM_POOL]
+    custom_objects.get_namespaced_custom_object.side_effect = [
+        {'spec': {'sandboxTemplateRef': {'name': 'openhands-agent-server'}}},
+        template,
+    ]
+    core_v1.read_namespaced_persistent_volume_claim.return_value.spec.storage_class_name = 'wrong-storage-class'
+
+    with pytest.raises(SandboxError, match='durable storage class'):
+        service._validate_profile_infrastructure_sync(linux, DEFAULT_WARM_POOL)
+
+
+@pytest.mark.parametrize('startup_timeout_seconds', [0, 3601])
+def test_execution_profile_rejects_out_of_range_startup_timeout(
+    startup_timeout_seconds,
+):
+    with pytest.raises(ValidationError):
+        SandboxSpecInfo(
+            id='invalid-timeout',
+            command=None,
+            startup_timeout_seconds=startup_timeout_seconds,
+        )
+
+
+def test_windows_profile_accepts_digest_pinned_halo_registry_image():
+    image = (
+        'ghcr.io/ghermann-msft/agent-server:abc123-windows-'
+        'ltsc2025-amd64@sha256:' + '1' * 64
+    )
+
+    profile = SandboxSpecInfo(
+        id=WINDOWS_STANDARD_POOL,
+        command=None,
+        operating_system=SandboxOperatingSystem.WINDOWS,
+        platform='windows/amd64',
+        image=image,
+    )
+
+    assert profile.image == image
 
 
 def test_kubernetes_specs_honor_halo_azure_files_overrides():

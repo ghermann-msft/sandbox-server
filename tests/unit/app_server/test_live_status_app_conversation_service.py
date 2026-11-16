@@ -37,7 +37,7 @@ from openhands.app_server.app_conversation.live_status_app_conversation_service 
     _resolve_title_llm_profile,
     effective_disabled_skills,
 )
-from openhands.app_server.errors import SandboxError
+from openhands.app_server.errors import SandboxError, SandboxStartupTimeoutError
 from openhands.app_server.integrations.provider import ProviderToken, ProviderType
 from openhands.app_server.integrations.service_types import SuggestedTask, TaskType
 from openhands.app_server.sandbox.sandbox_models import (
@@ -2150,6 +2150,7 @@ class TestLiveStatusAppConversationService:
         requested_spec = SandboxSpecInfo(
             id='windows-server-2025-amd64',
             command=None,
+            startup_timeout_seconds=300,
         )
         self.mock_user_context.get_default_sandbox_spec_id = AsyncMock(
             return_value='linux-standard'
@@ -2181,6 +2182,118 @@ class TestLiveStatusAppConversationService:
             sandbox_spec_id=requested_spec.id,
             sandbox_id=None,
         )
+        self.mock_sandbox_service.wait_for_sandbox_running.assert_awaited_once_with(
+            sandbox.id,
+            timeout=300,
+            poll_interval=self.service.sandbox_startup_poll_frequency,
+            httpx_client=self.service.httpx_client,
+        )
+
+    @pytest.mark.asyncio
+    async def test_wait_for_sandbox_start_uses_global_timeout_for_legacy_profile(
+        self,
+    ):
+        requested_spec = SandboxSpecInfo(
+            id='legacy-profile',
+            command=None,
+            startup_timeout_seconds=None,
+        )
+        self.mock_sandbox_spec_service.get_sandbox_spec = AsyncMock(
+            return_value=requested_spec
+        )
+        self.service._find_running_sandbox_for_user = AsyncMock(return_value=None)
+        sandbox = SandboxInfo(
+            id='new-legacy',
+            created_by_user_id='test_user_123',
+            sandbox_spec_id=requested_spec.id,
+            status=SandboxStatus.RUNNING,
+            session_api_key='key',
+        )
+        self.mock_sandbox_service.start_sandbox = AsyncMock(return_value=sandbox)
+        self.mock_sandbox_service.wait_for_sandbox_running = AsyncMock(
+            return_value=sandbox
+        )
+        task = AppConversationStartTask(
+            created_by_user_id='test_user_123',
+            request=AppConversationStartRequest(sandbox_spec_id=requested_spec.id),
+        )
+
+        [item async for item in self.service._wait_for_sandbox_start(task)]
+
+        self.mock_sandbox_service.wait_for_sandbox_running.assert_awaited_once_with(
+            sandbox.id,
+            timeout=self.service.sandbox_startup_timeout,
+            poll_interval=self.service.sandbox_startup_poll_frequency,
+            httpx_client=self.service.httpx_client,
+        )
+
+    @pytest.mark.asyncio
+    async def test_wait_for_sandbox_start_cleans_up_new_claim_on_timeout(self):
+        requested_spec = SandboxSpecInfo(
+            id='windows-server-2025-amd64',
+            command=None,
+            startup_timeout_seconds=300,
+        )
+        self.mock_sandbox_spec_service.get_sandbox_spec = AsyncMock(
+            return_value=requested_spec
+        )
+        self.mock_sandbox_service.search_sandboxes.return_value = SandboxPage(items=[])
+        sandbox = SandboxInfo(
+            id='new-windows',
+            created_by_user_id='test_user_123',
+            sandbox_spec_id=requested_spec.id,
+            status=SandboxStatus.STARTING,
+            session_api_key=None,
+        )
+        self.mock_sandbox_service.start_sandbox = AsyncMock(return_value=sandbox)
+        self.mock_sandbox_service.wait_for_sandbox_running = AsyncMock(
+            side_effect=SandboxStartupTimeoutError('timed out')
+        )
+        self.mock_sandbox_service.delete_sandbox = AsyncMock(return_value=True)
+        task = AppConversationStartTask(
+            created_by_user_id='test_user_123',
+            request=AppConversationStartRequest(sandbox_spec_id=requested_spec.id),
+        )
+
+        with pytest.raises(SandboxStartupTimeoutError, match='timed out'):
+            [item async for item in self.service._wait_for_sandbox_start(task)]
+
+        self.mock_sandbox_service.delete_sandbox.assert_awaited_once_with(sandbox.id)
+
+    @pytest.mark.asyncio
+    async def test_wait_for_sandbox_start_preserves_reused_claim_on_timeout(self):
+        requested_spec = SandboxSpecInfo(
+            id='windows-server-2025-amd64',
+            command=None,
+            startup_timeout_seconds=300,
+        )
+        sandbox = SandboxInfo(
+            id='existing-windows',
+            created_by_user_id='test_user_123',
+            sandbox_spec_id=requested_spec.id,
+            status=SandboxStatus.STARTING,
+            session_api_key=None,
+        )
+        self.mock_sandbox_service.get_sandbox = AsyncMock(return_value=sandbox)
+        self.mock_sandbox_spec_service.get_sandbox_spec = AsyncMock(
+            return_value=requested_spec
+        )
+        self.mock_sandbox_service.wait_for_sandbox_running = AsyncMock(
+            side_effect=SandboxStartupTimeoutError('timed out')
+        )
+        self.mock_sandbox_service.delete_sandbox = AsyncMock(return_value=True)
+        task = AppConversationStartTask(
+            created_by_user_id='test_user_123',
+            request=AppConversationStartRequest(
+                sandbox_id=sandbox.id,
+                sandbox_spec_id=requested_spec.id,
+            ),
+        )
+
+        with pytest.raises(SandboxStartupTimeoutError, match='timed out'):
+            [item async for item in self.service._wait_for_sandbox_start(task)]
+
+        self.mock_sandbox_service.delete_sandbox.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_wait_for_sandbox_start_rejects_profile_mismatch(self):

@@ -52,6 +52,10 @@ from openhands.app_server.sandbox.sandbox_service import (
     SandboxService,
     SandboxServiceInjector,
 )
+from openhands.app_server.sandbox.sandbox_spec_models import (
+    SandboxOperatingSystem,
+    SandboxSpecInfo,
+)
 from openhands.app_server.sandbox.sandbox_spec_service import (
     SandboxSpecService,
     resolve_sandbox_spec,
@@ -64,6 +68,8 @@ _logger = logging.getLogger(__name__)
 CLAIM_GROUP = 'extensions.agents.x-k8s.io'
 CLAIM_VERSION = 'v1beta1'
 CLAIM_PLURAL = 'sandboxclaims'
+WARM_POOL_PLURAL = 'sandboxwarmpools'
+TEMPLATE_PLURAL = 'sandboxtemplates'
 SANDBOX_GROUP = 'agents.x-k8s.io'
 SANDBOX_VERSION = 'v1beta1'
 SANDBOX_PLURAL = 'sandboxes'
@@ -76,6 +82,12 @@ MANAGED_BY_VALUE = 'openhands-app-server'
 SANDBOX_ID_LABEL = 'agents.openhands.dev/sandbox-id'
 # The spec id is an image name, which is not a valid label value.
 SPEC_ID_ANNOTATION = 'agents.openhands.dev/sandbox-spec-id'
+TEMPLATE_NAME_ANNOTATION = 'agents.openhands.dev/sandbox-template-name'
+WORKSPACE_STORAGE_CLASS_ANNOTATION = 'agents.openhands.dev/workspace-storage-class'
+WORKSPACE_STORAGE_SIZE_ANNOTATION = 'agents.openhands.dev/workspace-storage-size'
+DURABLE_PVC_ANNOTATION = 'agents.openhands.dev/durable-pvc'
+DURABLE_STORAGE_CLASS_ANNOTATION = 'agents.openhands.dev/durable-storage-class'
+DURABLE_SUB_PATH_ANNOTATION = 'agents.openhands.dev/durable-sub-path'
 # Lookup index for the session key. The env var stays the canonical secret; this is
 # a one-way hash so the API server can filter instead of us scanning every claim.
 SESSION_KEY_HASH_LABEL = 'agents.openhands.dev/session-key-hash'
@@ -141,8 +153,10 @@ class KubernetesSandboxService(SandboxService):
     inject_session_key: bool = True
     shutdown_after_seconds: int | None = None
     default_sandbox_spec_id: str | None = None
+    validate_profile_infrastructure: bool = True
     access_service: SandboxAccessService | None = None
     _custom_objects: Any = None
+    _core_v1: Any = None
 
     def __post_init__(self) -> None:
         if self._custom_objects is None:
@@ -151,6 +165,7 @@ class KubernetesSandboxService(SandboxService):
             except k8s_config.ConfigException:
                 k8s_config.load_kube_config()
             self._custom_objects = k8s_client.CustomObjectsApi()
+            self._core_v1 = k8s_client.CoreV1Api()
 
     # ── Naming ────────────────────────────────────────────────────────────────
 
@@ -237,6 +252,177 @@ class KubernetesSandboxService(SandboxService):
             if e.status == 404:
                 return None
             raise
+
+    def _get_extension_object_sync(self, plural: str, name: str) -> dict:
+        try:
+            return self._custom_objects.get_namespaced_custom_object(
+                group=CLAIM_GROUP,
+                version=CLAIM_VERSION,
+                namespace=self.namespace,
+                plural=plural,
+                name=name,
+            )
+        except ApiException as exc:
+            if exc.status == 404:
+                raise SandboxError(
+                    f'Kubernetes {plural} resource {name!r} was not found'
+                ) from exc
+            raise
+
+    def _validate_profile_infrastructure_sync(
+        self, sandbox_spec: SandboxSpecInfo, warm_pool: str
+    ) -> None:
+        pool = self._get_extension_object_sync(WARM_POOL_PLURAL, warm_pool)
+        template_name = ((pool.get('spec') or {}).get('sandboxTemplateRef') or {}).get(
+            'name'
+        )
+        if (
+            not isinstance(template_name, str)
+            or template_name != sandbox_spec.template_name
+        ):
+            raise SandboxError(
+                f'Execution profile {sandbox_spec.id!r} expects template '
+                f'{sandbox_spec.template_name!r}, but warm pool {warm_pool!r} '
+                f'references {template_name!r}'
+            )
+
+        template = self._get_extension_object_sync(TEMPLATE_PLURAL, template_name)
+        template_spec = template.get('spec') or {}
+        if template_spec.get('volumeClaimTemplatesPolicy') != 'Overrides':
+            raise SandboxError(
+                f'SandboxTemplate {template_name!r} must allow workspace volume '
+                'claim overrides'
+            )
+
+        pod_spec = (template_spec.get('podTemplate') or {}).get('spec') or {}
+        containers = pod_spec.get('containers') or []
+        container = next(
+            (item for item in containers if item.get('name') == 'agent-server'),
+            containers[0] if containers else None,
+        )
+        if container is None:
+            raise SandboxError(
+                f'SandboxTemplate {template_name!r} has no agent-server container'
+            )
+        if sandbox_spec.image and container.get('image') != sandbox_spec.image:
+            raise SandboxError(
+                f'Execution profile {sandbox_spec.id!r} image does not match '
+                f'SandboxTemplate {template_name!r}'
+            )
+        if container.get('workingDir') != sandbox_spec.working_dir:
+            raise SandboxError(
+                f'Execution profile {sandbox_spec.id!r} working directory does '
+                f'not match SandboxTemplate {template_name!r}'
+            )
+
+        volumes = {
+            volume.get('name'): volume for volume in pod_spec.get('volumes') or []
+        }
+        durable_volume = volumes.get('openhands-state') or {}
+        durable_claim_name = (durable_volume.get('persistentVolumeClaim') or {}).get(
+            'claimName'
+        )
+        if durable_claim_name != sandbox_spec.durable_volume_claim_name:
+            raise SandboxError(
+                f'Execution profile {sandbox_spec.id!r} durable PVC does not '
+                f'match SandboxTemplate {template_name!r}'
+            )
+        if self._core_v1 is None:
+            raise SandboxError(
+                'Kubernetes core API client is required to validate durable storage'
+            )
+        try:
+            durable_pvc = self._core_v1.read_namespaced_persistent_volume_claim(
+                name=sandbox_spec.durable_volume_claim_name,
+                namespace=self.namespace,
+            )
+        except ApiException as exc:
+            if exc.status == 404:
+                raise SandboxError(
+                    f'Durable PVC {sandbox_spec.durable_volume_claim_name!r} '
+                    'was not found'
+                ) from exc
+            raise
+        durable_storage_class = getattr(
+            getattr(durable_pvc, 'spec', None), 'storage_class_name', None
+        )
+        if durable_storage_class != sandbox_spec.durable_storage_class:
+            raise SandboxError(
+                f'Execution profile {sandbox_spec.id!r} durable storage class '
+                f'does not match PVC {sandbox_spec.durable_volume_claim_name!r}'
+            )
+
+        mounts = {
+            mount.get('name'): mount for mount in container.get('volumeMounts') or []
+        }
+        workspace_mount = mounts.get('workspace') or {}
+        durable_mount = mounts.get('openhands-state') or {}
+        if workspace_mount.get('mountPath') != sandbox_spec.workspace_mount_path:
+            raise SandboxError(
+                f'Execution profile {sandbox_spec.id!r} workspace mount does not '
+                f'match SandboxTemplate {template_name!r}'
+            )
+        if durable_mount.get('mountPath') != sandbox_spec.durable_mount_path:
+            raise SandboxError(
+                f'Execution profile {sandbox_spec.id!r} durable mount does not '
+                f'match SandboxTemplate {template_name!r}'
+            )
+        if sandbox_spec.operating_system == SandboxOperatingSystem.WINDOWS:
+            if 'subPath' in durable_mount or 'subPathExpr' in durable_mount:
+                raise SandboxError(
+                    f'Windows SandboxTemplate {template_name!r} cannot use volume '
+                    'subPath mounts'
+                )
+        elif durable_mount.get('subPathExpr') != '$(OH_SANDBOX_ID)':
+            raise SandboxError(
+                f'Linux SandboxTemplate {template_name!r} must isolate durable '
+                'state by OH_SANDBOX_ID'
+            )
+
+        if (
+            sandbox_spec.node_selector
+            and (pod_spec.get('nodeSelector') or {}) != sandbox_spec.node_selector
+        ):
+            raise SandboxError(
+                f'Execution profile {sandbox_spec.id!r} node selector does not '
+                f'match SandboxTemplate {template_name!r}'
+            )
+        expected_tolerations = [
+            toleration.model_dump(exclude_none=True)
+            for toleration in sandbox_spec.tolerations
+        ]
+        if (
+            expected_tolerations
+            and (pod_spec.get('tolerations') or []) != expected_tolerations
+        ):
+            raise SandboxError(
+                f'Execution profile {sandbox_spec.id!r} tolerations do not match '
+                f'SandboxTemplate {template_name!r}'
+            )
+
+        resources = container.get('resources') or {}
+        requests = resources.get('requests') or {}
+        limits = resources.get('limits') or {}
+        expected_resources = {
+            'cpu_request': (requests.get('cpu'), sandbox_spec.cpu_request),
+            'memory_request': (
+                requests.get('memory'),
+                sandbox_spec.memory_request,
+            ),
+            'cpu_limit': (limits.get('cpu'), sandbox_spec.cpu_limit),
+            'memory_limit': (limits.get('memory'), sandbox_spec.memory_limit),
+        }
+        mismatched_resources = [
+            name
+            for name, (actual, expected) in expected_resources.items()
+            if expected is not None and str(actual) != expected
+        ]
+        if mismatched_resources:
+            raise SandboxError(
+                f'Execution profile {sandbox_spec.id!r} resources '
+                f'{mismatched_resources!r} do not match SandboxTemplate '
+                f'{template_name!r}'
+            )
 
     def _create_claim_sync(self, body: dict) -> dict:
         return self._custom_objects.create_namespaced_custom_object(
@@ -498,7 +684,10 @@ class KubernetesSandboxService(SandboxService):
         await self._enforce_profile_quota(sandbox_spec)
         await self.pause_old_sandboxes(self.max_num_sandboxes - 1)
 
-        env_vars = dict(sandbox_spec.initial_env)
+        env_vars = {
+            name: value.replace('{sandbox_id}', sandbox_id)
+            for name, value in sandbox_spec.initial_env.items()
+        }
         env_vars['OH_SANDBOX_ID'] = sandbox_id
         env_vars[SECRET_KEY_VARIABLE] = base62.encodebytes(os.urandom(32))
         env_vars[WEBHOOK_CALLBACK_VARIABLE] = (
@@ -535,6 +724,38 @@ class KubernetesSandboxService(SandboxService):
             spec_warm_pool = None
         warm_pool = self.warm_pool or spec_warm_pool or sandbox_spec.id
 
+        workspace_storage_class = (
+            sandbox_spec.workspace_storage_class or sandbox_spec.storage_class
+        )
+        workspace_storage_size = (
+            sandbox_spec.workspace_storage_size or sandbox_spec.storage_size
+        )
+        durable_pvc = sandbox_spec.durable_volume_claim_name
+        durable_storage_class = sandbox_spec.durable_storage_class
+        durable_sub_path_template = sandbox_spec.durable_sub_path_template
+        if not workspace_storage_class or not workspace_storage_size:
+            raise SandboxError(
+                f'Execution profile {sandbox_spec.id!r} must define workspace '
+                'storage class and size'
+            )
+        if (
+            not durable_pvc
+            or not durable_storage_class
+            or not durable_sub_path_template
+        ):
+            raise SandboxError(
+                f'Execution profile {sandbox_spec.id!r} must define durable PVC, '
+                'storage class, and sub-path template'
+            )
+        durable_sub_path = durable_sub_path_template.replace('{sandbox_id}', sandbox_id)
+        template_name = sandbox_spec.template_name or ''
+        if self.validate_profile_infrastructure:
+            await asyncio.to_thread(
+                self._validate_profile_infrastructure_sync,
+                sandbox_spec,
+                warm_pool,
+            )
+
         created_by_user_id = None
         if self.access_service is not None:
             created_by_user_id = await self.access_service.create_personal_sandbox(
@@ -548,10 +769,31 @@ class KubernetesSandboxService(SandboxService):
                 'name': self._claim_name(sandbox_id),
                 'namespace': self.namespace,
                 'labels': labels,
-                'annotations': {SPEC_ID_ANNOTATION: sandbox_spec.id},
+                'annotations': {
+                    SPEC_ID_ANNOTATION: sandbox_spec.id,
+                    TEMPLATE_NAME_ANNOTATION: template_name,
+                    WORKSPACE_STORAGE_CLASS_ANNOTATION: workspace_storage_class,
+                    WORKSPACE_STORAGE_SIZE_ANNOTATION: workspace_storage_size,
+                    DURABLE_PVC_ANNOTATION: durable_pvc,
+                    DURABLE_STORAGE_CLASS_ANNOTATION: durable_storage_class,
+                    DURABLE_SUB_PATH_ANNOTATION: durable_sub_path,
+                },
             },
             'spec': {
                 'warmPoolRef': {'name': warm_pool},
+                'volumeClaimTemplates': [
+                    {
+                        'metadata': {'name': 'workspace'},
+                        'spec': {
+                            'accessModes': ['ReadWriteOnce'],
+                            'volumeMode': 'Filesystem',
+                            'storageClassName': workspace_storage_class,
+                            'resources': {
+                                'requests': {'storage': workspace_storage_size}
+                            },
+                        },
+                    }
+                ],
                 'env': [
                     {'name': name, 'value': value} for name, value in env_vars.items()
                 ],
@@ -726,6 +968,13 @@ class KubernetesSandboxServiceInjector(SandboxServiceInjector):
         ),
     )
     exposed_ports: list[ExposedPort] = Field(default_factory=_default_exposed_ports)
+    validate_profile_infrastructure: bool = Field(
+        default=True,
+        description=(
+            'Validate the selected warm pool and SandboxTemplate against the '
+            'execution profile before creating a claim.'
+        ),
+    )
 
     async def inject(
         self, state: InjectorState, request: Request | None = None
@@ -762,6 +1011,7 @@ class KubernetesSandboxServiceInjector(SandboxServiceInjector):
                 default_sandbox_spec_id=(
                     await user_context.get_default_sandbox_spec_id()
                 ),
+                validate_profile_infrastructure=(self.validate_profile_infrastructure),
                 access_service=SandboxAccessService(
                     db_session=db_session,
                     user_id=user_id,

@@ -114,10 +114,14 @@ async def test_admin_profile_crud_and_soft_delete(service):
         SandboxSpecUpdate(
             display_name='Build',
             max_concurrent_per_user=2,
+            startup_timeout_seconds=240,
+            operating_system=SandboxOperatingSystem.LINUX,
         ),
     )
     assert updated is not None
     assert updated.max_concurrent_per_user == 2
+    assert updated.startup_timeout_seconds == 240
+    assert updated.operating_system == SandboxOperatingSystem.LINUX
 
     assert await service.delete_sandbox_spec(created.id) is True
     assert await service.get_sandbox_spec(created.id) is None

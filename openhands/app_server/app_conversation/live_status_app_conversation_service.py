@@ -69,7 +69,7 @@ from openhands.app_server.config import (
     get_event_callback_service,
     resolve_provider_llm_base_url,
 )
-from openhands.app_server.errors import SandboxError
+from openhands.app_server.errors import SandboxError, SandboxStartupTimeoutError
 from openhands.app_server.event.event_service import EventService
 from openhands.app_server.event_callback.event_callback_models import EventCallback
 from openhands.app_server.event_callback.event_callback_service import (
@@ -941,6 +941,8 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
         self, task: AppConversationStartTask
     ) -> AsyncGenerator[AppConversationStartTask, None]:
         """Wait for sandbox to start and return info."""
+        created_sandbox = False
+        sandbox_spec = None
         # Get or create the sandbox
         if not task.request.sandbox_id:
             requested_spec = await resolve_sandbox_spec(
@@ -966,6 +968,8 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
                     sandbox_spec_id=requested_spec.id,
                     sandbox_id=sandbox_id_str,
                 )
+                created_sandbox = True
+            sandbox_spec = requested_spec
             task.sandbox_id = sandbox.id
         else:
             sandbox_info = await self.sandbox_service.get_sandbox(
@@ -984,6 +988,9 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
                 )
             sandbox = sandbox_info
             task.request.sandbox_spec_id = sandbox.sandbox_spec_id
+            sandbox_spec = await self.sandbox_spec_service.get_sandbox_spec(
+                sandbox.sandbox_spec_id, include_unavailable=True
+            )
 
         # Update the listener with sandbox info
         task.status = AppConversationStartTaskStatus.WAITING_FOR_SANDBOX
@@ -1018,12 +1025,35 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
             raise SandboxError(f'Sandbox not startable: {sandbox.id}')
 
         # Use shared wait_for_sandbox_running utility to poll for ready state
-        await self.sandbox_service.wait_for_sandbox_running(
-            sandbox.id,
-            timeout=self.sandbox_startup_timeout,
-            poll_interval=self.sandbox_startup_poll_frequency,
-            httpx_client=self.httpx_client,
+        startup_timeout = (
+            sandbox_spec.startup_timeout_seconds
+            if sandbox_spec is not None
+            and sandbox_spec.startup_timeout_seconds is not None
+            else self.sandbox_startup_timeout
         )
+        try:
+            await self.sandbox_service.wait_for_sandbox_running(
+                sandbox.id,
+                timeout=startup_timeout,
+                poll_interval=self.sandbox_startup_poll_frequency,
+                httpx_client=self.httpx_client,
+            )
+        except SandboxStartupTimeoutError:
+            if created_sandbox:
+                try:
+                    deleted = await self.sandbox_service.delete_sandbox(sandbox.id)
+                    if not deleted:
+                        _logger.warning(
+                            'Timed-out sandbox %s was already absent during cleanup',
+                            sandbox.id,
+                        )
+                except Exception:
+                    _logger.exception(
+                        'Failed to clean up timed-out sandbox %s',
+                        sandbox.id,
+                        stack_info=True,
+                    )
+            raise
 
     async def _seed_sandbox_profiles(
         self, agent_server_url: str, session_api_key: str | None

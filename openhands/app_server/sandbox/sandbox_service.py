@@ -5,7 +5,7 @@ from abc import ABC, abstractmethod
 
 import httpx
 
-from openhands.app_server.errors import SandboxError
+from openhands.app_server.errors import SandboxError, SandboxStartupTimeoutError
 from openhands.app_server.sandbox.sandbox_models import (
     AGENT_SERVER,
     SandboxInfo,
@@ -232,7 +232,11 @@ class SandboxService(ABC):
             timeout,
             status_detail,
         )
-        raise _start_failure_error(sandbox_id, status_detail)
+        failure = _start_failure_error(sandbox_id, status_detail)
+        raise SandboxStartupTimeoutError(
+            detail=failure.detail,
+            status_code=failure.status_code,
+        )
 
     async def _check_agent_server_alive(
         self, sandbox: SandboxInfo, httpx_client: httpx.AsyncClient

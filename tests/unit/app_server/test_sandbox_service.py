@@ -13,7 +13,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from openhands.app_server.errors import SandboxError
+from openhands.app_server.errors import SandboxError, SandboxStartupTimeoutError
 from openhands.app_server.sandbox.sandbox_models import (
     AGENT_SERVER,
     ExposedUrl,
@@ -224,7 +224,7 @@ class TestWaitForSandboxRunning:
             SandboxStatus.STARTING, '0/1 nodes are available: 1 Insufficient cpu.'
         )
         self._patch_timeout(monkeypatch)
-        with pytest.raises(SandboxError) as ei:
+        with pytest.raises(SandboxStartupTimeoutError) as ei:
             await mock_sandbox_service.wait_for_sandbox_running('sb1', timeout=1)
         msg = str(ei.value)
         assert 'at capacity' in msg and 'try again' in msg

@@ -52,10 +52,13 @@ class SandboxSpecInfo(BaseModel):
     resource_class: SandboxResourceClass = SandboxResourceClass.STANDARD
     image: str | None = None
     shell: list[str] = Field(default_factory=list)
+    workspace_mount_path: str | None = None
     durable_state_dir: str | None = None
+    durable_mount_path: str | None = None
     template_name: str | None = None
     warm_pool_name: str | None = None
     warm_pool_replicas: int = Field(default=0, ge=0)
+    startup_timeout_seconds: int | None = Field(default=None, gt=0, le=3600)
     cpu_request: str | None = None
     cpu_limit: str | None = None
     memory_request: str | None = None
@@ -69,7 +72,14 @@ class SandboxSpecInfo(BaseModel):
     durable_storage_class: str | None = None
     durable_storage_size: str | None = None
     durable_volume_claim_name: str | None = None
-    durable_sub_path_template: str | None = None
+    durable_sub_path_template: str | None = Field(
+        default=None,
+        description=(
+            'Deterministic durable-state namespace. Linux templates may mount '
+            'this as a volume subPath; Windows profiles interpolate it into '
+            'durable environment paths because Windows volume subPath is unsupported.'
+        ),
+    )
     node_selector: dict[str, str] = Field(default_factory=dict)
     tolerations: list[SandboxToleration] = Field(default_factory=list)
     capabilities: list[str] = Field(default_factory=list)
@@ -122,14 +132,18 @@ class SandboxSpecUpdate(BaseModel):
     published: bool | None = None
     availability: SandboxSpecAvailability | None = None
     availability_reason: str | None = None
+    operating_system: SandboxOperatingSystem | None = None
     resource_class: SandboxResourceClass | None = None
     platform: str | None = None
     image: str | None = None
     shell: list[str] | None = None
+    workspace_mount_path: str | None = None
     durable_state_dir: str | None = None
+    durable_mount_path: str | None = None
     template_name: str | None = None
     warm_pool_name: str | None = None
     warm_pool_replicas: int | None = Field(default=None, ge=0)
+    startup_timeout_seconds: int | None = Field(default=None, gt=0, le=3600)
     cpu_request: str | None = None
     cpu_limit: str | None = None
     memory_request: str | None = None

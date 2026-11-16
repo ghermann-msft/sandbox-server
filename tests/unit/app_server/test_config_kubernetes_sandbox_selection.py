@@ -19,7 +19,16 @@ def reset_global_config():
 
 def _get_clean_env():
     env = {}
-    for key in ['PATH', 'HOME', 'PYTHONPATH', 'VIRTUAL_ENV', 'TMPDIR', 'TMP', 'TEMP']:
+    for key in [
+        'PATH',
+        'HOME',
+        'USERPROFILE',
+        'PYTHONPATH',
+        'VIRTUAL_ENV',
+        'TMPDIR',
+        'TMP',
+        'TEMP',
+    ]:
         if key in os.environ:
             env[key] = os.environ[key]
     return env
@@ -58,3 +67,19 @@ def test_default_runtime_is_unchanged():
         config = config_from_env()
 
     assert isinstance(config.sandbox, DockerSandboxServiceInjector)
+
+
+def test_app_conversation_startup_timeout_environment_key():
+    from openhands.app_server.app_conversation.live_status_app_conversation_service import (
+        LiveStatusAppConversationServiceInjector,
+    )
+    from openhands.app_server.config import config_from_env
+
+    env = _get_clean_env()
+    env['OH_APP_CONVERSATION_SANDBOX_STARTUP_TIMEOUT'] = '600'
+
+    with patch.dict(os.environ, env, clear=True):
+        config = config_from_env()
+
+    assert isinstance(config.app_conversation, LiveStatusAppConversationServiceInjector)
+    assert config.app_conversation.sandbox_startup_timeout == 600

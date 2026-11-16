@@ -50,7 +50,38 @@ Everything else has a default; override through config as needed:
 Pod-level concerns live in the `SandboxTemplate` rather than here. That covers the
 image, CPU and memory, `runtimeClassName`, network policy and volumes.
 
-The default image extends the matching OpenHands agent-server release with the
+Execution profiles are enforced at claim creation:
+
+- The selected profile chooses a `SandboxWarmPool`, whose
+  `sandboxTemplateRef` must match the profile's `template_name`.
+- The claim overrides the template's `workspace` volume claim with the profile's
+  workspace storage class and size. Templates must set
+  `volumeClaimTemplatesPolicy: Overrides`.
+- The durable Azure Files PVC, container image, resource requests/limits, mount
+  roots, node selector, and tolerations are validated against the selected
+  template before a claim is created. A mismatch fails explicitly instead of
+  launching a sandbox with different infrastructure than the profile describes.
+
+The bundled Linux and Windows templates mount the existing Halo Azure Files PVC
+`openhands-halo-conversations`. To use another PVC or storage class, update the
+template and seed the matching profile fields together (the profile can be seeded
+with `OH_HALO_DURABLE_STATE_PVC` and `OH_HALO_DURABLE_STORAGE_CLASS`). Changing
+only the profile is rejected at sandbox creation.
+
+Linux mounts the sandbox's Azure Files directory at `/openhands` with
+`subPathExpr: $(OH_SANDBOX_ID)`. Kubernetes Windows containers do not support
+volume subPath mounts, so Windows mounts the whole share at `C:\OpenHands` and
+the app server expands `{sandbox_id}` into the conversations, bash-events, and
+persistence environment paths. This preserves deterministic per-sandbox
+directories without relying on an unsupported Windows mount feature.
+
+The global legacy startup fallback is configured with
+`OH_APP_CONVERSATION_SANDBOX_STARTUP_TIMEOUT` (120 seconds by default). Curated
+profiles override it with `startup_timeout_seconds`; the bundled Linux profile
+uses 300 seconds and Windows uses 600 seconds. Node warm capacity and image
+pre-pull remain the primary cold-start mitigation.
+
+The default Linux image extends the matching OpenHands agent-server release with the
 official Perforce MCP server v2026.4.3126709. The build verifies the published
 Linux zip with SHA256
 `f2ea428cf35acec04e822472b090128ff9e522d07264ab1211d46b05e479a387` and exposes
@@ -59,6 +90,12 @@ the stdio server as `/usr/local/bin/p4-mcp-server`. The upstream
 licensed under the
 [MIT license](https://github.com/perforce/p4mcp-server/blob/v2026.4.3126709/LICENSE.txt);
 its source is not forked or vendored here.
+
+The Windows profile accepts any digest-pinned registry reference matching the
+runtime contract. Halo publishes its image as
+`ghcr.io/ghermann-msft/agent-server:<sha>-windows-ltsc2025-amd64@sha256:<digest>`;
+the same exact reference must be present in both the profile and Windows
+SandboxTemplate before the profile is marked available.
 
 ### Reaching sandboxes from a browser
 

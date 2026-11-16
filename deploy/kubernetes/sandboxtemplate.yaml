@@ -14,6 +14,7 @@ spec:
   # and CORS settings) as environment variables on each SandboxClaim. Without this
   # the controller rejects the injection and sandboxes come up unauthenticated.
   envVarsInjectionPolicy: Allowed
+  volumeClaimTemplatesPolicy: Overrides
 
   # The controller-managed NetworkPolicy is restrictive in both directions: egress
   # allows public ranges but blocks private ones, and ingress only admits the
@@ -49,6 +50,7 @@ spec:
     - metadata:
         name: workspace
       spec:
+        storageClassName: managed-csi
         accessModes: ["ReadWriteOnce"]
         resources:
           requests:
@@ -105,6 +107,7 @@ metadata:
   namespace: default
 spec:
   envVarsInjectionPolicy: Allowed
+  volumeClaimTemplatesPolicy: Overrides
   volumeClaimTemplates:
     - metadata:
         name: workspace
@@ -131,9 +134,9 @@ spec:
             claimName: openhands-halo-conversations
       containers:
         - name: agent-server
-          image: ghcr.io/openhands/agent-server:1.37.1-windows-ltsc2025-amd64@sha256:0000000000000000000000000000000000000000000000000000000000000000
+          image: ghcr.io/ghermann-msft/agent-server:replace-with-sha-windows-ltsc2025-amd64@sha256:0000000000000000000000000000000000000000000000000000000000000000
           args: ["--host", "0.0.0.0", "--port", "8000"]
-          workingDir: 'C:\workspace'
+          workingDir: 'C:\workspace\project'
           env:
             - name: OH_SANDBOX_OPERATING_SYSTEM
               value: windows
@@ -164,4 +167,3 @@ spec:
               mountPath: 'C:\workspace'
             - name: openhands-state
               mountPath: 'C:\OpenHands'
-              subPathExpr: $(OH_SANDBOX_ID)
