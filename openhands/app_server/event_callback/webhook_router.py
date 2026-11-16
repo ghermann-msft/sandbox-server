@@ -39,6 +39,7 @@ from openhands.app_server.config import (
     depends_jwt_service,
     get_app_conversation_info_service,
     get_app_conversation_service,
+    get_app_conversation_start_task_service,
     get_event_callback_service,
     get_global_config,
     get_sandbox_service,
@@ -319,6 +320,23 @@ async def valid_conversation(
             id=conversation_id,
             sandbox_id=sandbox_record.id,
             created_by_user_id=sandbox_record.created_by_user_id,
+        )
+
+    if app_conversation_info.created_by_user_id is None:
+        async with get_app_conversation_start_task_service(state) as service:
+            start_tasks = await service.search_app_conversation_start_tasks(
+                conversation_id__eq=conversation_id,
+                limit=100,
+            )
+        matching_owners = {
+            task.created_by_user_id
+            for task in start_tasks.items
+            if task.sandbox_id == sandbox_record.id and task.created_by_user_id
+        }
+        if matching_owners != {sandbox_record.created_by_user_id}:
+            raise AuthError()
+        app_conversation_info = app_conversation_info.model_copy(
+            update={'created_by_user_id': sandbox_record.created_by_user_id}
         )
 
     if (

@@ -74,6 +74,53 @@ variables. `AZURE_AUTHORITY_HOST` is honored by Azure Identity when needed.
 a token for `https://ossrdbms-aad.database.windows.net/.default`, allowing
 Azure Identity to refresh credentials without restarting the server.
 
+## Hosted identity and GitHub
+
+Standalone behavior remains the default. Setting
+`OH_TRUSTED_IDENTITY_ASSERTION_SECRET` enables the hosted, per-user storage
+path and requires:
+
+- `OH_TRUSTED_IDENTITY_ASSERTION_ISSUER`
+- `OH_TRUSTED_IDENTITY_ASSERTION_AUDIENCE`
+- `JWT_SECRET` (shared by every server replica)
+- the existing `DB_HOST`, `DB_PORT`, `DB_NAME`, `DB_USER`, and `DB_PASS`
+  variables for PostgreSQL
+
+The assertion header defaults to `X-OpenHands-Identity-Assertion` and can be
+changed with `OH_TRUSTED_IDENTITY_ASSERTION_HEADER`. Lifetime and clock-skew
+limits default to 300 and 30 seconds and can be changed with
+`OH_TRUSTED_IDENTITY_ASSERTION_MAX_LIFETIME_SECONDS` and
+`OH_TRUSTED_IDENTITY_ASSERTION_CLOCK_SKEW_SECONDS`.
+
+Azure Database for PostgreSQL can use federated workload identity instead of a
+static password. Set `DB_AZURE_IDENTITY=true`, `DB_HOST`, `DB_PORT`, `DB_NAME`,
+`DB_USER`, and `DB_SSL_MODE=require`, together with the standard
+`AZURE_CLIENT_ID`, `AZURE_TENANT_ID`, and `AZURE_FEDERATED_TOKEN_FILE`
+variables. `AZURE_AUTHORITY_HOST` is honored by Azure Identity when needed.
+`DB_PASS` is not used in this mode. Each new pooled database connection obtains
+a token for `https://ossrdbms-aad.database.windows.net/.default`, allowing
+Azure Identity to refresh credentials without restarting the server.
+
+When `LLM_MODEL` is set, the first settings load for each hosted user creates
+and activates a `default` LLM profile from `LLM_MODEL` and the optional
+`LLM_BASE_URL`, `LLM_API_VERSION`, and `LLM_AUTH_TYPE` variables. The same
+profile is used for conversation titles. Existing user settings are not
+overwritten.
+
+GitHub App linking additionally requires:
+
+- `GITHUB_APP_CLIENT_ID`
+- `GITHUB_APP_CLIENT_SECRET`
+- `GITHUB_APP_SLUG`
+- `OH_GITHUB_OAUTH_CALLBACK_URL`
+- `OH_GITHUB_OAUTH_SUCCESS_URL`
+
+The Canvas-compatible endpoints are `GET /oauth/git-providers` and
+`POST /oauth/{provider_id}/link`. GitHub redirects to
+`GET /oauth/github/callback`; the server persists the resulting user token for
+the existing `/api/v1/git/installations/search` and
+`/api/v1/git/repositories/search` APIs.
+
 ## Extraction provenance
 
 The extraction is based on:

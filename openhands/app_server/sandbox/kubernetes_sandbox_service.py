@@ -25,7 +25,7 @@ import os
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from typing import Any, AsyncGenerator
+from typing import Any, AsyncGenerator, Mapping
 
 import base62
 from fastapi import Request
@@ -36,6 +36,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from openhands.agent_server.utils import utc_now
 from openhands.app_server.errors import SandboxError
+from openhands.app_server.sandbox.sandbox_access import SandboxAccessService
 from openhands.app_server.sandbox.sandbox_models import (
     AGENT_SERVER,
     VSCODE,
@@ -139,6 +140,7 @@ class KubernetesSandboxService(SandboxService):
     inject_session_key: bool = True
     shutdown_after_seconds: int | None = None
     default_sandbox_spec_id: str | None = None
+    access_service: SandboxAccessService | None = None
     _custom_objects: Any = None
 
     def __post_init__(self) -> None:
@@ -321,7 +323,11 @@ class KubernetesSandboxService(SandboxService):
                 return env.get('value')
         return None
 
-    async def _claim_to_sandbox_info(self, claim: dict) -> SandboxInfo | None:
+    async def _claim_to_sandbox_info(
+        self,
+        claim: dict,
+        owners: Mapping[str, str] | None = None,
+    ) -> SandboxInfo | None:
         metadata = claim.get('metadata') or {}
         labels = metadata.get('labels') or {}
         sandbox_id = labels.get(SANDBOX_ID_LABEL)
@@ -348,9 +354,15 @@ class KubernetesSandboxService(SandboxService):
                 pass
 
         annotations = metadata.get('annotations') or {}
+        if owners is not None:
+            created_by_user_id = owners.get(sandbox_id)
+        elif self.access_service is not None:
+            created_by_user_id = await self.access_service.owner_user_id(sandbox_id)
+        else:
+            created_by_user_id = None
         return SandboxInfo(
             id=sandbox_id,
-            created_by_user_id=None,
+            created_by_user_id=created_by_user_id,
             sandbox_spec_id=annotations.get(SPEC_ID_ANNOTATION, ''),
             status=status,
             session_api_key=(
@@ -375,10 +387,22 @@ class KubernetesSandboxService(SandboxService):
         limit: int = 100,
     ) -> SandboxPage:
         claims = await asyncio.to_thread(self._list_claims_sync)
+        owners: dict[str, str] = {}
+        if self.access_service is not None:
+            sandbox_ids = [
+                sandbox_id
+                for claim in claims
+                if (
+                    sandbox_id := (
+                        (claim.get('metadata') or {}).get('labels') or {}
+                    ).get(SANDBOX_ID_LABEL)
+                )
+            ]
+            owners = await self.access_service.owner_user_ids(sandbox_ids)
         # Each conversion reads the claim's Sandbox, so run them concurrently
         # rather than paying one API round-trip per claim in series.
         infos = await asyncio.gather(
-            *[self._claim_to_sandbox_info(claim) for claim in claims]
+            *[self._claim_to_sandbox_info(claim, owners) for claim in claims]
         )
         items = [info for info in infos if info is not None]
         items.sort(key=lambda item: item.created_at)
@@ -433,7 +457,10 @@ class KubernetesSandboxService(SandboxService):
         sandbox_id = labels.get(SANDBOX_ID_LABEL)
         if not sandbox_id:
             return None
-        return SandboxRecord(id=sandbox_id, created_by_user_id=None)
+        created_by_user_id = None
+        if self.access_service is not None:
+            created_by_user_id = await self.access_service.owner_user_id(sandbox_id)
+        return SandboxRecord(id=sandbox_id, created_by_user_id=created_by_user_id)
 
     async def start_sandbox(
         self, sandbox_spec_id: str | None = None, sandbox_id: str | None = None
@@ -443,6 +470,8 @@ class KubernetesSandboxService(SandboxService):
             sandbox_id = base62.encodebytes(os.urandom(16))
         else:
             self._validate_sandbox_id(sandbox_id)
+        if self.access_service is not None:
+            self.access_service.require_owner()
 
         # Resolving first keeps an unknown spec id from evicting a sandbox on its
         # way to raising.
@@ -487,6 +516,12 @@ class KubernetesSandboxService(SandboxService):
         # more than one runtime.
         warm_pool = self.warm_pool or sandbox_spec.id
 
+        created_by_user_id = None
+        if self.access_service is not None:
+            created_by_user_id = await self.access_service.create_personal_sandbox(
+                sandbox_id
+            )
+
         claim: dict[str, Any] = {
             'apiVersion': f'{CLAIM_GROUP}/{CLAIM_VERSION}',
             'kind': 'SandboxClaim',
@@ -521,7 +556,7 @@ class KubernetesSandboxService(SandboxService):
 
         return SandboxInfo(
             id=sandbox_id,
-            created_by_user_id=None,
+            created_by_user_id=created_by_user_id,
             sandbox_spec_id=sandbox_spec.id,
             status=SandboxStatus.STARTING,
             session_api_key=None,
@@ -558,6 +593,8 @@ class KubernetesSandboxService(SandboxService):
         if not name:
             return False
         await asyncio.to_thread(self._delete_claim_sync, name)
+        if self.access_service is not None:
+            await self.access_service.delete_sandbox(sandbox_id)
         return True
 
 
@@ -642,6 +679,7 @@ class KubernetesSandboxServiceInjector(SandboxServiceInjector):
     ) -> AsyncGenerator[SandboxService, None]:
         # Defined inline to prevent circular lookup
         from openhands.app_server.config import (
+            get_db_session,
             get_global_config,
             get_sandbox_spec_service,
             get_user_context,
@@ -652,7 +690,9 @@ class KubernetesSandboxServiceInjector(SandboxServiceInjector):
         async with (
             get_sandbox_spec_service(state) as sandbox_spec_service,
             get_user_context(state, request) as user_context,
+            get_db_session(state, request) as db_session,
         ):
+            user_id = await user_context.get_user_id()
             yield KubernetesSandboxService(
                 sandbox_spec_service=sandbox_spec_service,
                 namespace=self.namespace,
@@ -668,5 +708,9 @@ class KubernetesSandboxServiceInjector(SandboxServiceInjector):
                 shutdown_after_seconds=self.shutdown_after_seconds,
                 default_sandbox_spec_id=(
                     await user_context.get_default_sandbox_spec_id()
+                ),
+                access_service=SandboxAccessService(
+                    db_session=db_session,
+                    user_id=user_id,
                 ),
             )

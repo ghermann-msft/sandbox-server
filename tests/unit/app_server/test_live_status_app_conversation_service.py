@@ -58,6 +58,7 @@ from openhands.sdk import Agent, AgentContext, Event
 from openhands.sdk.llm import LLM
 from openhands.sdk.secret import LookupSecret, StaticSecret
 from openhands.sdk.settings import ConversationSettings, OpenHandsAgentSettings
+from openhands.sdk.tool import SUB_AGENT_TOOL_NAME, Tool
 from openhands.sdk.workspace.remote.async_remote_workspace import AsyncRemoteWorkspace
 
 
@@ -1193,7 +1194,7 @@ class TestLiveStatusAppConversationService:
         assert 'git_provider:github' in metadata['tags']
 
     @patch(
-        'openhands.app_server.app_conversation.live_status_app_conversation_service.get_default_tools',
+        'openhands.app_server.app_conversation.live_status_app_conversation_service.launch_tool_specs',
         return_value=[],
     )
     @pytest.mark.asyncio
@@ -1229,7 +1230,7 @@ class TestLiveStatusAppConversationService:
         self.service._load_skills_and_update_agent.assert_called_once()
 
     @patch(
-        'openhands.app_server.app_conversation.live_status_app_conversation_service.get_default_tools',
+        'openhands.app_server.app_conversation.live_status_app_conversation_service.launch_tool_specs',
         return_value=[],
     )
     @pytest.mark.asyncio
@@ -1262,7 +1263,7 @@ class TestLiveStatusAppConversationService:
         assert request.title_llm_profile == 'Titles'
 
     @patch(
-        'openhands.app_server.app_conversation.live_status_app_conversation_service.get_default_tools',
+        'openhands.app_server.app_conversation.live_status_app_conversation_service.launch_tool_specs',
         return_value=[],
     )
     @pytest.mark.asyncio
@@ -1303,7 +1304,7 @@ class TestLiveStatusAppConversationService:
         assert set(kwargs['disabled_skills']) == {'member-skill', 'profile-skill'}
 
     @patch(
-        'openhands.app_server.app_conversation.live_status_app_conversation_service.get_default_tools',
+        'openhands.app_server.app_conversation.live_status_app_conversation_service.launch_tool_specs',
         return_value=[],
     )
     @pytest.mark.asyncio
@@ -1332,7 +1333,7 @@ class TestLiveStatusAppConversationService:
         assert result.conversation_id == conversation_id
 
     @patch(
-        'openhands.app_server.app_conversation.live_status_app_conversation_service.get_default_tools',
+        'openhands.app_server.app_conversation.live_status_app_conversation_service.launch_tool_specs',
         return_value=[],
     )
     @pytest.mark.asyncio
@@ -1399,7 +1400,7 @@ class TestLiveStatusAppConversationService:
         assert updated.condenser.llm.usage_id == 'condenser'
 
     @patch(
-        'openhands.app_server.app_conversation.live_status_app_conversation_service.get_default_tools',
+        'openhands.app_server.app_conversation.live_status_app_conversation_service.launch_tool_specs',
         return_value=[],
     )
     @pytest.mark.asyncio
@@ -1457,7 +1458,7 @@ class TestLiveStatusAppConversationService:
         )
 
     @patch(
-        'openhands.app_server.app_conversation.live_status_app_conversation_service.get_default_tools',
+        'openhands.app_server.app_conversation.live_status_app_conversation_service.launch_tool_specs',
         return_value=[],
     )
     @pytest.mark.asyncio
@@ -1495,7 +1496,7 @@ class TestLiveStatusAppConversationService:
         }
 
     @patch(
-        'openhands.app_server.app_conversation.live_status_app_conversation_service.get_default_tools',
+        'openhands.app_server.app_conversation.live_status_app_conversation_service.launch_tool_specs',
         return_value=[],
     )
     @pytest.mark.asyncio
@@ -1545,7 +1546,7 @@ class TestLiveStatusAppConversationService:
         )
 
     @patch(
-        'openhands.app_server.app_conversation.live_status_app_conversation_service.get_default_tools',
+        'openhands.app_server.app_conversation.live_status_app_conversation_service.launch_tool_specs',
         return_value=[],
     )
     @pytest.mark.asyncio
@@ -1583,7 +1584,7 @@ class TestLiveStatusAppConversationService:
         }
 
     @patch(
-        'openhands.app_server.app_conversation.live_status_app_conversation_service.get_default_tools',
+        'openhands.app_server.app_conversation.live_status_app_conversation_service.launch_tool_specs',
         return_value=[],
     )
     @pytest.mark.asyncio
@@ -1615,7 +1616,7 @@ class TestLiveStatusAppConversationService:
         }
 
     @patch(
-        'openhands.app_server.app_conversation.live_status_app_conversation_service.get_default_tools',
+        'openhands.app_server.app_conversation.live_status_app_conversation_service.launch_tool_specs',
         return_value=[],
     )
     @pytest.mark.asyncio
@@ -1716,7 +1717,7 @@ class TestLiveStatusAppConversationService:
         }
 
     @patch(
-        'openhands.app_server.app_conversation.live_status_app_conversation_service.get_default_tools',
+        'openhands.app_server.app_conversation.live_status_app_conversation_service.launch_tool_specs',
         return_value=[],
     )
     @pytest.mark.asyncio
@@ -1743,7 +1744,7 @@ class TestLiveStatusAppConversationService:
         assert 'git fetch --unshallow' in suffix
 
     @patch(
-        'openhands.app_server.app_conversation.live_status_app_conversation_service.get_default_tools',
+        'openhands.app_server.app_conversation.live_status_app_conversation_service.launch_tool_specs',
         return_value=[],
     )
     @pytest.mark.asyncio
@@ -1776,16 +1777,11 @@ class TestLiveStatusAppConversationService:
     @patch(
         'openhands.app_server.app_conversation.live_status_app_conversation_service.register_builtins_agents'
     )
-    @patch(
-        'openhands.app_server.app_conversation.live_status_app_conversation_service.get_default_tools',
-        return_value=[],
-    )
     @pytest.mark.asyncio
-    async def test_build_request_passes_enable_sub_agents_true(
-        self, mock_tools, mock_register_builtins, mock_get_agent_definitions
+    async def test_build_request_forwards_explicit_subagent_definitions(
+        self, mock_register_builtins, mock_get_agent_definitions
     ):
-        """Built-in sub-agents are registered when the user setting is on."""
-        from openhands.sdk.settings import OpenHandsAgentSettings
+        """Built-in sub-agents are registered when the canonical tool is present."""
         from openhands.sdk.subagent.schema import AgentDefinition
 
         agent_definition = AgentDefinition(
@@ -1797,7 +1793,7 @@ class TestLiveStatusAppConversationService:
 
         agent_settings = OpenHandsAgentSettings(
             llm={'model': 'gpt-4', 'api_key': 'test-key'},
-            enable_sub_agents=True,
+            tools=[Tool(name=SUB_AGENT_TOOL_NAME)],
         )
         self.mock_user.agent_settings = agent_settings
         self.mock_user_context.get_user_info.return_value = self.mock_user
@@ -1818,8 +1814,8 @@ class TestLiveStatusAppConversationService:
 
         mock_register_builtins.assert_called_once_with(enable_browser=True)
         mock_get_agent_definitions.assert_called_once_with()
-        mock_tools.assert_called_once_with(enable_browser=True, enable_sub_agents=True)
         assert result.agent_definitions == [agent_definition]
+        assert result.agent.tools == [Tool(name=SUB_AGENT_TOOL_NAME)]
 
     @patch(
         'openhands.app_server.app_conversation.live_status_app_conversation_service.get_registered_agent_definitions'
@@ -1827,20 +1823,13 @@ class TestLiveStatusAppConversationService:
     @patch(
         'openhands.app_server.app_conversation.live_status_app_conversation_service.register_builtins_agents'
     )
-    @patch(
-        'openhands.app_server.app_conversation.live_status_app_conversation_service.get_default_tools',
-        return_value=[],
-    )
     @pytest.mark.asyncio
-    async def test_build_request_passes_enable_sub_agents_false(
-        self, mock_tools, mock_register_builtins, mock_get_agent_definitions
+    async def test_build_request_materializes_default_tools_without_retired_switch(
+        self, mock_register_builtins, mock_get_agent_definitions
     ):
-        """Built-in sub-agents are registered but not forwarded when disabled."""
-        from openhands.sdk.settings import OpenHandsAgentSettings
-
+        """Current SDK settings start conversations without retired switches."""
         agent_settings = OpenHandsAgentSettings(
             llm={'model': 'gpt-4', 'api_key': 'test-key'},
-            enable_sub_agents=False,
         )
         self.mock_user.agent_settings = agent_settings
         self.mock_user_context.get_user_info.return_value = self.mock_user
@@ -1861,11 +1850,52 @@ class TestLiveStatusAppConversationService:
 
         mock_register_builtins.assert_called_once_with(enable_browser=True)
         mock_get_agent_definitions.assert_not_called()
-        mock_tools.assert_called_once_with(enable_browser=True, enable_sub_agents=False)
         assert result.agent_definitions == []
+        assert [tool.name for tool in result.agent.tools] == [
+            'terminal',
+            'file_editor',
+            'task_tracker',
+            'browser_tool_set',
+        ]
 
     @patch(
-        'openhands.app_server.app_conversation.live_status_app_conversation_service.get_default_tools',
+        'openhands.app_server.app_conversation.live_status_app_conversation_service.get_registered_agent_definitions'
+    )
+    @patch(
+        'openhands.app_server.app_conversation.live_status_app_conversation_service.register_builtins_agents'
+    )
+    @pytest.mark.asyncio
+    async def test_build_request_preserves_explicit_tools_without_delegation(
+        self, mock_register_builtins, mock_get_agent_definitions
+    ):
+        agent_settings = OpenHandsAgentSettings(
+            llm={'model': 'gpt-4', 'api_key': 'test-key'},
+            tools=[Tool(name='terminal')],
+        )
+        self.mock_user.agent_settings = agent_settings
+        self.mock_user_context.get_user_info.return_value = self.mock_user
+
+        real_llm = LLM(model='gpt-4', api_key=SecretStr('test-key'))
+        self.service._setup_secrets_for_git_providers = AsyncMock(return_value={})
+        self.service._configure_llm_and_mcp = AsyncMock(return_value=(real_llm, {}))
+
+        result = await self.service._build_start_conversation_request_for_user(
+            sandbox=self.mock_sandbox,
+            conversation_id=uuid4(),
+            initial_message=None,
+            system_message_suffix=None,
+            git_provider=None,
+            working_dir='/test/dir',
+            remote_workspace=None,
+        )
+
+        mock_register_builtins.assert_called_once_with(enable_browser=True)
+        mock_get_agent_definitions.assert_not_called()
+        assert result.agent_definitions == []
+        assert result.agent.tools == [Tool(name='terminal')]
+
+    @patch(
+        'openhands.app_server.app_conversation.live_status_app_conversation_service.launch_tool_specs',
         return_value=[],
     )
     @pytest.mark.asyncio
@@ -1923,7 +1953,7 @@ class TestLiveStatusAppConversationService:
         assert secrets['ANOTHER_SECRET'].value.get_secret_value() == 'another_value'
 
     @patch(
-        'openhands.app_server.app_conversation.live_status_app_conversation_service.get_default_tools',
+        'openhands.app_server.app_conversation.live_status_app_conversation_service.launch_tool_specs',
         return_value=[],
     )
     @pytest.mark.asyncio
@@ -1972,7 +2002,7 @@ class TestLiveStatusAppConversationService:
         assert secrets['SHARED_SECRET'].value.get_secret_value() == 'overridden_value'
 
     @patch(
-        'openhands.app_server.app_conversation.live_status_app_conversation_service.get_default_tools',
+        'openhands.app_server.app_conversation.live_status_app_conversation_service.launch_tool_specs',
         return_value=[],
     )
     @pytest.mark.asyncio
@@ -3128,7 +3158,7 @@ class TestLiveStatusAppConversationService:
         assert get_project_dir('/workspace/project', '') == '/workspace/project'
 
     @patch(
-        'openhands.app_server.app_conversation.live_status_app_conversation_service.get_default_tools',
+        'openhands.app_server.app_conversation.live_status_app_conversation_service.launch_tool_specs',
         return_value=[],
     )
     @pytest.mark.asyncio
@@ -3162,7 +3192,7 @@ class TestLiveStatusAppConversationService:
         ), 'workspace.working_dir must point to the repo root, not the sandbox mount'
 
     @patch(
-        'openhands.app_server.app_conversation.live_status_app_conversation_service.get_default_tools',
+        'openhands.app_server.app_conversation.live_status_app_conversation_service.launch_tool_specs',
         return_value=[],
     )
     @pytest.mark.asyncio
@@ -3535,7 +3565,7 @@ class TestPluginHandling:
 
     @pytest.mark.asyncio
     @patch(
-        'openhands.app_server.app_conversation.live_status_app_conversation_service.get_default_tools',
+        'openhands.app_server.app_conversation.live_status_app_conversation_service.launch_tool_specs',
         return_value=[],
     )
     async def test_build_request_with_plugins(self, _mock_tools):
@@ -3582,7 +3612,7 @@ class TestPluginHandling:
         assert '- api_key: test123' in result.initial_message.content[0].text
 
     @patch(
-        'openhands.app_server.app_conversation.live_status_app_conversation_service.get_default_tools',
+        'openhands.app_server.app_conversation.live_status_app_conversation_service.launch_tool_specs',
         return_value=[],
     )
     @pytest.mark.asyncio
@@ -3608,7 +3638,7 @@ class TestPluginHandling:
         assert result.plugins is None
 
     @patch(
-        'openhands.app_server.app_conversation.live_status_app_conversation_service.get_default_tools',
+        'openhands.app_server.app_conversation.live_status_app_conversation_service.launch_tool_specs',
         return_value=[],
     )
     @pytest.mark.asyncio
@@ -3650,7 +3680,7 @@ class TestPluginHandling:
         assert result.plugins[0].repo_path == 'plugins/city-weather'
 
     @patch(
-        'openhands.app_server.app_conversation.live_status_app_conversation_service.get_default_tools',
+        'openhands.app_server.app_conversation.live_status_app_conversation_service.launch_tool_specs',
         return_value=[],
     )
     @pytest.mark.asyncio
