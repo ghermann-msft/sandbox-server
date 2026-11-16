@@ -24,10 +24,17 @@ from openhands.app_server.sandbox.kubernetes_sandbox_service import (
     MANAGED_BY_LABEL,
     MANAGED_BY_VALUE,
     SANDBOX_ID_LABEL,
+    SECRET_KEY_VARIABLE,
     SESSION_KEY_HASH_LABEL,
     SPEC_ID_ANNOTATION,
     KubernetesSandboxService,
     KubernetesSandboxServiceInjector,
+)
+from openhands.app_server.sandbox.kubernetes_sandbox_spec_service import (
+    DEFAULT_WARM_POOL,
+    WINDOWS_STANDARD_POOL,
+    get_bootstrap_sandbox_specs,
+    get_default_sandbox_specs,
 )
 from openhands.app_server.sandbox.sandbox_access import (
     SandboxAccessService,
@@ -37,6 +44,10 @@ from openhands.app_server.sandbox.sandbox_models import AGENT_SERVER, SandboxSta
 from openhands.app_server.sandbox.sandbox_service import (
     SESSION_API_KEY_VARIABLE,
     WEBHOOK_CALLBACK_VARIABLE,
+)
+from openhands.app_server.sandbox.sandbox_spec_models import (
+    SandboxOperatingSystem,
+    SandboxResourceClass,
 )
 
 
@@ -121,6 +132,8 @@ async def test_start_sandbox_creates_claim(service, custom_objects):
 
     env = {item['name']: item['value'] for item in body['spec']['env']}
     assert env['LOG_JSON'] == 'true'
+    assert env['OH_SANDBOX_ID'] == info.id
+    assert env[SECRET_KEY_VARIABLE]
     assert env[WEBHOOK_CALLBACK_VARIABLE] == 'http://app-server:3000/api/v1/webhooks'
     assert env[SESSION_API_KEY_VARIABLE]
 
@@ -287,6 +300,22 @@ async def test_get_sandbox_running_exposes_urls_and_key(service, custom_objects)
     assert info.session_api_key == 'secret-key'
     # DNS resolves the Sandbox resource name, not the app-level id.
     assert info.exposed_urls[0].url == 'https://sb-1.example.com:8000'
+
+
+async def test_get_legacy_sandbox_adopts_warm_pool_profile(service, custom_objects):
+    claim = _claim()
+    claim['metadata']['annotations'] = {}
+    claim['spec']['warmPoolRef'] = {'name': 'openhands-pool'}
+    custom_objects.list_namespaced_custom_object.return_value = {'items': [claim]}
+    custom_objects.get_namespaced_custom_object.return_value = _sandbox()
+
+    info = await service.get_sandbox('sb1')
+
+    assert info is not None
+    assert info.sandbox_spec_id == 'openhands-pool'
+    service.sandbox_spec_service.get_sandbox_spec.assert_awaited_once_with(
+        'openhands-pool', include_unavailable=True
+    )
 
 
 async def test_get_sandbox_missing_returns_none(service, custom_objects):
@@ -547,4 +576,91 @@ async def test_unknown_spec_id_does_not_pause_existing_sandboxes(
         await service.start_sandbox(sandbox_spec_id='no-such-spec')
 
     custom_objects.patch_namespaced_custom_object.assert_not_called()
+    custom_objects.create_namespaced_custom_object.assert_not_called()
+
+
+def test_default_kubernetes_specs_include_curated_linux_and_windows_profiles():
+    specs = {spec.id: spec for spec in get_default_sandbox_specs()}
+
+    linux = specs[DEFAULT_WARM_POOL]
+    assert linux.operating_system == SandboxOperatingSystem.LINUX
+    assert linux.resource_class == SandboxResourceClass.STANDARD
+    assert linux.working_dir == '/workspace/project'
+    assert linux.durable_state_dir == '/openhands'
+    assert linux.initial_env['OH_WORKSPACE_PATH'] == '/workspace/project'
+    assert linux.initial_env['OH_CONVERSATIONS_PATH'] == '/openhands/conversations'
+    assert linux.initial_env['OH_CONVERSATION_WORKTREE_ROOT'] == (
+        '/workspace/worktrees'
+    )
+
+    windows = specs[WINDOWS_STANDARD_POOL]
+    assert windows.operating_system == SandboxOperatingSystem.WINDOWS
+    assert windows.resource_class == SandboxResourceClass.STANDARD
+    assert windows.working_dir == r'C:\workspace\project'
+    assert windows.initial_env['OH_CONVERSATIONS_PATH'] == (
+        r'C:\OpenHands\conversations'
+    )
+    assert windows.initial_env['OH_PERSISTENCE_DIR'] == (r'C:\OpenHands\persistence')
+    assert windows.initial_env['OH_CONVERSATION_WORKTREE_ROOT'] == (
+        r'C:\workspace\worktrees'
+    )
+    assert windows.workspace_storage_class == 'managed-csi'
+    assert windows.durable_storage_class == 'openhands-halo-azurefile'
+    assert windows.durable_volume_claim_name == 'openhands-halo-conversations'
+    assert windows.cpu_cores == 4
+    assert windows.memory_gib == 8
+
+
+def test_kubernetes_specs_honor_halo_azure_files_overrides():
+    with patch.dict(
+        'os.environ',
+        {
+            'OH_HALO_DURABLE_STATE_PVC': 'openhands-halo-conversations',
+            'OH_HALO_DURABLE_STORAGE_CLASS': 'openhands-halo-azurefile',
+        },
+    ):
+        specs = get_default_sandbox_specs()
+
+    assert {profile.durable_volume_claim_name for profile in specs} == {
+        'openhands-halo-conversations'
+    }
+    assert {profile.durable_storage_class for profile in specs} == {
+        'openhands-halo-azurefile'
+    }
+    assert {profile.durable_sub_path_template for profile in specs} == {'{sandbox_id}'}
+
+
+def test_bootstrap_file_overrides_builtin_profile(tmp_path):
+    bootstrap = tmp_path / 'profiles.json'
+    bootstrap.write_text(
+        '[{"id":"openhands-pool","command":null,'
+        '"bootstrap_revision":"ppe-v2","working_dir":"/fast/project",'
+        '"durable_state_dir":"/openhands",'
+        '"durable_sub_path_template":"{sandbox_id}"}]',
+        encoding='utf-8',
+    )
+    with patch.dict('os.environ', {'OH_SANDBOX_SPEC_BOOTSTRAP_FILE': str(bootstrap)}):
+        profiles = {profile.id: profile for profile in get_bootstrap_sandbox_specs()}
+
+    overridden = profiles[DEFAULT_WARM_POOL]
+    assert overridden.working_dir == '/fast/project'
+    assert overridden.bootstrap_revision == 'ppe-v2'
+    assert overridden.source == 'bootstrap'
+    assert overridden.immutable is True
+
+
+async def test_profile_global_quota_fails_before_claim_creation(
+    service, mock_sandbox_spec_service, custom_objects
+):
+    spec = get_default_sandbox_specs()[0].model_copy(
+        update={'max_concurrent_sandboxes': 1}
+    )
+    mock_sandbox_spec_service.get_default_sandbox_spec.return_value = spec
+    custom_objects.list_namespaced_custom_object.return_value = {
+        'items': [_claim(sandbox_id='existing')]
+    }
+
+    with pytest.raises(SandboxError, match='global concurrency limit'):
+        await service.start_sandbox()
+
     custom_objects.create_namespaced_custom_object.assert_not_called()

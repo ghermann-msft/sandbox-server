@@ -638,6 +638,7 @@ def grouped_workspace_dir(
     base_working_dir: str,
     grouping_strategy: SandboxGroupingStrategy,
     conversation_id_hex: str,
+    operating_system='linux',
 ) -> str:
     """Workspace dir for a conversation given the grouping strategy.
 
@@ -648,7 +649,17 @@ def grouped_workspace_dir(
     """
     if grouping_strategy == SandboxGroupingStrategy.NO_GROUPING:
         return base_working_dir
-    return f'{base_working_dir}/{conversation_id_hex}'
+    from openhands.app_server.sandbox.sandbox_spec_models import (
+        SandboxOperatingSystem,
+    )
+
+    if operating_system == SandboxOperatingSystem.WINDOWS:
+        import ntpath
+
+        return ntpath.join(base_working_dir, conversation_id_hex)
+    import posixpath
+
+    return posixpath.join(base_working_dir, conversation_id_hex)
 
 
 # Fields the batch ``update()`` method refuses to touch:

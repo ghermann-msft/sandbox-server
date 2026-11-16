@@ -55,6 +55,10 @@ spec:
             storage: 5Gi
   podTemplate:
     spec:
+      volumes:
+        - name: openhands-state
+          persistentVolumeClaim:
+            claimName: openhands-halo-conversations
       # runtimeClassName: gvisor   # uncomment for kernel-level isolation
       securityContext:
         runAsUser: 10001
@@ -64,7 +68,7 @@ spec:
         - name: agent-server
           image: ghcr.io/openhands/agent-server:1.37.1-python-p4mcp-2026.4.3126709
           args: ["--host", "0.0.0.0", "--port", "8000"]
-          workingDir: /workspace
+          workingDir: /workspace/project
           ports:
             - containerPort: 8000
               name: agent-server
@@ -87,3 +91,77 @@ spec:
           volumeMounts:
             - name: workspace
               mountPath: /workspace
+            - name: openhands-state
+              mountPath: /openhands
+              subPathExpr: $(OH_SANDBOX_ID)
+---
+# Native Windows Server 2025 execution profile. The image digest is deliberately
+# a deployment-time contract: replace the zero digest with the digest produced by
+# the SDK Windows image build before publishing the profile as available.
+apiVersion: extensions.agents.x-k8s.io/v1beta1
+kind: SandboxTemplate
+metadata:
+  name: openhands-agent-server-windows-2025
+  namespace: default
+spec:
+  envVarsInjectionPolicy: Allowed
+  volumeClaimTemplates:
+    - metadata:
+        name: workspace
+      spec:
+        storageClassName: managed-csi
+        accessModes: ["ReadWriteOnce"]
+        volumeMode: Filesystem
+        resources:
+          requests:
+            storage: 20Gi
+  podTemplate:
+    spec:
+      nodeSelector:
+        kubernetes.io/os: windows
+        node.kubernetes.io/windows-build: "10.0.26100"
+      tolerations:
+        - key: os
+          operator: Equal
+          value: windows
+          effect: NoSchedule
+      volumes:
+        - name: openhands-state
+          persistentVolumeClaim:
+            claimName: openhands-halo-conversations
+      containers:
+        - name: agent-server
+          image: ghcr.io/openhands/agent-server:1.37.1-windows-ltsc2025-amd64@sha256:0000000000000000000000000000000000000000000000000000000000000000
+          args: ["--host", "0.0.0.0", "--port", "8000"]
+          workingDir: 'C:\workspace'
+          env:
+            - name: OH_SANDBOX_OPERATING_SYSTEM
+              value: windows
+          ports:
+            - containerPort: 8000
+              name: agent-server
+          livenessProbe:
+            httpGet:
+              path: /alive
+              port: 8000
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: 8000
+            initialDelaySeconds: 3
+            periodSeconds: 3
+            failureThreshold: 60
+          resources:
+            requests:
+              cpu: "2"
+              memory: 4Gi
+            limits:
+              cpu: "4"
+              memory: 8Gi
+          volumeMounts:
+            - name: workspace
+              mountPath: 'C:\workspace'
+            - name: openhands-state
+              mountPath: 'C:\OpenHands'
+              subPathExpr: $(OH_SANDBOX_ID)

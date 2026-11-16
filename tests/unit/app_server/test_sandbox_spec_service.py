@@ -7,14 +7,22 @@ a sandbox spec id against the bundled default).
 """
 
 import importlib.metadata
-from unittest.mock import patch
+import logging
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
+from openhands.app_server.errors import SandboxError
+from openhands.app_server.sandbox.sandbox_spec_models import (
+    SandboxOperatingSystem,
+    SandboxResourceClass,
+    SandboxSpecInfo,
+)
 from openhands.app_server.sandbox.sandbox_spec_service import (
     _bundled_agent_server_version,
     get_agent_server_image,
     is_custom_sandbox_spec,
+    resolve_sandbox_spec,
 )
 
 
@@ -193,3 +201,45 @@ def test_get_agent_server_image_propagates_package_not_found():
     ):
         with pytest.raises(importlib.metadata.PackageNotFoundError):
             get_agent_server_image()
+
+
+def test_legacy_sandbox_spec_defaults_to_linux_standard_profile():
+    spec = SandboxSpecInfo(
+        id='legacy',
+        command=None,
+    )
+
+    assert spec.operating_system == SandboxOperatingSystem.LINUX
+    assert spec.resource_class == SandboxResourceClass.STANDARD
+    assert spec.cpu_cores is None
+    assert spec.memory_gib is None
+
+
+def test_available_windows_profile_requires_digest_pinned_image():
+    with pytest.raises(ValueError, match='digest-pinned'):
+        SandboxSpecInfo(
+            id='windows',
+            command=None,
+            operating_system=SandboxOperatingSystem.WINDOWS,
+            platform='windows/amd64',
+            image='ghcr.io/openhands/agent-server:windows-ltsc2025-amd64',
+        )
+
+
+async def test_explicit_unavailable_profile_has_deterministic_error():
+    service = AsyncMock()
+    unavailable = SandboxSpecInfo(
+        id='windows-server-2025-amd64',
+        command=None,
+        availability='unavailable',
+        availability_reason='digest-pinned image not configured',
+    )
+    service.get_sandbox_spec.side_effect = [None, unavailable]
+
+    with pytest.raises(SandboxError, match='digest-pinned image not configured'):
+        await resolve_sandbox_spec(
+            unavailable.id,
+            None,
+            service,
+            logging.getLogger(__name__),
+        )

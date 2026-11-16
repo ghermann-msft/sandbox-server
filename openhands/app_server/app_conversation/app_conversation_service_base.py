@@ -1,5 +1,7 @@
 import logging
+import ntpath
 import os
+import posixpath
 import shlex
 import tempfile
 from abc import ABC
@@ -56,6 +58,7 @@ PRE_COMMIT_LOCAL = '.git/hooks/pre-commit.local'
 def get_project_dir(
     working_dir: str,
     selected_repository: str | None = None,
+    operating_system=None,
 ) -> str:
     """Get the project root directory for a conversation.
 
@@ -83,7 +86,15 @@ def get_project_dir(
     """
     if selected_repository:
         repo_name = selected_repository.split('/')[-1]
-        return f'{working_dir}/{repo_name}'
+        from openhands.app_server.sandbox.sandbox_spec_models import (
+            SandboxOperatingSystem,
+        )
+
+        if operating_system == SandboxOperatingSystem.WINDOWS or (
+            operating_system is None and ntpath.splitdrive(working_dir)[0]
+        ):
+            return ntpath.join(working_dir, repo_name)
+        return posixpath.join(working_dir, repo_name)
     return working_dir
 
 

@@ -86,6 +86,7 @@ def sample_conversation_info() -> AppConversationInfo:
         id=uuid4(),
         created_by_user_id='test_user_123',
         sandbox_id='sandbox_123',
+        sandbox_spec_id='windows-standard',
         selected_repository='https://github.com/test/repo',
         selected_branch='main',
         git_provider=ProviderType.GITHUB,
@@ -153,6 +154,9 @@ class TestSQLAppConversationInfoService:
         assert retrieved_info is not None
         assert retrieved_info.id == sample_conversation_info.id
         assert retrieved_info.sandbox_id == sample_conversation_info.sandbox_id
+        assert (
+            retrieved_info.sandbox_spec_id == sample_conversation_info.sandbox_spec_id
+        )
         assert (
             retrieved_info.selected_repository
             == sample_conversation_info.selected_repository
@@ -232,6 +236,7 @@ class TestSQLAppConversationInfoService:
         assert retrieved_info is not None
         assert retrieved_info.id == minimal_info.id
         assert retrieved_info.sandbox_id == minimal_info.sandbox_id
+        assert retrieved_info.sandbox_spec_id is None
 
         # Verify optional fields are None or default values
         assert retrieved_info.selected_repository is None

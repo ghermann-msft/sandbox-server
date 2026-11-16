@@ -179,7 +179,9 @@ async def _get_agent_server_context(
         )
 
     # Get the sandbox spec to find the working directory
-    sandbox_spec = await sandbox_spec_service.get_sandbox_spec(sandbox.sandbox_spec_id)
+    sandbox_spec = await sandbox_spec_service.get_sandbox_spec(
+        sandbox.sandbox_spec_id, include_unavailable=True
+    )
     if not sandbox_spec:
         # TODO: This is a temporary work around for the fact that we don't store previous
         # sandbox spec versions when updating OpenHands. When the SandboxSpecServices
@@ -1148,7 +1150,9 @@ async def read_conversation_file(
         return ''
 
     # Get the sandbox spec to find the working directory
-    sandbox_spec = await sandbox_spec_service.get_sandbox_spec(sandbox.sandbox_spec_id)
+    sandbox_spec = await sandbox_spec_service.get_sandbox_spec(
+        sandbox.sandbox_spec_id, include_unavailable=True
+    )
     if not sandbox_spec:
         return ''
 

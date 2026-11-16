@@ -90,9 +90,11 @@ from openhands.app_server.sandbox.sandbox_models import (
     SandboxStatus,
 )
 from openhands.app_server.sandbox.sandbox_service import SandboxService
+from openhands.app_server.sandbox.sandbox_spec_models import SandboxOperatingSystem
 from openhands.app_server.sandbox.sandbox_spec_service import (
     SandboxSpecService,
     is_custom_sandbox_spec,
+    resolve_sandbox_spec,
 )
 from openhands.app_server.services.injector import InjectorState
 from openhands.app_server.services.jwt_service import JwtService
@@ -434,7 +436,7 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
 
             # Get the working dir
             sandbox_spec = await self.sandbox_spec_service.get_sandbox_spec(
-                sandbox.sandbox_spec_id
+                sandbox.sandbox_spec_id, include_unavailable=True
             )
             assert sandbox_spec is not None
 
@@ -447,6 +449,11 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
                 sandbox_spec.working_dir,
                 sandbox_grouping_strategy,
                 conversation_id.hex,
+                getattr(
+                    sandbox_spec,
+                    'operating_system',
+                    SandboxOperatingSystem.LINUX,
+                ),
             )
 
             # Run setup scripts
@@ -603,6 +610,7 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
                 id=info.id,
                 title=f'Conversation {info.id.hex[:5]}',
                 sandbox_id=sandbox.id,
+                sandbox_spec_id=sandbox.sandbox_spec_id,
                 created_by_user_id=user_id,
                 llm_model=llm_model,
                 agent_kind=agent_kind,
@@ -796,7 +804,9 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
                 result[stored_conversation.sandbox_id].append(stored_conversation.id)
         return result
 
-    async def _find_running_sandbox_for_user(self) -> SandboxInfo | None:
+    async def _find_running_sandbox_for_user(
+        self, sandbox_spec_id: str
+    ) -> SandboxInfo | None:
         """Find a running sandbox for the current user based on the grouping strategy.
 
         Returns:
@@ -822,6 +832,7 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
                     if (
                         sandbox.status == SandboxStatus.RUNNING
                         and sandbox.created_by_user_id == user_id
+                        and sandbox.sandbox_spec_id == sandbox_spec_id
                     ):
                         running_sandboxes.append(sandbox)
 
@@ -932,8 +943,15 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
         """Wait for sandbox to start and return info."""
         # Get or create the sandbox
         if not task.request.sandbox_id:
+            requested_spec = await resolve_sandbox_spec(
+                task.request.sandbox_spec_id,
+                await self.user_context.get_default_sandbox_spec_id(),
+                self.sandbox_spec_service,
+                _logger,
+            )
+            task.request.sandbox_spec_id = requested_spec.id
             # First try to find a running sandbox for the current user
-            sandbox = await self._find_running_sandbox_for_user()
+            sandbox = await self._find_running_sandbox_for_user(requested_spec.id)
             if sandbox is None:
                 # No running sandbox found, start a new one
 
@@ -945,7 +963,8 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
                 )
 
                 sandbox = await self.sandbox_service.start_sandbox(
-                    sandbox_id=sandbox_id_str
+                    sandbox_spec_id=requested_spec.id,
+                    sandbox_id=sandbox_id_str,
                 )
             task.sandbox_id = sandbox.id
         else:
@@ -954,7 +973,17 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
             )
             if sandbox_info is None:
                 raise SandboxError(f'Sandbox not found: {task.request.sandbox_id}')
+            if (
+                task.request.sandbox_spec_id is not None
+                and sandbox_info.sandbox_spec_id != task.request.sandbox_spec_id
+            ):
+                raise SandboxError(
+                    f'Sandbox {task.request.sandbox_id} uses execution profile '
+                    f'{sandbox_info.sandbox_spec_id!r}, not requested profile '
+                    f'{task.request.sandbox_spec_id!r}'
+                )
             sandbox = sandbox_info
+            task.request.sandbox_spec_id = sandbox.sandbox_spec_id
 
         # Update the listener with sandbox info
         task.status = AppConversationStartTaskStatus.WAITING_FOR_SANDBOX
@@ -1101,9 +1130,16 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
             request: The conversation start request to modify
             parent_info: The parent conversation info to inherit from
         """
-        # Inherit sandbox_id from parent to share the same workspace/environment
-        if not request.sandbox_id:
+        # Share the parent sandbox only when the caller did not explicitly select
+        # a different execution profile. A different profile requires a distinct
+        # compatible sandbox.
+        if not request.sandbox_id and (
+            not request.sandbox_spec_id
+            or request.sandbox_spec_id == parent_info.sandbox_spec_id
+        ):
             request.sandbox_id = parent_info.sandbox_id
+            if not request.sandbox_spec_id:
+                request.sandbox_spec_id = parent_info.sandbox_spec_id
 
         # Inherit git parameters from parent if not provided
         if not request.selected_repository:

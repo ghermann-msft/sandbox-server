@@ -119,6 +119,7 @@ class AppConversationInfo(BaseModel):
 
     created_by_user_id: str | None
     sandbox_id: str
+    sandbox_spec_id: str | None = None
 
     selected_repository: str | None = None
     selected_branch: str | None = None
@@ -232,6 +233,13 @@ class AppConversationStartRequest(OpenHandsModel):
     """
 
     sandbox_id: str | None = Field(default=None)
+    sandbox_spec_id: str | None = Field(
+        default=None,
+        description=(
+            'Exact enabled execution-profile id. Resource fields are selected '
+            'from the administrator-authored profile and cannot be supplied here.'
+        ),
+    )
     conversation_id: UUID | None = Field(default=None)
     initial_message: SendMessageRequest | None = None
     system_message_suffix: str | None = None

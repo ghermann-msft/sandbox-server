@@ -23,6 +23,7 @@ from openhands.app_server.app_conversation.app_conversation_models import (
     AgentType,
     AppConversationInfo,
     AppConversationStartRequest,
+    AppConversationStartTask,
     ConversationTrigger,
 )
 from openhands.app_server.app_conversation.app_conversation_service import (
@@ -46,7 +47,10 @@ from openhands.app_server.sandbox.sandbox_models import (
     SandboxPage,
     SandboxStatus,
 )
-from openhands.app_server.sandbox.sandbox_spec_models import SandboxSpecInfo
+from openhands.app_server.sandbox.sandbox_spec_models import (
+    SandboxOperatingSystem,
+    SandboxSpecInfo,
+)
 from openhands.app_server.settings.llm_profiles import LLMProfiles
 from openhands.app_server.settings.settings_models import (
     SandboxGroupingStrategy,
@@ -2055,16 +2059,19 @@ class TestLiveStatusAppConversationService:
         running_sandbox.id = 'sandbox_1'
         running_sandbox.status = SandboxStatus.RUNNING
         running_sandbox.created_by_user_id = user_id
+        running_sandbox.sandbox_spec_id = 'linux-standard'
 
         other_user_sandbox = Mock(spec=SandboxInfo)
         other_user_sandbox.id = 'sandbox_2'
         other_user_sandbox.status = SandboxStatus.RUNNING
         other_user_sandbox.created_by_user_id = 'other_user'
+        other_user_sandbox.sandbox_spec_id = 'linux-standard'
 
         paused_sandbox = Mock(spec=SandboxInfo)
         paused_sandbox.id = 'sandbox_3'
         paused_sandbox.status = SandboxStatus.PAUSED
         paused_sandbox.created_by_user_id = user_id
+        paused_sandbox.sandbox_spec_id = 'linux-standard'
 
         # Mock sandbox service search
         mock_page = Mock(spec=SandboxPage)
@@ -2073,7 +2080,7 @@ class TestLiveStatusAppConversationService:
         self.mock_sandbox_service.search_sandboxes = AsyncMock(return_value=mock_page)
 
         # Act
-        result = await self.service._find_running_sandbox_for_user()
+        result = await self.service._find_running_sandbox_for_user('linux-standard')
 
         # Assert
         assert result == running_sandbox
@@ -2094,11 +2101,13 @@ class TestLiveStatusAppConversationService:
         other_user_sandbox.id = 'sandbox_1'
         other_user_sandbox.status = SandboxStatus.RUNNING
         other_user_sandbox.created_by_user_id = 'other_user'
+        other_user_sandbox.sandbox_spec_id = 'windows-standard'
 
         paused_sandbox = Mock(spec=SandboxInfo)
         paused_sandbox.id = 'sandbox_2'
         paused_sandbox.status = SandboxStatus.PAUSED
         paused_sandbox.created_by_user_id = user_id
+        paused_sandbox.sandbox_spec_id = 'windows-standard'
 
         # Mock sandbox service search
         mock_page = Mock(spec=SandboxPage)
@@ -2107,7 +2116,7 @@ class TestLiveStatusAppConversationService:
         self.mock_sandbox_service.search_sandboxes = AsyncMock(return_value=mock_page)
 
         # Act
-        result = await self.service._find_running_sandbox_for_user()
+        result = await self.service._find_running_sandbox_for_user('windows-standard')
 
         # Assert
         assert result is None
@@ -2126,7 +2135,7 @@ class TestLiveStatusAppConversationService:
         with patch(
             'openhands.app_server.app_conversation.live_status_app_conversation_service._logger'
         ) as mock_logger:
-            result = await self.service._find_running_sandbox_for_user()
+            result = await self.service._find_running_sandbox_for_user('linux-standard')
 
         # Assert
         assert result is None
@@ -2135,6 +2144,92 @@ class TestLiveStatusAppConversationService:
             'Error finding running sandbox for user'
             in mock_logger.warning.call_args[0][0]
         )
+
+    @pytest.mark.asyncio
+    async def test_wait_for_sandbox_start_creates_exact_requested_profile(self):
+        requested_spec = SandboxSpecInfo(
+            id='windows-server-2025-amd64',
+            command=None,
+        )
+        self.mock_user_context.get_default_sandbox_spec_id = AsyncMock(
+            return_value='linux-standard'
+        )
+        self.mock_sandbox_spec_service.get_sandbox_spec = AsyncMock(
+            return_value=requested_spec
+        )
+        self.service._find_running_sandbox_for_user = AsyncMock(return_value=None)
+        sandbox = SandboxInfo(
+            id='new-windows',
+            created_by_user_id='test_user_123',
+            sandbox_spec_id=requested_spec.id,
+            status=SandboxStatus.RUNNING,
+            session_api_key='key',
+        )
+        self.mock_sandbox_service.start_sandbox = AsyncMock(return_value=sandbox)
+        self.mock_sandbox_service.wait_for_sandbox_running = AsyncMock(
+            return_value=sandbox
+        )
+        task = AppConversationStartTask(
+            created_by_user_id='test_user_123',
+            request=AppConversationStartRequest(sandbox_spec_id=requested_spec.id),
+        )
+
+        updates = [item async for item in self.service._wait_for_sandbox_start(task)]
+
+        assert updates[-1].request.sandbox_spec_id == requested_spec.id
+        self.mock_sandbox_service.start_sandbox.assert_awaited_once_with(
+            sandbox_spec_id=requested_spec.id,
+            sandbox_id=None,
+        )
+
+    @pytest.mark.asyncio
+    async def test_wait_for_sandbox_start_rejects_profile_mismatch(self):
+        sandbox = SandboxInfo(
+            id='existing-linux',
+            created_by_user_id='test_user_123',
+            sandbox_spec_id='linux-standard',
+            status=SandboxStatus.RUNNING,
+            session_api_key='key',
+        )
+        self.mock_sandbox_service.get_sandbox = AsyncMock(return_value=sandbox)
+        task = AppConversationStartTask(
+            created_by_user_id='test_user_123',
+            request=AppConversationStartRequest(
+                sandbox_id=sandbox.id,
+                sandbox_spec_id='windows-server-2025-amd64',
+            ),
+        )
+
+        with pytest.raises(SandboxError, match='not requested profile'):
+            [item async for item in self.service._wait_for_sandbox_start(task)]
+
+    def test_parent_inheritance_pins_execution_profile(self):
+        request = AppConversationStartRequest()
+        parent = AppConversationInfo(
+            created_by_user_id='test_user_123',
+            sandbox_id='parent-sandbox',
+            sandbox_spec_id='windows-server-2025-amd64',
+        )
+
+        self.service._inherit_configuration_from_parent(request, parent)
+
+        assert request.sandbox_id == parent.sandbox_id
+        assert request.sandbox_spec_id == parent.sandbox_spec_id
+
+    def test_parent_with_different_explicit_profile_gets_distinct_sandbox(self):
+        request = AppConversationStartRequest(
+            sandbox_spec_id='windows-server-2025-amd64'
+        )
+        parent = AppConversationInfo(
+            created_by_user_id='test_user_123',
+            sandbox_id='parent-linux',
+            sandbox_spec_id='linux-standard',
+        )
+
+        self.service._inherit_configuration_from_parent(request, parent)
+
+        assert request.sandbox_id is None
+        assert request.sandbox_spec_id == 'windows-server-2025-amd64'
 
     async def test_export_conversation_success(self):
         """Test successful download of conversation trajectory."""
@@ -3156,6 +3251,20 @@ class TestLiveStatusAppConversationService:
 
         assert get_project_dir('/workspace/project', None) == '/workspace/project'
         assert get_project_dir('/workspace/project', '') == '/workspace/project'
+
+    def test_get_project_dir_uses_windows_path_semantics(self):
+        from openhands.app_server.app_conversation.app_conversation_service_base import (
+            get_project_dir,
+        )
+
+        assert (
+            get_project_dir(
+                r'C:\workspace\project',
+                'OpenHands/software-agent-sdk',
+                SandboxOperatingSystem.WINDOWS,
+            )
+            == r'C:\workspace\project\software-agent-sdk'
+        )
 
     @patch(
         'openhands.app_server.app_conversation.live_status_app_conversation_service.launch_tool_specs',

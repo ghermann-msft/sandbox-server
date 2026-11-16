@@ -79,6 +79,7 @@ SPEC_ID_ANNOTATION = 'agents.openhands.dev/sandbox-spec-id'
 # Lookup index for the session key. The env var stays the canonical secret; this is
 # a one-way hash so the API server can filter instead of us scanning every claim.
 SESSION_KEY_HASH_LABEL = 'agents.openhands.dev/session-key-hash'
+SECRET_KEY_VARIABLE = 'OH_SECRET_KEY'
 
 _INVALID_NAME_CHARS = re.compile(r'[^a-z0-9-]+')
 # Sandbox ids travel as label values, so they are limited to the label charset and
@@ -354,6 +355,18 @@ class KubernetesSandboxService(SandboxService):
                 pass
 
         annotations = metadata.get('annotations') or {}
+        sandbox_spec_id = annotations.get(SPEC_ID_ANNOTATION)
+        if not isinstance(sandbox_spec_id, str) or not sandbox_spec_id:
+            warm_pool_ref = (claim.get('spec') or {}).get('warmPoolRef') or {}
+            warm_pool_name = warm_pool_ref.get('name')
+            legacy_spec = None
+            if isinstance(warm_pool_name, str) and warm_pool_name:
+                legacy_spec = await self.sandbox_spec_service.get_sandbox_spec(
+                    warm_pool_name, include_unavailable=True
+                )
+            if legacy_spec is None:
+                legacy_spec = await self.sandbox_spec_service.get_default_sandbox_spec()
+            sandbox_spec_id = legacy_spec.id
         if owners is not None:
             created_by_user_id = owners.get(sandbox_id)
         elif self.access_service is not None:
@@ -363,7 +376,7 @@ class KubernetesSandboxService(SandboxService):
         return SandboxInfo(
             id=sandbox_id,
             created_by_user_id=created_by_user_id,
-            sandbox_spec_id=annotations.get(SPEC_ID_ANNOTATION, ''),
+            sandbox_spec_id=sandbox_spec_id,
             status=status,
             session_api_key=(
                 self._session_api_key(claim)
@@ -482,9 +495,12 @@ class KubernetesSandboxService(SandboxService):
             _logger,
         )
 
+        await self._enforce_profile_quota(sandbox_spec)
         await self.pause_old_sandboxes(self.max_num_sandboxes - 1)
 
         env_vars = dict(sandbox_spec.initial_env)
+        env_vars['OH_SANDBOX_ID'] = sandbox_id
+        env_vars[SECRET_KEY_VARIABLE] = base62.encodebytes(os.urandom(32))
         env_vars[WEBHOOK_CALLBACK_VARIABLE] = (
             f'{self.webhook_base_url.rstrip("/")}/api/v1/webhooks'
         )
@@ -514,7 +530,10 @@ class KubernetesSandboxService(SandboxService):
         # The warm pool selects the SandboxTemplate (and therefore the image); when
         # it is not pinned in config the spec id names the pool, so the UI can offer
         # more than one runtime.
-        warm_pool = self.warm_pool or sandbox_spec.id
+        spec_warm_pool = getattr(sandbox_spec, 'warm_pool_name', None)
+        if not isinstance(spec_warm_pool, str):
+            spec_warm_pool = None
+        warm_pool = self.warm_pool or spec_warm_pool or sandbox_spec.id
 
         created_by_user_id = None
         if self.access_service is not None:
@@ -562,6 +581,40 @@ class KubernetesSandboxService(SandboxService):
             session_api_key=None,
             exposed_urls=[],
         )
+
+    async def _enforce_profile_quota(self, sandbox_spec) -> None:
+        max_global = getattr(sandbox_spec, 'max_concurrent_sandboxes', None)
+        max_per_user = getattr(sandbox_spec, 'max_concurrent_per_user', None)
+        max_global = max_global if isinstance(max_global, int) else None
+        max_per_user = max_per_user if isinstance(max_per_user, int) else None
+        if max_global is None and max_per_user is None:
+            return
+        claims = await asyncio.to_thread(self._list_claims_sync)
+        matching_ids: list[str] = []
+        for claim in claims:
+            metadata = claim.get('metadata') or {}
+            annotations = metadata.get('annotations') or {}
+            labels = metadata.get('labels') or {}
+            sandbox_id = labels.get(SANDBOX_ID_LABEL)
+            if annotations.get(SPEC_ID_ANNOTATION) == sandbox_spec.id and isinstance(
+                sandbox_id, str
+            ):
+                matching_ids.append(sandbox_id)
+        if max_global is not None and len(matching_ids) >= max_global:
+            raise SandboxError(
+                f'Execution profile {sandbox_spec.id!r} reached its global '
+                'concurrency limit'
+            )
+        if max_per_user is not None and self.access_service is not None:
+            owners = await self.access_service.owner_user_ids(matching_ids)
+            owned_count = sum(
+                owner == self.access_service.user_id for owner in owners.values()
+            )
+            if owned_count >= max_per_user:
+                raise SandboxError(
+                    f'Execution profile {sandbox_spec.id!r} reached the current '
+                    'user concurrency limit'
+                )
 
     async def resume_sandbox(self, sandbox_id: str) -> bool:
         return await self._set_operating_mode(sandbox_id, 'Running')

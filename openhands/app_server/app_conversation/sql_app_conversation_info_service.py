@@ -173,6 +173,9 @@ class StoredConversationMetadata(Base):
         String, nullable=False, default='V0', index=True
     )
     sandbox_id: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
+    sandbox_spec_id: Mapped[str | None] = mapped_column(
+        String, nullable=True, index=True
+    )
     parent_conversation_id: Mapped[str | None] = mapped_column(
         String, nullable=True, index=True
     )
@@ -489,6 +492,7 @@ class SQLAppConversationInfoService(AppConversationInfoService):
             agent_kind=info.agent_kind,
             conversation_version='V1',
             sandbox_id=info.sandbox_id,
+            sandbox_spec_id=info.sandbox_spec_id,
             parent_conversation_id=(
                 str(info.parent_conversation_id)
                 if info.parent_conversation_id
@@ -792,6 +796,7 @@ class SQLAppConversationInfoService(AppConversationInfoService):
             id=UUID(stored.conversation_id),
             created_by_user_id=None,  # User ID is now stored in ConversationMetadataSaas
             sandbox_id=sandbox_id,  # Use the asserted non-None value
+            sandbox_spec_id=stored.sandbox_spec_id,
             selected_repository=stored.selected_repository,
             selected_branch=stored.selected_branch,
             git_provider=(
