@@ -50,6 +50,16 @@ Everything else has a default; override through config as needed:
 Pod-level concerns live in the `SandboxTemplate` rather than here. That covers the
 image, CPU and memory, `runtimeClassName`, network policy and volumes.
 
+The default image extends the matching OpenHands agent-server release with the
+official Perforce MCP server v2026.4.3126709. The build verifies the published
+Linux zip with SHA256
+`f2ea428cf35acec04e822472b090128ff9e522d07264ab1211d46b05e479a387` and exposes
+the stdio server as `/usr/local/bin/p4-mcp-server`. The upstream
+[`perforce/p4mcp-server`](https://github.com/perforce/p4mcp-server) project is
+licensed under the
+[MIT license](https://github.com/perforce/p4mcp-server/blob/v2026.4.3126709/LICENSE.txt);
+its source is not forked or vendored here.
+
 ### Reaching sandboxes from a browser
 
 The default `sandbox_url_pattern` is cluster-internal, which is right when the app
@@ -94,8 +104,8 @@ kubectl -n agent-sandbox-system rollout status deploy --timeout=240s
 kubectl apply -f deploy/kubernetes/
 
 # optional on kind: preload the image so the first sandbox starts quickly
-docker pull ghcr.io/openhands/agent-server:1.37.1-python
-kind load docker-image ghcr.io/openhands/agent-server:1.37.1-python --name ohk8s
+docker pull ghcr.io/openhands/agent-server:1.37.1-python-p4mcp-2026.4.3126709
+kind load docker-image ghcr.io/openhands/agent-server:1.37.1-python-p4mcp-2026.4.3126709 --name ohk8s
 
 # 2. run the app server against it
 RUNTIME=kubernetes SERVE_FRONTEND=false make start

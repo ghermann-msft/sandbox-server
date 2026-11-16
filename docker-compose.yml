@@ -7,8 +7,7 @@ services:
     image: openhands-sandbox-server:latest
     container_name: openhands-sandbox-server-${DATE:-}
     environment:
-      - AGENT_SERVER_IMAGE_REPOSITORY=${AGENT_SERVER_IMAGE_REPOSITORY:-ghcr.io/openhands/agent-server}
-      - AGENT_SERVER_IMAGE_TAG=${AGENT_SERVER_IMAGE_TAG:-1.30.0-python}
+      - AGENT_SERVER_IMAGE=${AGENT_SERVER_IMAGE:-ghcr.io/openhands/agent-server:1.37.1-python-p4mcp-2026.4.3126709}
       #- SANDBOX_USER_ID=${SANDBOX_USER_ID:-1234} # enable this only if you want a specific non-root sandbox user but you will have to manually adjust permissions of ~/.openhands for this user
       - WORKSPACE_MOUNT_PATH=${WORKSPACE_BASE:-$PWD/workspace}
     ports:

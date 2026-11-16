@@ -118,6 +118,10 @@ async def resolve_sandbox_spec(
 
 @cache  # memoize so the auto-correct warning fires once per process
 def get_agent_server_image() -> str:
+    image = os.getenv('AGENT_SERVER_IMAGE')
+    if image:
+        return image
+
     repository = os.getenv('AGENT_SERVER_IMAGE_REPOSITORY') or _DEFAULT_REPOSITORY
     bundled_version = _bundled_agent_server_version()
     tag = os.getenv('AGENT_SERVER_IMAGE_TAG') or f'{bundled_version}-python'

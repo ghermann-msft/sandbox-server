@@ -40,11 +40,30 @@ make test
 ## Docker
 
 ```bash
-docker compose up --build
+make docker-build
+docker compose up
 ```
 
 The Compose setup mounts the Docker socket and a local workspace so the server
-can manage sandbox containers.
+can manage sandbox containers. The sandbox runtime image extends the pinned
+OpenHands agent-server image with the official Perforce MCP server
+v2026.4.3126709. MCP configuration can invoke the prebundled stdio executable at
+`/usr/local/bin/p4-mcp-server`; no package download is needed when a conversation
+starts.
+
+Production deployments can build and publish the runtime image independently:
+
+```bash
+docker build -f containers/sandbox/Dockerfile \
+  --build-arg AGENT_SERVER_IMAGE=ghcr.io/openhands/agent-server:1.37.1-python \
+  -t <runtime-image> .
+docker push <runtime-image>
+```
+
+Set `AGENT_SERVER_IMAGE` on the sandbox-server control-plane container to the
+published immutable reference, preferably `<registry>/<repository>@sha256:<digest>`.
+This full-reference override takes precedence over the legacy
+`AGENT_SERVER_IMAGE_REPOSITORY` and `AGENT_SERVER_IMAGE_TAG` variables.
 
 ## Extraction provenance
 

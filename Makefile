@@ -27,6 +27,8 @@ test:
 	$(POETRY) run pytest tests/unit/app_server
 
 docker-build:
+	docker build -f containers/sandbox/Dockerfile \
+		-t ghcr.io/openhands/agent-server:1.37.1-python-p4mcp-2026.4.3126709 .
 	docker build -f containers/app/Dockerfile -t openhands-sandbox-server:latest .
 
 docker-run:
