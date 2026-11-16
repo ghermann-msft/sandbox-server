@@ -200,6 +200,34 @@ async def test_search_fans_out_claim_conversions(service, custom_objects):
     assert sorted(item.id for item in page.items) == ['sb1', 'sb2']
 
 
+async def test_search_batches_owner_lookup(service, custom_objects):
+    custom_objects.list_namespaced_custom_object.return_value = {
+        'items': [
+            _claim(sandbox_id='sb1', sandbox_name='sb-1'),
+            _claim(sandbox_id='sb2', sandbox_name='sb-2'),
+            {'metadata': {'labels': {}}},
+        ]
+    }
+    custom_objects.get_namespaced_custom_object.return_value = _sandbox()
+    access_service = AsyncMock()
+    access_service.owner_user_ids.return_value = {
+        'sb1': 'entra:tenant:owner-1',
+    }
+    access_service.owner_user_id.side_effect = AssertionError(
+        'search must not query owners per claim'
+    )
+    service.access_service = access_service
+
+    page = await service.search_sandboxes()
+
+    access_service.owner_user_ids.assert_awaited_once_with(['sb1', 'sb2'])
+    access_service.owner_user_id.assert_not_awaited()
+    assert {item.id: item.created_by_user_id for item in page.items} == {
+        'sb1': 'entra:tenant:owner-1',
+        'sb2': None,
+    }
+
+
 async def test_session_key_lookup_filters_server_side(service, custom_objects):
     """The session key is looked up through a label selector, not a full scan."""
     key = 'secret-key'

@@ -25,7 +25,7 @@ import os
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from typing import Any, AsyncGenerator
+from typing import Any, AsyncGenerator, Mapping
 
 import base62
 from fastapi import Request
@@ -323,7 +323,11 @@ class KubernetesSandboxService(SandboxService):
                 return env.get('value')
         return None
 
-    async def _claim_to_sandbox_info(self, claim: dict) -> SandboxInfo | None:
+    async def _claim_to_sandbox_info(
+        self,
+        claim: dict,
+        owners: Mapping[str, str] | None = None,
+    ) -> SandboxInfo | None:
         metadata = claim.get('metadata') or {}
         labels = metadata.get('labels') or {}
         sandbox_id = labels.get(SANDBOX_ID_LABEL)
@@ -350,9 +354,12 @@ class KubernetesSandboxService(SandboxService):
                 pass
 
         annotations = metadata.get('annotations') or {}
-        created_by_user_id = None
-        if self.access_service is not None:
+        if owners is not None:
+            created_by_user_id = owners.get(sandbox_id)
+        elif self.access_service is not None:
             created_by_user_id = await self.access_service.owner_user_id(sandbox_id)
+        else:
+            created_by_user_id = None
         return SandboxInfo(
             id=sandbox_id,
             created_by_user_id=created_by_user_id,
@@ -380,10 +387,22 @@ class KubernetesSandboxService(SandboxService):
         limit: int = 100,
     ) -> SandboxPage:
         claims = await asyncio.to_thread(self._list_claims_sync)
+        owners: dict[str, str] = {}
+        if self.access_service is not None:
+            sandbox_ids = [
+                sandbox_id
+                for claim in claims
+                if (
+                    sandbox_id := (
+                        (claim.get('metadata') or {}).get('labels') or {}
+                    ).get(SANDBOX_ID_LABEL)
+                )
+            ]
+            owners = await self.access_service.owner_user_ids(sandbox_ids)
         # Each conversion reads the claim's Sandbox, so run them concurrently
         # rather than paying one API round-trip per claim in series.
         infos = await asyncio.gather(
-            *[self._claim_to_sandbox_info(claim) for claim in claims]
+            *[self._claim_to_sandbox_info(claim, owners) for claim in claims]
         )
         items = [info for info in infos if info is not None]
         items.sort(key=lambda item: item.created_at)

@@ -1,3 +1,4 @@
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime
 
@@ -68,16 +69,26 @@ class SandboxAccessService:
         return format_entra_user_id(tenant_id, object_id)
 
     async def owner_user_id(self, sandbox_id: str) -> str | None:
+        owners = await self.owner_user_ids([sandbox_id])
+        return owners.get(sandbox_id)
+
+    async def owner_user_ids(self, sandbox_ids: Iterable[str]) -> dict[str, str]:
+        unique_ids = set(sandbox_ids)
+        if not unique_ids:
+            return {}
         result = await self.db_session.execute(
             select(
+                StoredSandboxAccess.sandbox_id,
                 StoredSandboxAccess.tenant_id,
                 StoredSandboxAccess.owner_object_id,
-            ).where(StoredSandboxAccess.sandbox_id == sandbox_id)
+            ).where(StoredSandboxAccess.sandbox_id.in_(unique_ids))
         )
-        owner = result.one_or_none()
-        if owner is None:
-            return None
-        return format_entra_user_id(owner.tenant_id, owner.owner_object_id)
+        return {
+            owner.sandbox_id: format_entra_user_id(
+                owner.tenant_id, owner.owner_object_id
+            )
+            for owner in result.all()
+        }
 
     async def delete_sandbox(self, sandbox_id: str) -> None:
         await self.db_session.execute(
