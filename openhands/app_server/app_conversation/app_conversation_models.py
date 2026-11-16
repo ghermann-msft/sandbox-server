@@ -16,7 +16,10 @@ from openhands.app_server.event_callback.event_callback_models import (
     EventCallbackProcessor,
 )
 from openhands.app_server.integrations.service_types import ProviderType, SuggestedTask
-from openhands.app_server.sandbox.sandbox_models import SandboxStatus
+from openhands.app_server.sandbox.sandbox_models import (
+    SandboxStartupProgress,
+    SandboxStatus,
+)
 
 # Import from new location and re-export for backward compatibility
 from openhands.app_server.settings.settings_models import SandboxGroupingStrategy
@@ -356,6 +359,13 @@ class AppConversationStartTask(OpenHandsModel):
     )
     agent_server_url: str | None = Field(
         default=None, description='The agent server url, if READY'
+    )
+    sandbox_startup_progress: SandboxStartupProgress | None = Field(
+        default=None,
+        description=(
+            'Sanitized Kubernetes/runtime startup phase and timing while waiting '
+            'for the sandbox.'
+        ),
     )
     request: AppConversationStartRequest
     created_at: datetime = Field(default_factory=utc_now)

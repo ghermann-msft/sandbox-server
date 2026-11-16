@@ -20,10 +20,14 @@ from openhands.app_server.sandbox.sandbox_models import (
     SandboxInfo,
     SandboxPage,
     SandboxRecord,
+    SandboxStartupPhase,
+    SandboxStartupProgress,
+    SandboxStartupProgressStatus,
     SandboxStatus,
 )
 from openhands.app_server.sandbox.sandbox_service import (
     SandboxService,
+    SandboxStartupObservation,
     _classify_start_failure,
     _start_failure_error,
 )
@@ -41,6 +45,7 @@ class MockSandboxService(SandboxService):
         self.resume_sandbox_mock = AsyncMock()
         self.pause_sandbox_mock = AsyncMock()
         self.delete_sandbox_mock = AsyncMock()
+        self.get_sandbox_startup_observation_mock = AsyncMock(return_value=None)
 
     async def search_sandboxes(
         self, page_id: str | None = None, limit: int = 100
@@ -73,6 +78,15 @@ class MockSandboxService(SandboxService):
 
     async def delete_sandbox(self, sandbox_id: str) -> bool:
         return await self.delete_sandbox_mock(sandbox_id)
+
+    async def get_sandbox_startup_observation(
+        self, sandbox_id: str
+    ) -> SandboxStartupObservation:
+        if self.get_sandbox_startup_observation_mock.side_effect is not None:
+            return await self.get_sandbox_startup_observation_mock(sandbox_id)
+        if self.get_sandbox_startup_observation_mock.return_value is not None:
+            return await self.get_sandbox_startup_observation_mock(sandbox_id)
+        return await super().get_sandbox_startup_observation(sandbox_id)
 
 
 def create_sandbox_info(
@@ -189,7 +203,7 @@ class TestWaitForSandboxRunning:
             return 1000.0 if calls['n'] <= 3 else 2000.0
 
         monkeypatch.setattr(
-            'openhands.app_server.sandbox.sandbox_service.time.time', fake_time
+            'openhands.app_server.sandbox.sandbox_service._monotonic', fake_time
         )
         monkeypatch.setattr(
             'openhands.app_server.sandbox.sandbox_service.asyncio.sleep', AsyncMock()
@@ -227,10 +241,140 @@ class TestWaitForSandboxRunning:
         with pytest.raises(SandboxStartupTimeoutError) as ei:
             await mock_sandbox_service.wait_for_sandbox_running('sb1', timeout=1)
         msg = str(ei.value)
-        assert 'at capacity' in msg and 'try again' in msg
-        assert 'insufficient cpu' in msg
-        assert 'failed to start within' not in msg
+        assert 'safety limit' in msg
+        assert 'reference: sb1' in msg
         assert mock_sandbox_service.get_sandbox_mock.call_count > 1
+
+    @staticmethod
+    def _progress(
+        phase: SandboxStartupPhase,
+        key: str,
+        status: SandboxStartupProgressStatus = (
+            SandboxStartupProgressStatus.PROGRESSING
+        ),
+    ) -> SandboxStartupObservation:
+        now = datetime.now(timezone.utc)
+        return SandboxStartupObservation(
+            progress=SandboxStartupProgress(
+                phase=phase,
+                status=status,
+                message=phase.value,
+                reason=key,
+                started_at=now,
+                updated_at=now,
+                phase_started_at=now,
+                elapsed_seconds=0,
+                phase_elapsed_seconds=0,
+                inactivity_seconds=0,
+            ),
+            progress_key=key,
+        )
+
+    @pytest.mark.asyncio
+    async def test_forward_progress_refreshes_inactivity_deadline(
+        self, mock_sandbox_service, monkeypatch
+    ):
+        mock_sandbox_service.get_sandbox_mock.return_value = self._sandbox(
+            SandboxStatus.STARTING, None
+        )
+        mock_sandbox_service.get_sandbox_startup_observation_mock.side_effect = [
+            self._progress(SandboxStartupPhase.WAITING_FOR_CAPACITY, 'capacity'),
+            self._progress(SandboxStartupPhase.PROVISIONING_NODE, 'node'),
+            self._progress(SandboxStartupPhase.SCHEDULING, 'scheduled'),
+            self._progress(
+                SandboxStartupPhase.READY,
+                'ready',
+                SandboxStartupProgressStatus.READY,
+            ),
+        ]
+        times = iter([0, 50, 100, 150, 200])
+        monkeypatch.setattr(
+            'openhands.app_server.sandbox.sandbox_service._monotonic',
+            lambda: next(times),
+        )
+        monkeypatch.setattr(
+            'openhands.app_server.sandbox.sandbox_service.asyncio.sleep', AsyncMock()
+        )
+
+        updates = [
+            update
+            async for update in mock_sandbox_service.watch_sandbox_startup(
+                'sb1',
+                timeout=300,
+                inactivity_timeout=60,
+            )
+        ]
+
+        assert [update.phase for update in updates] == [
+            SandboxStartupPhase.WAITING_FOR_CAPACITY,
+            SandboxStartupPhase.PROVISIONING_NODE,
+            SandboxStartupPhase.SCHEDULING,
+            SandboxStartupPhase.READY,
+        ]
+
+    @pytest.mark.asyncio
+    async def test_inactivity_timeout_fails_without_progress(
+        self, mock_sandbox_service, monkeypatch
+    ):
+        mock_sandbox_service.get_sandbox_mock.return_value = self._sandbox(
+            SandboxStatus.STARTING, None
+        )
+        progress = self._progress(SandboxStartupPhase.SCHEDULING, 'same')
+        mock_sandbox_service.get_sandbox_startup_observation_mock.return_value = (
+            progress
+        )
+        times = iter([0, 0, 121])
+        monkeypatch.setattr(
+            'openhands.app_server.sandbox.sandbox_service._monotonic',
+            lambda: next(times),
+        )
+        monkeypatch.setattr(
+            'openhands.app_server.sandbox.sandbox_service.asyncio.sleep', AsyncMock()
+        )
+
+        updates = []
+        with pytest.raises(SandboxStartupTimeoutError, match='No verifiable'):
+            async for update in mock_sandbox_service.watch_sandbox_startup(
+                'sb1',
+                timeout=300,
+                inactivity_timeout=120,
+            ):
+                updates.append(update)
+
+        assert updates[-1].status == SandboxStartupProgressStatus.FAILED
+        assert updates[-1].reason == 'STARTUP_INACTIVITY_TIMEOUT'
+
+    @pytest.mark.asyncio
+    async def test_absolute_limit_still_bounds_continuous_progress(
+        self, mock_sandbox_service, monkeypatch
+    ):
+        mock_sandbox_service.get_sandbox_mock.return_value = self._sandbox(
+            SandboxStatus.STARTING, None
+        )
+        mock_sandbox_service.get_sandbox_startup_observation_mock.side_effect = [
+            self._progress(SandboxStartupPhase.SCHEDULING, 'one'),
+            self._progress(SandboxStartupPhase.PROVISIONING_STORAGE, 'two'),
+            self._progress(SandboxStartupPhase.PULLING_IMAGE, 'three'),
+        ]
+        times = iter([0, 0, 150, 300])
+        monkeypatch.setattr(
+            'openhands.app_server.sandbox.sandbox_service._monotonic',
+            lambda: next(times),
+        )
+        monkeypatch.setattr(
+            'openhands.app_server.sandbox.sandbox_service.asyncio.sleep', AsyncMock()
+        )
+
+        updates = []
+        with pytest.raises(SandboxStartupTimeoutError, match='safety limit'):
+            async for update in mock_sandbox_service.watch_sandbox_startup(
+                'sb1',
+                timeout=300,
+                inactivity_timeout=200,
+            ):
+                updates.append(update)
+
+        assert updates[-1].reason == 'STARTUP_ABSOLUTE_TIMEOUT'
 
     @pytest.mark.asyncio
     async def test_image_pull_detail_is_redacted(self, mock_sandbox_service):
@@ -243,6 +387,7 @@ class TestWaitForSandboxRunning:
             await mock_sandbox_service.wait_for_sandbox_running('sb1', timeout=5)
         msg = str(ei.value)
         assert 'could not be pulled' in msg
+        assert 'reference: sb1' in msg
         assert 'registry.internal.corp' not in msg
         assert 'secret-project' not in msg
 

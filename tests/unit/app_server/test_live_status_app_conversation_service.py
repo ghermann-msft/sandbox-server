@@ -6,7 +6,7 @@ import os
 import sys
 import types
 import zipfile
-from datetime import datetime
+from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 from uuid import uuid4
@@ -45,6 +45,9 @@ from openhands.app_server.sandbox.sandbox_models import (
     ExposedUrl,
     SandboxInfo,
     SandboxPage,
+    SandboxStartupPhase,
+    SandboxStartupProgress,
+    SandboxStartupProgressStatus,
     SandboxStatus,
 )
 from openhands.app_server.sandbox.sandbox_spec_models import (
@@ -285,6 +288,7 @@ class TestLiveStatusAppConversationService:
             jwt_service=self.mock_jwt_service,
             pending_message_service=self.mock_pending_message_service,
             sandbox_startup_timeout=30,
+            sandbox_startup_inactivity_timeout=10,
             sandbox_startup_poll_frequency=1,
             max_num_conversations_per_sandbox=20,
             httpx_client=self.mock_httpx_client,
@@ -2167,27 +2171,44 @@ class TestLiveStatusAppConversationService:
             session_api_key='key',
         )
         self.mock_sandbox_service.start_sandbox = AsyncMock(return_value=sandbox)
-        self.mock_sandbox_service.wait_for_sandbox_running = AsyncMock(
-            return_value=sandbox
+        ready_progress = self._startup_progress(
+            SandboxStartupPhase.READY,
+            SandboxStartupProgressStatus.READY,
         )
+        autoscaler_progress = self._startup_progress(
+            SandboxStartupPhase.PROVISIONING_NODE,
+            SandboxStartupProgressStatus.PROGRESSING,
+        )
+
+        async def watch(*args, **kwargs):
+            yield autoscaler_progress
+            yield ready_progress
+
+        self.mock_sandbox_service.watch_sandbox_startup = watch
         task = AppConversationStartTask(
             created_by_user_id='test_user_123',
             request=AppConversationStartRequest(sandbox_spec_id=requested_spec.id),
         )
 
-        updates = [item async for item in self.service._wait_for_sandbox_start(task)]
+        updates = [
+            item.model_copy(deep=True)
+            async for item in self.service._wait_for_sandbox_start(task)
+        ]
 
         assert updates[-1].request.sandbox_spec_id == requested_spec.id
         self.mock_sandbox_service.start_sandbox.assert_awaited_once_with(
             sandbox_spec_id=requested_spec.id,
             sandbox_id=None,
         )
-        self.mock_sandbox_service.wait_for_sandbox_running.assert_awaited_once_with(
-            sandbox.id,
-            timeout=300,
-            poll_interval=self.service.sandbox_startup_poll_frequency,
-            httpx_client=self.service.httpx_client,
-        )
+        assert updates[-1].sandbox_startup_progress == ready_progress
+        assert [
+            update.sandbox_startup_progress.phase
+            for update in updates
+            if update.sandbox_startup_progress is not None
+        ] == [
+            SandboxStartupPhase.PROVISIONING_NODE,
+            SandboxStartupPhase.READY,
+        ]
 
     @pytest.mark.asyncio
     async def test_wait_for_sandbox_start_uses_global_timeout_for_legacy_profile(
@@ -2210,9 +2231,17 @@ class TestLiveStatusAppConversationService:
             session_api_key='key',
         )
         self.mock_sandbox_service.start_sandbox = AsyncMock(return_value=sandbox)
-        self.mock_sandbox_service.wait_for_sandbox_running = AsyncMock(
-            return_value=sandbox
+        ready_progress = self._startup_progress(
+            SandboxStartupPhase.READY,
+            SandboxStartupProgressStatus.READY,
         )
+        captured = {}
+
+        async def watch(*args, **kwargs):
+            captured.update(kwargs)
+            yield ready_progress
+
+        self.mock_sandbox_service.watch_sandbox_startup = watch
         task = AppConversationStartTask(
             created_by_user_id='test_user_123',
             request=AppConversationStartRequest(sandbox_spec_id=requested_spec.id),
@@ -2220,12 +2249,8 @@ class TestLiveStatusAppConversationService:
 
         [item async for item in self.service._wait_for_sandbox_start(task)]
 
-        self.mock_sandbox_service.wait_for_sandbox_running.assert_awaited_once_with(
-            sandbox.id,
-            timeout=self.service.sandbox_startup_timeout,
-            poll_interval=self.service.sandbox_startup_poll_frequency,
-            httpx_client=self.service.httpx_client,
-        )
+        assert captured['timeout'] == self.service.sandbox_startup_timeout
+        assert captured['inactivity_timeout'] == 10
 
     @pytest.mark.asyncio
     async def test_wait_for_sandbox_start_cleans_up_new_claim_on_timeout(self):
@@ -2246,9 +2271,15 @@ class TestLiveStatusAppConversationService:
             session_api_key=None,
         )
         self.mock_sandbox_service.start_sandbox = AsyncMock(return_value=sandbox)
-        self.mock_sandbox_service.wait_for_sandbox_running = AsyncMock(
-            side_effect=SandboxStartupTimeoutError('timed out')
-        )
+
+        async def watch(*args, **kwargs):
+            yield self._startup_progress(
+                SandboxStartupPhase.WAITING_FOR_CAPACITY,
+                SandboxStartupProgressStatus.PROGRESSING,
+            )
+            raise SandboxStartupTimeoutError('timed out')
+
+        self.mock_sandbox_service.watch_sandbox_startup = watch
         self.mock_sandbox_service.delete_sandbox = AsyncMock(return_value=True)
         task = AppConversationStartTask(
             created_by_user_id='test_user_123',
@@ -2278,9 +2309,15 @@ class TestLiveStatusAppConversationService:
         self.mock_sandbox_spec_service.get_sandbox_spec = AsyncMock(
             return_value=requested_spec
         )
-        self.mock_sandbox_service.wait_for_sandbox_running = AsyncMock(
-            side_effect=SandboxStartupTimeoutError('timed out')
-        )
+
+        async def watch(*args, **kwargs):
+            yield self._startup_progress(
+                SandboxStartupPhase.PROVISIONING_NODE,
+                SandboxStartupProgressStatus.PROGRESSING,
+            )
+            raise SandboxStartupTimeoutError('timed out')
+
+        self.mock_sandbox_service.watch_sandbox_startup = watch
         self.mock_sandbox_service.delete_sandbox = AsyncMock(return_value=True)
         task = AppConversationStartTask(
             created_by_user_id='test_user_123',
@@ -2294,6 +2331,25 @@ class TestLiveStatusAppConversationService:
             [item async for item in self.service._wait_for_sandbox_start(task)]
 
         self.mock_sandbox_service.delete_sandbox.assert_not_awaited()
+
+    @staticmethod
+    def _startup_progress(
+        phase: SandboxStartupPhase,
+        status: SandboxStartupProgressStatus,
+    ) -> SandboxStartupProgress:
+        now = datetime.now(timezone.utc)
+        return SandboxStartupProgress(
+            phase=phase,
+            status=status,
+            message=phase.value,
+            reason=phase.value,
+            started_at=now,
+            updated_at=now,
+            phase_started_at=now,
+            elapsed_seconds=0,
+            phase_elapsed_seconds=0,
+            inactivity_seconds=0,
+        )
 
     @pytest.mark.asyncio
     async def test_wait_for_sandbox_start_rejects_profile_mismatch(self):
@@ -3587,6 +3643,7 @@ class TestPluginHandling:
             jwt_service=self.mock_jwt_service,
             pending_message_service=self.mock_pending_message_service,
             sandbox_startup_timeout=30,
+            sandbox_startup_inactivity_timeout=10,
             sandbox_startup_poll_frequency=1,
             max_num_conversations_per_sandbox=20,
             httpx_client=self.mock_httpx_client,
@@ -4249,6 +4306,7 @@ class TestLoadHooksFromWorkspace:
             jwt_service=self.mock_jwt_service,
             pending_message_service=self.mock_pending_message_service,
             sandbox_startup_timeout=30,
+            sandbox_startup_inactivity_timeout=10,
             sandbox_startup_poll_frequency=1,
             max_num_conversations_per_sandbox=20,
             httpx_client=self.mock_httpx_client,
@@ -4569,6 +4627,7 @@ class TestBuildAcpStartConversationRequestSecrets:
             jwt_service=Mock(),
             pending_message_service=Mock(),
             sandbox_startup_timeout=30,
+            sandbox_startup_inactivity_timeout=10,
             sandbox_startup_poll_frequency=1,
             max_num_conversations_per_sandbox=20,
             httpx_client=Mock(),

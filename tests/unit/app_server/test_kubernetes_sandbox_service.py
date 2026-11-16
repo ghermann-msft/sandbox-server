@@ -48,7 +48,12 @@ from openhands.app_server.sandbox.sandbox_access import (
     SandboxAccessService,
     StoredSandboxAccess,
 )
-from openhands.app_server.sandbox.sandbox_models import AGENT_SERVER, SandboxStatus
+from openhands.app_server.sandbox.sandbox_models import (
+    AGENT_SERVER,
+    SandboxStartupPhase,
+    SandboxStartupProgressStatus,
+    SandboxStatus,
+)
 from openhands.app_server.sandbox.sandbox_service import (
     SESSION_API_KEY_VARIABLE,
     WEBHOOK_CALLBACK_VARIABLE,
@@ -425,6 +430,351 @@ async def test_failed_sandbox_reports_error_with_detail(service, custom_objects)
     assert info is not None
     assert info.status == SandboxStatus.ERROR
     assert info.status_detail == 'ImagePullBackOff'
+
+
+@pytest.mark.parametrize(
+    ('sandbox', 'pods', 'pvcs', 'events', 'phase', 'reason'),
+    [
+        (
+            None,
+            [],
+            [],
+            [{'reason': 'TriggeredScaleUp', 'message': 'scale-up started'}],
+            SandboxStartupPhase.PROVISIONING_NODE,
+            'AUTOSCALER_TRIGGERED',
+        ),
+        (
+            None,
+            [],
+            [],
+            [
+                {
+                    'reason': 'FailedScheduling',
+                    'message': '0/1 nodes available: 1 Insufficient cpu.',
+                }
+            ],
+            SandboxStartupPhase.WAITING_FOR_CAPACITY,
+            'CAPACITY_UNAVAILABLE',
+        ),
+        (
+            None,
+            [],
+            [
+                {
+                    'metadata': {'name': 'workspace-pvc'},
+                    'status': {'phase': 'Pending'},
+                }
+            ],
+            [],
+            SandboxStartupPhase.PROVISIONING_STORAGE,
+            'WORKSPACE_STORAGE_PENDING',
+        ),
+        (
+            None,
+            [
+                {
+                    'metadata': {'name': 'pod-1'},
+                    'spec': {'nodeName': 'node-1'},
+                    'status': {'phase': 'Pending'},
+                }
+            ],
+            [],
+            [{'reason': 'Pulling', 'message': 'Pulling image'}],
+            SandboxStartupPhase.PULLING_IMAGE,
+            'IMAGE_PULLING',
+        ),
+        (
+            None,
+            [
+                {
+                    'metadata': {'name': 'pod-1'},
+                    'spec': {'nodeName': 'node-1'},
+                    'status': {
+                        'phase': 'Pending',
+                        'containerStatuses': [
+                            {
+                                'state': {'waiting': {'reason': 'ContainerCreating'}},
+                                'restartCount': 0,
+                            }
+                        ],
+                    },
+                }
+            ],
+            [],
+            [],
+            SandboxStartupPhase.STARTING_CONTAINER,
+            'CONTAINER_STARTING',
+        ),
+        (
+            None,
+            [
+                {
+                    'metadata': {'name': 'pod-1'},
+                    'spec': {'nodeName': 'node-1'},
+                    'status': {
+                        'phase': 'Running',
+                        'containerStatuses': [
+                            {
+                                'state': {
+                                    'running': {'startedAt': '2026-11-16T21:00:00Z'}
+                                },
+                                'restartCount': 0,
+                            }
+                        ],
+                    },
+                }
+            ],
+            [],
+            [],
+            SandboxStartupPhase.WAITING_FOR_AGENT_SERVER,
+            'AGENT_SERVER_NOT_READY',
+        ),
+        (
+            _sandbox(ready=True),
+            [],
+            [],
+            [],
+            SandboxStartupPhase.READY,
+            'SANDBOX_READY',
+        ),
+    ],
+)
+def test_kubernetes_startup_progress_phases(
+    service,
+    sandbox,
+    pods,
+    pvcs,
+    events,
+    phase,
+    reason,
+):
+    progress = service._startup_progress_from(
+        _claim(), sandbox, pods, pvcs, events
+    ).progress
+
+    assert progress.phase == phase
+    assert progress.reason == reason
+    assert progress.status == (
+        SandboxStartupProgressStatus.READY
+        if phase == SandboxStartupPhase.READY
+        else SandboxStartupProgressStatus.PROGRESSING
+    )
+
+
+def test_kubernetes_startup_progress_distinguishes_durable_storage(service):
+    claim = _claim()
+    claim['metadata']['annotations'][DURABLE_PVC_ANNOTATION] = (
+        'openhands-halo-conversations'
+    )
+
+    progress = service._startup_progress_from(
+        claim,
+        None,
+        [],
+        [
+            {
+                'metadata': {'name': 'openhands-halo-conversations'},
+                'status': {'phase': 'Pending'},
+            }
+        ],
+        [],
+    ).progress
+
+    assert progress.phase == SandboxStartupPhase.PROVISIONING_STORAGE
+    assert progress.reason == 'DURABLE_STORAGE_PENDING'
+
+
+def test_kubernetes_startup_progress_fails_terminal_image_error(service):
+    observation = service._startup_progress_from(
+        _claim(),
+        None,
+        [
+            {
+                'metadata': {'name': 'pod-1'},
+                'spec': {'nodeName': 'node-1'},
+                'status': {
+                    'phase': 'Pending',
+                    'containerStatuses': [
+                        {
+                            'state': {'waiting': {'reason': 'ImagePullBackOff'}},
+                            'restartCount': 0,
+                        }
+                    ],
+                },
+            }
+        ],
+        [],
+        [],
+    )
+    progress = observation.progress
+
+    assert progress.phase == SandboxStartupPhase.FAILED
+    assert progress.status == SandboxStartupProgressStatus.FAILED
+    assert progress.reason == 'IMAGE_PULL_BACKOFF'
+    assert observation.failure_detail == 'ImagePullBackOff'
+    assert 'registry' not in progress.message.lower()
+
+
+def test_repeated_scheduler_event_is_not_forward_progress(service):
+    first = service._startup_progress_from(
+        _claim(),
+        None,
+        [],
+        [],
+        [
+            {
+                'reason': 'FailedScheduling',
+                'message': '0/1 nodes available: 1 Insufficient cpu.',
+                'count': 1,
+                'lastTimestamp': '2026-11-16T21:00:00Z',
+            }
+        ],
+    )
+    repeated = service._startup_progress_from(
+        _claim(),
+        None,
+        [],
+        [],
+        [
+            {
+                'reason': 'FailedScheduling',
+                'message': '0/1 nodes available: 1 Insufficient cpu.',
+                'count': 20,
+                'lastTimestamp': '2026-11-16T21:05:00Z',
+            }
+        ],
+    )
+
+    assert first.progress_key == repeated.progress_key
+
+
+def test_recovered_storage_event_is_not_terminal(service):
+    progress = service._startup_progress_from(
+        _claim(),
+        None,
+        [],
+        [
+            {
+                'metadata': {'name': 'workspace-pvc'},
+                'status': {'phase': 'Bound'},
+            }
+        ],
+        [
+            {'reason': 'ProvisioningFailed', 'message': 'temporary failure'},
+            {'reason': 'ProvisioningSucceeded', 'message': 'provisioned'},
+        ],
+    ).progress
+
+    assert progress.status == SandboxStartupProgressStatus.PROGRESSING
+    assert progress.phase != SandboxStartupPhase.FAILED
+
+
+def test_terminal_storage_event_has_safe_structured_reason(service):
+    observation = service._startup_progress_from(
+        _claim(),
+        None,
+        [],
+        [],
+        [
+            {
+                'reason': 'FailedMount',
+                'message': 'failed to mount secret internal-share-name',
+            }
+        ],
+    )
+    progress = observation.progress
+
+    assert progress.status == SandboxStartupProgressStatus.FAILED
+    assert progress.reason == 'STORAGE_MOUNT_FAILED'
+    assert 'internal-share-name' not in progress.message
+    assert 'internal-share-name' in (observation.failure_detail or '')
+
+
+def test_autoscaler_reports_terminal_placement_constraint(service):
+    observation = service._startup_progress_from(
+        _claim(),
+        None,
+        [],
+        [],
+        [
+            {
+                'reason': 'FailedScheduling',
+                'message': 'node(s) did not match Pod node affinity',
+            },
+            {
+                'reason': 'NotTriggerScaleUp',
+                'message': 'node(s) did not match Pod node affinity',
+            },
+        ],
+    )
+
+    assert observation.progress.status == SandboxStartupProgressStatus.FAILED
+    assert observation.progress.reason == 'SCHEDULING_CONSTRAINT'
+    assert 'affinity' not in observation.progress.message.lower()
+    assert 'affinity' in (observation.failure_detail or '').lower()
+
+
+def test_kubernetes_startup_resources_follow_owners_and_events(service, core_v1):
+    claim = _claim()
+    claim['metadata']['name'] = 'claim-1'
+    claim['metadata']['annotations'][DURABLE_PVC_ANNOTATION] = 'durable-pvc'
+    sandbox = {
+        'metadata': {'name': 'sandbox-1'},
+        'status': {'conditions': []},
+    }
+    pod = MagicMock()
+    pod.to_dict.return_value = {
+        'metadata': {
+            'name': 'pod-1',
+            'owner_references': [{'name': 'sandbox-1'}],
+        },
+        'status': {'phase': 'Pending'},
+    }
+    workspace_pvc = MagicMock()
+    workspace_pvc.to_dict.return_value = {
+        'metadata': {
+            'name': 'workspace-pvc',
+            'owner_references': [{'name': 'sandbox-1'}],
+        },
+        'status': {'phase': 'Pending'},
+    }
+    durable_pvc = MagicMock()
+    durable_pvc.to_dict.return_value = {
+        'metadata': {'name': 'durable-pvc'},
+        'status': {'phase': 'Bound'},
+    }
+    event = MagicMock()
+    event.to_dict.return_value = {
+        'metadata': {'uid': 'event-1', 'name': 'event-1'},
+        'reason': 'TriggeredScaleUp',
+        'message': 'scale-up started',
+    }
+    core_v1.list_namespaced_pod.return_value.items = [pod]
+    core_v1.list_namespaced_persistent_volume_claim.return_value.items = [
+        workspace_pvc,
+        durable_pvc,
+    ]
+    core_v1.list_namespaced_event.return_value.items = [event]
+
+    pods, pvcs, events = service._get_startup_resources_sync(claim, sandbox)
+
+    assert [_resource['metadata']['name'] for _resource in pods] == ['pod-1']
+    assert {_resource['metadata']['name'] for _resource in pvcs} == {
+        'workspace-pvc',
+        'durable-pvc',
+    }
+    assert events[0]['reason'] == 'TriggeredScaleUp'
+    selectors = {
+        call.kwargs['field_selector']
+        for call in core_v1.list_namespaced_event.call_args_list
+    }
+    assert selectors == {
+        'involvedObject.name=claim-1',
+        'involvedObject.name=sandbox-1',
+        'involvedObject.name=pod-1',
+        'involvedObject.name=workspace-pvc',
+        'involvedObject.name=durable-pvc',
+    }
 
 
 async def test_pause_and_resume_patch_operating_mode(service, custom_objects):

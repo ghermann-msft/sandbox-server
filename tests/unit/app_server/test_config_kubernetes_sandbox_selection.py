@@ -77,9 +77,11 @@ def test_app_conversation_startup_timeout_environment_key():
 
     env = _get_clean_env()
     env['OH_APP_CONVERSATION_SANDBOX_STARTUP_TIMEOUT'] = '600'
+    env['OH_APP_CONVERSATION_SANDBOX_STARTUP_INACTIVITY_TIMEOUT'] = '90'
 
     with patch.dict(os.environ, env, clear=True):
         config = config_from_env()
 
     assert isinstance(config.app_conversation, LiveStatusAppConversationServiceInjector)
     assert config.app_conversation.sandbox_startup_timeout == 600
+    assert config.app_conversation.sandbox_startup_inactivity_timeout == 90

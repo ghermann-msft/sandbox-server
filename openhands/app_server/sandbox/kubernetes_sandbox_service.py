@@ -20,6 +20,7 @@ the agent server.
 import asyncio
 import hashlib
 import hmac
+import json
 import logging
 import os
 import re
@@ -44,6 +45,9 @@ from openhands.app_server.sandbox.sandbox_models import (
     SandboxInfo,
     SandboxPage,
     SandboxRecord,
+    SandboxStartupPhase,
+    SandboxStartupProgress,
+    SandboxStartupProgressStatus,
     SandboxStatus,
 )
 from openhands.app_server.sandbox.sandbox_service import (
@@ -51,6 +55,7 @@ from openhands.app_server.sandbox.sandbox_service import (
     WEBHOOK_CALLBACK_VARIABLE,
     SandboxService,
     SandboxServiceInjector,
+    SandboxStartupObservation,
 )
 from openhands.app_server.sandbox.sandbox_spec_models import (
     SandboxOperatingSystem,
@@ -102,6 +107,105 @@ _NAME_DIGEST_LENGTH = 6
 # Ready=False reasons the controller treats as terminal: the pod finished either
 # way, or the claim outlived its lifecycle.
 _TERMINAL_READY_REASONS = frozenset({'PodFailed', 'PodSucceeded', 'SandboxExpired'})
+_TERMINAL_CONTAINER_REASONS = frozenset(
+    {
+        'CreateContainerConfigError',
+        'CreateContainerError',
+        'ErrImagePull',
+        'ImagePullBackOff',
+        'InvalidImageName',
+        'RunContainerError',
+    }
+)
+_SAFE_CONTAINER_REASON = {
+    'CreateContainerConfigError': 'CONTAINER_CONFIG_ERROR',
+    'CreateContainerError': 'CONTAINER_CREATE_ERROR',
+    'ErrImagePull': 'IMAGE_PULL_ERROR',
+    'ImagePullBackOff': 'IMAGE_PULL_BACKOFF',
+    'InvalidImageName': 'INVALID_IMAGE_NAME',
+    'RunContainerError': 'CONTAINER_RUNTIME_ERROR',
+}
+_SAFE_STORAGE_REASON = {
+    'FailedAttachVolume': 'STORAGE_ATTACH_FAILED',
+    'FailedMount': 'STORAGE_MOUNT_FAILED',
+    'ProvisioningFailed': 'STORAGE_PROVISIONING_FAILED',
+}
+_TERMINAL_STORAGE_EVENT_REASONS = frozenset(
+    {'FailedAttachVolume', 'FailedMount', 'ProvisioningFailed'}
+)
+_CAPACITY_EVENT_REASONS = frozenset(
+    {'FailedScheduling', 'NotTriggerScaleUp', 'TriggeredScaleUp'}
+)
+
+
+def _serialize_kubernetes_object(value: Any) -> dict[str, Any]:
+    if value is None:
+        return {}
+    if isinstance(value, dict):
+        return value
+    if hasattr(value, 'to_dict'):
+        result = value.to_dict()
+        return result if isinstance(result, dict) else {}
+    result = k8s_client.ApiClient().sanitize_for_serialization(value)
+    return result if isinstance(result, dict) else {}
+
+
+def _value(mapping: dict[str, Any], *names: str, default=None):
+    for name in names:
+        if name in mapping:
+            return mapping[name]
+    return default
+
+
+def _owner_names(resource: dict[str, Any]) -> set[str]:
+    metadata = resource.get('metadata') or {}
+    owners = _value(metadata, 'ownerReferences', 'owner_references', default=[]) or []
+    return {
+        str(_value(owner, 'name'))
+        for owner in owners
+        if isinstance(owner, dict) and _value(owner, 'name')
+    }
+
+
+def _resource_name(resource: dict[str, Any]) -> str | None:
+    metadata = resource.get('metadata') or {}
+    name = _value(metadata, 'name')
+    return str(name) if name else None
+
+
+def _event_sort_key(event: dict[str, Any]) -> str:
+    metadata = event.get('metadata') or {}
+    return str(
+        _value(
+            event,
+            'eventTime',
+            'event_time',
+            'lastTimestamp',
+            'last_timestamp',
+            default=_value(
+                metadata, 'creationTimestamp', 'creation_timestamp', default=''
+            ),
+        )
+        or ''
+    )
+
+
+def _condition_progress_state(resource: dict[str, Any]) -> list[dict[str, Any]]:
+    conditions = (resource.get('status') or {}).get('conditions') or []
+    return [
+        {
+            'type': _value(condition, 'type'),
+            'status': _value(condition, 'status'),
+            'reason': _value(condition, 'reason'),
+            'last_transition_time': _value(
+                condition,
+                'lastTransitionTime',
+                'last_transition_time',
+            ),
+        }
+        for condition in conditions
+        if isinstance(condition, dict)
+    ]
 
 
 class ExposedPort(BaseModel):
@@ -252,6 +356,68 @@ class KubernetesSandboxService(SandboxService):
             if e.status == 404:
                 return None
             raise
+
+    def _get_startup_resources_sync(
+        self, claim: dict[str, Any], sandbox: dict[str, Any] | None
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+        if self._core_v1 is None:
+            return [], [], []
+        claim_name = _resource_name(claim)
+        sandbox_name = _resource_name(sandbox or {}) or _sandbox_name(claim)
+        owner_names = {name for name in (claim_name, sandbox_name) if name}
+        durable_pvc_name = ((claim.get('metadata') or {}).get('annotations') or {}).get(
+            DURABLE_PVC_ANNOTATION
+        )
+
+        pods_response = self._core_v1.list_namespaced_pod(namespace=self.namespace)
+        pods = [
+            _serialize_kubernetes_object(item)
+            for item in getattr(pods_response, 'items', [])
+        ]
+        pods = [
+            pod
+            for pod in pods
+            if _owner_names(pod) & owner_names
+            or any(
+                value in owner_names
+                for value in ((pod.get('metadata') or {}).get('labels') or {}).values()
+            )
+        ]
+
+        pvc_response = self._core_v1.list_namespaced_persistent_volume_claim(
+            namespace=self.namespace
+        )
+        pvcs = [
+            _serialize_kubernetes_object(item)
+            for item in getattr(pvc_response, 'items', [])
+        ]
+        pvcs = [
+            pvc
+            for pvc in pvcs
+            if _owner_names(pvc) & owner_names
+            or _resource_name(pvc) == durable_pvc_name
+        ]
+
+        event_names = owner_names | {
+            name
+            for resource in [*pods, *pvcs]
+            if (name := _resource_name(resource)) is not None
+        }
+        events_by_uid: dict[str, dict[str, Any]] = {}
+        for resource_name in event_names:
+            response = self._core_v1.list_namespaced_event(
+                namespace=self.namespace,
+                field_selector=f'involvedObject.name={resource_name}',
+            )
+            for item in getattr(response, 'items', []):
+                event = _serialize_kubernetes_object(item)
+                metadata = event.get('metadata') or {}
+                key = str(
+                    _value(metadata, 'uid', default=_resource_name(event) or id(item))
+                )
+                events_by_uid[key] = event
+        events = sorted(events_by_uid.values(), key=_event_sort_key)
+        return pods, pvcs, events
 
     def _get_extension_object_sync(self, plural: str, name: str) -> dict:
         try:
@@ -483,6 +649,248 @@ class KubernetesSandboxService(SandboxService):
 
         return SandboxStatus.STARTING, None
 
+    def _startup_progress_from(
+        self,
+        claim: dict[str, Any],
+        sandbox: dict[str, Any] | None,
+        pods: list[dict[str, Any]],
+        pvcs: list[dict[str, Any]],
+        events: list[dict[str, Any]],
+    ) -> SandboxStartupObservation:
+        now = utc_now()
+        sandbox_status, sandbox_detail = self._status_from(claim, sandbox)
+        pod = pods[-1] if pods else {}
+        pod_status = pod.get('status') or {}
+        pod_spec = pod.get('spec') or {}
+        pod_phase = str(_value(pod_status, 'phase', default='') or '')
+        node_name = _value(pod_spec, 'nodeName', 'node_name')
+        container_statuses = (
+            _value(
+                pod_status,
+                'containerStatuses',
+                'container_statuses',
+                default=[],
+            )
+            or []
+        )
+        waiting_reasons: list[str] = []
+        running_started_at: list[str] = []
+        for container_status in container_statuses:
+            if not isinstance(container_status, dict):
+                continue
+            state = container_status.get('state') or {}
+            waiting = state.get('waiting') or {}
+            running = state.get('running') or {}
+            reason = _value(waiting, 'reason')
+            if reason:
+                waiting_reasons.append(str(reason))
+            started_at = _value(running, 'startedAt', 'started_at')
+            if started_at:
+                running_started_at.append(str(started_at))
+
+        pvc_states = {
+            _resource_name(pvc) or '': str(
+                _value(pvc.get('status') or {}, 'phase', default='') or ''
+            )
+            for pvc in pvcs
+        }
+        pvc_phases = list(pvc_states.values())
+        durable_pvc_name = ((claim.get('metadata') or {}).get('annotations') or {}).get(
+            DURABLE_PVC_ANNOTATION
+        )
+        event_reasons = [
+            str(_value(event, 'reason', default='') or '') for event in events
+        ]
+        latest_event = events[-1] if events else {}
+        latest_event_reason = str(_value(latest_event, 'reason', default='') or '')
+        latest_event_message = str(_value(latest_event, 'message', default='') or '')
+
+        phase = SandboxStartupPhase.SCHEDULING
+        status = SandboxStartupProgressStatus.PROGRESSING
+        reason = 'CLAIM_ACCEPTED'
+        message = 'The sandbox claim was accepted and is being scheduled.'
+        failure_detail: str | None = None
+
+        terminal_container_reason = next(
+            (item for item in waiting_reasons if item in _TERMINAL_CONTAINER_REASONS),
+            None,
+        )
+        storage_event_reasons = _TERMINAL_STORAGE_EVENT_REASONS | {
+            'ProvisioningSucceeded',
+            'SuccessfulAttachVolume',
+            'SuccessfulMountVolume',
+        }
+        latest_storage_event = next(
+            (
+                event
+                for event in reversed(events)
+                if str(_value(event, 'reason', default='') or '')
+                in storage_event_reasons
+            ),
+            {},
+        )
+        latest_storage_event_reason = str(
+            _value(latest_storage_event, 'reason', default='') or ''
+        )
+        latest_storage_event_message = str(
+            _value(latest_storage_event, 'message', default='') or ''
+        )
+        terminal_storage_reason = (
+            latest_storage_event_reason
+            if latest_storage_event_reason in _TERMINAL_STORAGE_EVENT_REASONS
+            else None
+        )
+        latest_scheduling_event = next(
+            (
+                event
+                for event in reversed(events)
+                if str(_value(event, 'reason', default='') or '')
+                in _CAPACITY_EVENT_REASONS
+            ),
+            {},
+        )
+        latest_scheduling_reason = str(
+            _value(latest_scheduling_event, 'reason', default='') or ''
+        )
+        latest_scheduling_message = str(
+            _value(latest_scheduling_event, 'message', default='') or ''
+        )
+        deterministic_scheduling_failure = (
+            latest_scheduling_message
+            if latest_scheduling_reason in {'FailedScheduling', 'NotTriggerScaleUp'}
+            and any(
+                marker in latest_scheduling_message.lower()
+                for marker in (
+                    'untolerated taint',
+                    'node affinity',
+                    'node selector',
+                    'volume node affinity conflict',
+                )
+            )
+            else None
+        )
+
+        if sandbox_status == SandboxStatus.ERROR:
+            phase = SandboxStartupPhase.FAILED
+            status = SandboxStartupProgressStatus.FAILED
+            reason = 'SANDBOX_TERMINAL'
+            message = 'The sandbox controller reported a terminal failure.'
+            failure_detail = sandbox_detail
+        elif pod_phase == 'Failed':
+            phase = SandboxStartupPhase.FAILED
+            status = SandboxStartupProgressStatus.FAILED
+            reason = 'POD_FAILED'
+            message = 'The sandbox pod terminated before becoming ready.'
+            failure_detail = latest_event_message or sandbox_detail or 'PodFailed'
+        elif terminal_container_reason:
+            phase = SandboxStartupPhase.FAILED
+            status = SandboxStartupProgressStatus.FAILED
+            reason = _SAFE_CONTAINER_REASON[terminal_container_reason]
+            message = (
+                'The sandbox runtime image or container configuration could not '
+                'be started.'
+            )
+            failure_detail = terminal_container_reason
+        elif terminal_storage_reason:
+            phase = SandboxStartupPhase.FAILED
+            status = SandboxStartupProgressStatus.FAILED
+            reason = _SAFE_STORAGE_REASON[terminal_storage_reason]
+            message = 'The sandbox storage could not be provisioned or mounted.'
+            failure_detail = (
+                f'{terminal_storage_reason}: {latest_storage_event_message}'
+                if latest_storage_event_message
+                else terminal_storage_reason
+            )
+        elif deterministic_scheduling_failure:
+            phase = SandboxStartupPhase.FAILED
+            status = SandboxStartupProgressStatus.FAILED
+            reason = 'SCHEDULING_CONSTRAINT'
+            message = 'No node satisfies the sandbox placement requirements.'
+            failure_detail = deterministic_scheduling_failure
+        elif pod_phase == 'Running' or running_started_at:
+            phase = SandboxStartupPhase.WAITING_FOR_AGENT_SERVER
+            reason = 'AGENT_SERVER_NOT_READY'
+            message = 'Waiting for the Agent Server readiness probe.'
+        elif not node_name and latest_scheduling_reason == 'TriggeredScaleUp':
+            phase = SandboxStartupPhase.PROVISIONING_NODE
+            reason = 'AUTOSCALER_TRIGGERED'
+            message = 'The cluster autoscaler is provisioning a node.'
+        elif (
+            not node_name
+            and latest_scheduling_reason in {'FailedScheduling', 'NotTriggerScaleUp'}
+            and 'Insufficient ' in latest_scheduling_message
+        ):
+            phase = SandboxStartupPhase.WAITING_FOR_CAPACITY
+            reason = 'CAPACITY_UNAVAILABLE'
+            message = 'Waiting for cluster capacity; the autoscaler may add a node.'
+        elif any(item == 'Pending' for item in pvc_phases):
+            phase = SandboxStartupPhase.PROVISIONING_STORAGE
+            if durable_pvc_name and pvc_states.get(durable_pvc_name) == 'Pending':
+                reason = 'DURABLE_STORAGE_PENDING'
+                message = 'Attaching durable conversation storage.'
+            else:
+                reason = 'WORKSPACE_STORAGE_PENDING'
+                message = 'Provisioning and attaching workspace storage.'
+        elif not pod or not node_name:
+            phase = SandboxStartupPhase.SCHEDULING
+            reason = 'POD_UNSCHEDULED'
+            message = 'Scheduling the sandbox onto a node.'
+        elif latest_event_reason == 'Pulling':
+            phase = SandboxStartupPhase.PULLING_IMAGE
+            reason = 'IMAGE_PULLING'
+            message = 'Pulling the sandbox runtime image.'
+        elif waiting_reasons:
+            phase = SandboxStartupPhase.STARTING_CONTAINER
+            reason = 'CONTAINER_STARTING'
+            message = 'Starting the sandbox container.'
+        elif latest_event_reason == 'Pulled':
+            phase = SandboxStartupPhase.STARTING_CONTAINER
+            reason = 'IMAGE_PULLED'
+            message = 'The sandbox image is present; starting the container.'
+        elif sandbox_status == SandboxStatus.RUNNING:
+            phase = SandboxStartupPhase.READY
+            status = SandboxStartupProgressStatus.READY
+            reason = 'SANDBOX_READY'
+            message = 'The sandbox and Agent Server are ready.'
+
+        if sandbox_status == SandboxStatus.RUNNING:
+            phase = SandboxStartupPhase.READY
+            status = SandboxStartupProgressStatus.READY
+            reason = 'SANDBOX_READY'
+            message = 'The sandbox and Agent Server are ready.'
+
+        progress_state = {
+            'phase': phase.value,
+            'reason': reason,
+            'claim_conditions': _condition_progress_state(claim),
+            'sandbox_conditions': _condition_progress_state(sandbox or {}),
+            'pod_phase': pod_phase,
+            'node_name': node_name,
+            'waiting_reasons': waiting_reasons,
+            'running_started_at': running_started_at,
+            'pvc_phases': pvc_phases,
+            'event_reasons': list(dict.fromkeys(event_reasons)),
+        }
+        progress_key = hashlib.sha256(
+            json.dumps(progress_state, sort_keys=True, default=str).encode()
+        ).hexdigest()
+        return SandboxStartupObservation(
+            progress=SandboxStartupProgress(
+                phase=phase,
+                status=status,
+                message=message,
+                reason=reason,
+                started_at=now,
+                updated_at=now,
+                phase_started_at=now,
+                elapsed_seconds=0,
+                phase_elapsed_seconds=0,
+                inactivity_seconds=0,
+            ),
+            progress_key=progress_key,
+            failure_detail=failure_detail,
+        )
+
     def _exposed_urls(self, sandbox_id: str, sandbox_name: str) -> list[ExposedUrl]:
         """Build the URLs for a running sandbox.
 
@@ -621,6 +1029,23 @@ class KubernetesSandboxService(SandboxService):
         if claim is None:
             return None
         return await self._claim_to_sandbox_info(claim)
+
+    async def get_sandbox_startup_observation(
+        self, sandbox_id: str
+    ) -> SandboxStartupObservation:
+        claim = await asyncio.to_thread(self._get_claim_sync, sandbox_id)
+        if claim is None:
+            raise SandboxError(f'Sandbox not found: {sandbox_id}')
+        sandbox_name = _sandbox_name(claim)
+        sandbox = (
+            await asyncio.to_thread(self._get_sandbox_object_sync, sandbox_name)
+            if sandbox_name
+            else None
+        )
+        pods, pvcs, events = await asyncio.to_thread(
+            self._get_startup_resources_sync, claim, sandbox
+        )
+        return self._startup_progress_from(claim, sandbox, pods, pvcs, events)
 
     async def _claim_for_session_api_key(self, session_api_key: str) -> dict | None:
         """Find a claim by session key, filtered by the API server.

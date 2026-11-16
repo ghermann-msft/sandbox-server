@@ -75,11 +75,39 @@ the app server expands `{sandbox_id}` into the conversations, bash-events, and
 persistence environment paths. This preserves deterministic per-sandbox
 directories without relying on an unsupported Windows mount feature.
 
-The global legacy startup fallback is configured with
+The global legacy startup safety limit is configured with
 `OH_APP_CONVERSATION_SANDBOX_STARTUP_TIMEOUT` (120 seconds by default). Curated
-profiles override it with `startup_timeout_seconds`; the bundled Linux profile
-uses 300 seconds and Windows uses 600 seconds. Node warm capacity and image
-pre-pull remain the primary cold-start mitigation.
+profiles override that absolute ceiling with `startup_timeout_seconds`; the
+bundled Linux profile uses 300 seconds and Windows uses 600 seconds. The
+independent inactivity deadline is configured with
+`OH_APP_CONVERSATION_SANDBOX_STARTUP_INACTIVITY_TIMEOUT` (120 seconds by
+default). Authoritative Kubernetes progress refreshes only the inactivity
+deadline; it never extends the profile's absolute ceiling. Node warm capacity
+and image pre-pull remain the primary cold-start mitigation.
+
+Conversation start tasks expose `sandbox_startup_progress` while status is
+`WAITING_FOR_SANDBOX`. The object contains:
+
+- `phase`: `WAITING_FOR_CAPACITY`, `PROVISIONING_NODE`, `SCHEDULING`,
+  `PROVISIONING_STORAGE`, `PULLING_IMAGE`, `STARTING_CONTAINER`,
+  `WAITING_FOR_AGENT_SERVER`, `READY`, or `FAILED`.
+- `status`: `PROGRESSING`, `READY`, or `FAILED`.
+- Sanitized `message` and stable `reason` values suitable for display and
+  branching. Raw event messages, registry names, node labels, secret names, and
+  volume paths are not serialized.
+- `started_at`, `updated_at`, `phase_started_at`, `elapsed_seconds`,
+  `phase_elapsed_seconds`, and `inactivity_seconds`.
+
+The same `AppConversationStartTask` shape is emitted item-by-item by
+`POST /app-conversations/stream-start` and persisted for
+`GET /app-conversations/start-tasks/search` and the task lookup endpoints.
+
+The app server observes SandboxClaim/Sandbox conditions and their owned Pod/PVC
+resources plus Kubernetes events. Repeated copies of the same scheduler event do
+not count as progress. Autoscaler activation, scheduling, PVC phase changes,
+image pull, container state, and readiness transitions do. Deterministic
+scheduler constraints and terminal image/storage/container failures fail
+immediately with a sanitized task detail containing the sandbox reference ID.
 
 The default Linux image extends the matching OpenHands agent-server release with the
 official Perforce MCP server v2026.4.3126709. The build verifies the published

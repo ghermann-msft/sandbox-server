@@ -277,6 +277,7 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
     jwt_service: JwtService
     pending_message_service: PendingMessageService
     sandbox_startup_timeout: int
+    sandbox_startup_inactivity_timeout: int
     sandbox_startup_poll_frequency: int
     max_num_conversations_per_sandbox: int
     httpx_client: httpx.AsyncClient
@@ -1024,7 +1025,8 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
         ):
             raise SandboxError(f'Sandbox not startable: {sandbox.id}')
 
-        # Use shared wait_for_sandbox_running utility to poll for ready state
+        # The profile timeout is the absolute safety ceiling. Observable runtime
+        # progress refreshes the shorter inactivity deadline.
         startup_timeout = (
             sandbox_spec.startup_timeout_seconds
             if sandbox_spec is not None
@@ -1032,12 +1034,18 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
             else self.sandbox_startup_timeout
         )
         try:
-            await self.sandbox_service.wait_for_sandbox_running(
+            async for progress in self.sandbox_service.watch_sandbox_startup(
                 sandbox.id,
                 timeout=startup_timeout,
+                inactivity_timeout=min(
+                    self.sandbox_startup_inactivity_timeout,
+                    startup_timeout,
+                ),
                 poll_interval=self.sandbox_startup_poll_frequency,
                 httpx_client=self.httpx_client,
-            )
+            ):
+                task.sandbox_startup_progress = progress
+                yield task
         except SandboxStartupTimeoutError:
             if created_sandbox:
                 try:
@@ -3100,7 +3108,20 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
 
 class LiveStatusAppConversationServiceInjector(AppConversationServiceInjector):
     sandbox_startup_timeout: int = Field(
-        default=120, description='The max timeout time for sandbox startup'
+        default=120,
+        gt=0,
+        description=(
+            'Legacy absolute sandbox startup safety limit when the selected '
+            'execution profile has no startup_timeout_seconds'
+        ),
+    )
+    sandbox_startup_inactivity_timeout: int = Field(
+        default=120,
+        gt=0,
+        description=(
+            'Maximum seconds without verifiable sandbox startup progress before '
+            'the start fails'
+        ),
     )
     sandbox_startup_poll_frequency: int = Field(
         default=2, description='The frequency to poll for sandbox readiness'
@@ -3215,6 +3236,9 @@ class LiveStatusAppConversationServiceInjector(AppConversationServiceInjector):
                 jwt_service=jwt_service,
                 pending_message_service=pending_message_service,
                 sandbox_startup_timeout=self.sandbox_startup_timeout,
+                sandbox_startup_inactivity_timeout=(
+                    self.sandbox_startup_inactivity_timeout
+                ),
                 sandbox_startup_poll_frequency=self.sandbox_startup_poll_frequency,
                 max_num_conversations_per_sandbox=self.max_num_conversations_per_sandbox,
                 httpx_client=httpx_client,
