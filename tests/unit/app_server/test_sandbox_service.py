@@ -119,26 +119,28 @@ class TestWaitForSandboxRunning:
     def _patch_timeout(self, monkeypatch):
         calls = {'n': 0}
 
-        def fake_time():
+        def fake_monotonic():
             calls['n'] += 1
-            return 1000.0 if calls['n'] <= 3 else 2000.0
+            return 1000.0 if calls['n'] <= 4 else 2000.0
 
         monkeypatch.setattr(
-            'openhands.app_server.sandbox.sandbox_service.time.time', fake_time
+            'openhands.app_server.sandbox.sandbox_service.time.monotonic',
+            fake_monotonic,
         )
         monkeypatch.setattr(
             'openhands.app_server.sandbox.sandbox_service.asyncio.sleep', AsyncMock()
         )
 
     @pytest.mark.asyncio
-    async def test_capacity_error_state_is_friendly_and_trimmed(
-        self, mock_sandbox_service
+    async def test_capacity_error_state_is_friendly_and_trimmed_after_deadline(
+        self, mock_sandbox_service, monkeypatch
     ):
         mock_sandbox_service.get_sandbox_mock.return_value = self._sandbox(
             SandboxStatus.ERROR,
             '0/1 nodes are available: 1 Insufficient ephemeral-storage. '
             'preemption: 0/1 nodes are available.',
         )
+        self._patch_timeout(monkeypatch)
         with pytest.raises(SandboxError) as ei:
             await mock_sandbox_service.wait_for_sandbox_running('sb1', timeout=5)
         msg = str(ei.value)
@@ -213,26 +215,62 @@ class TestWaitForSandboxRunning:
         assert 'prod-token' not in msg
 
     @pytest.mark.asyncio
-    async def test_scheduling_constraint_is_redacted(self, mock_sandbox_service):
+    async def test_failed_scheduling_can_recover_after_scale_up(
+        self, mock_sandbox_service, monkeypatch
+    ):
+        failed_scheduling = self._sandbox(
+            SandboxStatus.ERROR,
+            "0/1 nodes are available: 1 node(s) didn't match Pod's "
+            'node affinity/selector.',
+        )
+        scaling = self._sandbox(
+            SandboxStatus.STARTING,
+            'TriggeredScaleUp: pod should schedule on node group akstest 0->1',
+        )
+        running = self._sandbox(SandboxStatus.RUNNING, None)
+        mock_sandbox_service.get_sandbox_mock.side_effect = [
+            failed_scheduling,
+            scaling,
+            running,
+        ]
+        sleep = AsyncMock()
+        monkeypatch.setattr(
+            'openhands.app_server.sandbox.sandbox_service.asyncio.sleep', sleep
+        )
+
+        result = await mock_sandbox_service.wait_for_sandbox_running('sb1', timeout=600)
+
+        assert result is running
+        assert mock_sandbox_service.get_sandbox_mock.call_count == 3
+        assert sleep.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_unschedulable_error_is_reported_after_deadline(
+        self, mock_sandbox_service, monkeypatch
+    ):
         mock_sandbox_service.get_sandbox_mock.return_value = self._sandbox(
             SandboxStatus.ERROR,
             'node(s) had untolerated taint {dedicated: internal-gpu-pool}',
         )
+        self._patch_timeout(monkeypatch)
         with pytest.raises(SandboxError) as ei:
             await mock_sandbox_service.wait_for_sandbox_running('sb1', timeout=5)
         msg = str(ei.value)
         assert 'could not be scheduled' in msg
         assert 'internal-gpu-pool' not in msg
         assert 'dedicated' not in msg
-        # deterministic placement failure -> no misleading 'try again'
         assert 'try again' not in msg
+        assert mock_sandbox_service.get_sandbox_mock.call_count > 1
 
     @pytest.mark.asyncio
-    async def test_device_resource_shortage_is_redacted(self, mock_sandbox_service):
+    async def test_device_resource_shortage_is_redacted(
+        self, mock_sandbox_service, monkeypatch
+    ):
         mock_sandbox_service.get_sandbox_mock.return_value = self._sandbox(
             SandboxStatus.ERROR,
             '0/3 nodes are available: 3 Insufficient smarter-devices/kvm.',
         )
+        self._patch_timeout(monkeypatch)
         with pytest.raises(SandboxError) as ei:
             await mock_sandbox_service.wait_for_sandbox_running('sb1', timeout=5)
         msg = str(ei.value)

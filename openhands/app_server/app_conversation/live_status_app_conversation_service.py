@@ -981,15 +981,18 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
         if sandbox.status == SandboxStatus.PAUSED:
             await self.sandbox_service.resume_sandbox(sandbox.id)
 
-        # Check for immediate error states
-        if sandbox.status in (None, SandboxStatus.ERROR):
+        # A scheduler-reported ERROR can be transient while an autoscalable node
+        # pool is provisioning. The shared wait utility distinguishes those from
+        # terminal startup failures.
+        if sandbox.status is None:
             raise SandboxError(f'Sandbox status: {sandbox.status}')
 
-        # For non-STARTING/RUNNING states (except PAUSED which we just resumed), fail fast
+        # For states the wait utility cannot resolve, fail fast.
         if sandbox.status not in (
             SandboxStatus.STARTING,
             SandboxStatus.RUNNING,
             SandboxStatus.PAUSED,
+            SandboxStatus.ERROR,
         ):
             raise SandboxError(f'Sandbox not startable: {sandbox.id}')
 

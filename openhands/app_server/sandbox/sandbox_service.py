@@ -39,8 +39,9 @@ _CAPACITY_MARKERS = (
     'Insufficient pods',
 )
 _IMAGE_PULL_MARKERS = ('ImagePullBackOff', 'ErrImagePull')
-# Deterministic placement failures -- retrying won't help. Substrings match the
-# scheduler's predicate messages without echoing specific taint/label values.
+# Scheduler placement failures can be transient while cluster autoscaling adds a
+# matching node. Substrings match predicate messages without echoing specific
+# taint/label values.
 _SCHEDULING_MARKERS = (
     'untolerated taint',
     'node affinity',
@@ -107,6 +108,17 @@ def _start_failure_error(sandbox_id: str, detail: str | None) -> SandboxError:
     """
     message = _classify_start_failure(detail) or _GENERIC_START_FAILURE
     return SandboxError(f'{message} (reference: {sandbox_id})')
+
+
+def _is_retryable_start_failure(detail: str | None) -> bool:
+    """Return whether a reported start failure can be resolved by scheduling."""
+    if not detail:
+        return False
+    return (
+        any(marker in detail for marker in _CAPACITY_MARKERS)
+        or any(marker in detail for marker in _SCHEDULING_MARKERS)
+        or 'Insufficient ' in detail
+    )
 
 
 class SandboxService(ABC):
@@ -196,22 +208,33 @@ class SandboxService(ABC):
             SandboxInfo with RUNNING status and verified agent server
 
         Raises:
-            SandboxError: If sandbox not found, enters ERROR state, or times out
+            SandboxError: If sandbox is not found, enters a terminal ERROR state,
+                or does not become ready before the timeout
         """
-        start = time.time()
+        deadline = time.monotonic() + timeout
         sandbox: SandboxInfo | None = None
-        while time.time() - start <= timeout:
+        last_retryable_detail: str | None = None
+        while time.monotonic() <= deadline:
             sandbox = await self.get_sandbox(sandbox_id)
             if sandbox is None:
                 raise SandboxError(f'Sandbox not found: {sandbox_id}')
 
             if sandbox.status == SandboxStatus.ERROR:
-                _logger.warning(
-                    'Sandbox %s entered error state; status_detail=%r',
-                    sandbox_id,
-                    sandbox.status_detail,
-                )
-                raise _start_failure_error(sandbox_id, sandbox.status_detail)
+                if not _is_retryable_start_failure(sandbox.status_detail):
+                    _logger.warning(
+                        'Sandbox %s entered terminal error state; status_detail=%r',
+                        sandbox_id,
+                        sandbox.status_detail,
+                    )
+                    raise _start_failure_error(sandbox_id, sandbox.status_detail)
+                if sandbox.status_detail != last_retryable_detail:
+                    _logger.warning(
+                        'Sandbox %s is temporarily unschedulable; waiting for the '
+                        'startup deadline; status_detail=%r',
+                        sandbox_id,
+                        sandbox.status_detail,
+                    )
+                    last_retryable_detail = sandbox.status_detail
 
             if sandbox.status == SandboxStatus.RUNNING:
                 # Optionally verify agent server is alive to avoid race conditions
@@ -223,7 +246,10 @@ class SandboxService(ABC):
                 else:
                     return sandbox
 
-            await asyncio.sleep(poll_interval)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            await asyncio.sleep(min(poll_interval, remaining))
 
         status_detail = sandbox.status_detail if sandbox is not None else None
         _logger.warning(

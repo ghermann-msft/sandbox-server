@@ -23,6 +23,8 @@ from openhands.app_server.app_conversation.app_conversation_models import (
     AgentType,
     AppConversationInfo,
     AppConversationStartRequest,
+    AppConversationStartTask,
+    AppConversationStartTaskStatus,
     ConversationTrigger,
 )
 from openhands.app_server.app_conversation.app_conversation_service import (
@@ -318,6 +320,42 @@ class TestLiveStatusAppConversationService:
         # Default mock for hooks loading - returns None (no hooks found)
         # Tests that specifically test hooks loading can override this mock
         self.service._load_hooks_from_workspace = AsyncMock(return_value=None)
+
+    @pytest.mark.asyncio
+    async def test_initial_unschedulable_error_is_delegated_to_startup_wait(self):
+        sandbox = SandboxInfo(
+            id='sb-autoscale',
+            created_by_user_id=None,
+            sandbox_spec_id='windows-build',
+            status=SandboxStatus.ERROR,
+            session_api_key=None,
+            created_at=datetime.now(),
+            status_detail=(
+                "0/1 nodes are available: 1 node(s) didn't match Pod's "
+                'node affinity/selector.'
+            ),
+        )
+        task = AppConversationStartTask(
+            created_by_user_id=None,
+            request=AppConversationStartRequest(),
+        )
+        self.mock_sandbox_service.start_sandbox = AsyncMock(return_value=sandbox)
+        self.mock_sandbox_service.wait_for_sandbox_running = AsyncMock(
+            return_value=sandbox
+        )
+
+        updates = [
+            update async for update in self.service._wait_for_sandbox_start(task)
+        ]
+
+        assert updates == [task]
+        assert task.status == AppConversationStartTaskStatus.WAITING_FOR_SANDBOX
+        self.mock_sandbox_service.wait_for_sandbox_running.assert_awaited_once_with(
+            'sb-autoscale',
+            timeout=30,
+            poll_interval=1,
+            httpx_client=self.mock_httpx_client,
+        )
 
     @pytest.mark.asyncio
     async def test_seed_sandbox_profiles_upserts_resolved_keys_and_prunes(self):
