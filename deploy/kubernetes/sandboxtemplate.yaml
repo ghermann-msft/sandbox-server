@@ -1,9 +1,9 @@
 # SandboxTemplate describing the pod each sandbox runs in.
 #
 # The image must match the agent server the app server is built against; see
-# `get_agent_server_image()` (AGENT_SERVER_IMAGE_REPOSITORY / AGENT_SERVER_IMAGE_TAG
-# override it). The readiness probe on /health makes the Sandbox report Ready only
-# once the agent server is actually accepting requests.
+# `get_agent_server_image()` (AGENT_SERVER_IMAGE, or the legacy repository/tag
+# variables, override it). The readiness probe on /health makes the Sandbox report
+# Ready only once the agent server is actually accepting requests.
 apiVersion: extensions.agents.x-k8s.io/v1beta1
 kind: SandboxTemplate
 metadata:
@@ -62,7 +62,7 @@ spec:
         fsGroup: 10001
       containers:
         - name: agent-server
-          image: ghcr.io/openhands/agent-server:1.37.1-python
+          image: ghcr.io/openhands/agent-server:1.37.1-python-p4-r25.2-p4mcp-2026.4.3126709
           args: ["--host", "0.0.0.0", "--port", "8000"]
           workingDir: /workspace
           ports:

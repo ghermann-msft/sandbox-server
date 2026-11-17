@@ -1,8 +1,10 @@
 import asyncio
+import hashlib
 import importlib.metadata
 import io
 import json
 import logging
+import re
 import zipfile
 from collections import defaultdict
 from collections.abc import Mapping
@@ -157,6 +159,8 @@ _conversation_info_type_adapter = TypeAdapter(list[ConversationInfo | None])
 _logger = logging.getLogger(__name__)
 
 _EXPORT_LOCK_KEY_PREFIX = 'app_conversation_export'
+_PERFORCE_SECRET_ENV_VARS = ('P4PORT', 'P4USER', 'P4PASSWD')
+_SECRET_REFERENCE_PATTERN = re.compile(r'^\$\{[A-Za-z_][A-Za-z0-9_]*\}$')
 
 
 def _resolve_title_llm_profile(user: UserInfo) -> str | None:
@@ -242,6 +246,56 @@ def append_system_context(existing: str | None, block: str) -> str:
     if block in existing:
         return existing
     return f'{existing.rstrip()}\n\n{block}'
+
+
+def _perforce_mcp_secret_name(server_name: str, env_name: str) -> str:
+    slug = re.sub(r'[^A-Za-z0-9_]', '_', server_name).upper().strip('_')
+    slug = slug[:48] or 'SERVER'
+    digest = hashlib.sha256(server_name.encode('utf-8')).hexdigest().upper()
+    return f'OH_MCP_{slug}_{digest}_{env_name}'
+
+
+def bridge_perforce_mcp_secrets(
+    mcp_servers: Mapping[str, MCPServer],
+) -> tuple[dict[str, MCPServer], dict[str, StaticSecret]]:
+    """Move Perforce stdio credentials into per-server conversation secrets."""
+    rewritten_servers: dict[str, MCPServer] = {}
+    secrets: dict[str, StaticSecret] = {}
+
+    for server_name, server in mcp_servers.items():
+        env = getattr(server, 'env', None)
+        if not env:
+            rewritten_servers[server_name] = server
+            continue
+
+        rewritten_env = dict(env)
+        changed = False
+        for env_name in _PERFORCE_SECRET_ENV_VARS:
+            value = env.get(env_name)
+            if value is None:
+                continue
+
+            raw_value = (
+                value.get_secret_value()
+                if hasattr(value, 'get_secret_value')
+                else str(value)
+            )
+            if _SECRET_REFERENCE_PATTERN.fullmatch(raw_value):
+                continue
+
+            secret_name = _perforce_mcp_secret_name(server_name, env_name)
+            secrets[secret_name] = StaticSecret(
+                value=SecretStr(raw_value),
+                description=f'{env_name} for MCP server {server_name}',
+            )
+            rewritten_env[env_name] = SecretStr(f'${{{secret_name}}}')
+            changed = True
+
+        rewritten_servers[server_name] = (
+            server.model_copy(update={'env': rewritten_env}) if changed else server
+        )
+
+    return rewritten_servers, secrets
 
 
 def effective_disabled_skills(user: UserInfo) -> list[str]:
@@ -2213,6 +2267,7 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
         llm, mcp_config = await self._configure_llm_and_mcp(
             user, llm_model, conversation_id
         )
+        mcp_config, mcp_secrets = bridge_perforce_mcp_secrets(mcp_config)
 
         # --- system_message_suffix (planning-agent prefix) ------------------
         effective_suffix = system_message_suffix
@@ -2385,6 +2440,7 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
             'agent': agent,
             'user_id': laminar_user_id,
             'organization_id': str(organization_id) if organization_id else None,
+            'secrets': {**secrets, **mcp_secrets},
         }
         title_llm_profile = _resolve_title_llm_profile(user)
         if title_llm_profile:
@@ -2610,6 +2666,8 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
         # ACP CLI, so it is intentionally not injected here.
         acp_mcp_servers: dict[str, MCPServer] = {}
         self._merge_custom_mcp_config(acp_mcp_servers, user)
+        acp_mcp_servers, mcp_secrets = bridge_perforce_mcp_secrets(acp_mcp_servers)
+        secrets.update(mcp_secrets)
         if acp_mcp_servers:
             settings_update['mcp_config'] = acp_mcp_servers
         if system_message_suffix:

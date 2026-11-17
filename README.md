@@ -37,6 +37,36 @@ make lint
 make test
 ```
 
+## Linux Perforce runtime
+
+The Linux sandbox runtime image extends the pinned OpenHands agent-server image
+with the official Perforce `p4` r25.2 Linux client and `p4-mcp-server`
+v2026.4.3126709. Both downloads are pinned by URL and SHA256. The executable
+paths are `/usr/local/bin/p4` and `/usr/local/bin/p4-mcp-server`.
+
+Build the runtime and control-plane images with:
+
+```bash
+make docker-build
+```
+
+Set `AGENT_SERVER_IMAGE` on the sandbox-server container to the published
+immutable runtime reference, preferably
+`<registry>/<repository>@sha256:<digest>`. It takes precedence over the legacy
+`AGENT_SERVER_IMAGE_REPOSITORY` and `AGENT_SERVER_IMAGE_TAG` variables.
+
+For stdio MCP servers, `P4PORT`, `P4USER`, and `P4PASSWD` are moved into
+deterministic per-server conversation secret names and each process-local MCP
+environment is rewritten to `${...}` references. Multiple Perforce servers
+therefore retain distinct credentials. Other MCP environment fields and remote
+server headers are preserved. Do not put plaintext Perforce credentials in
+images, manifests, or logs.
+
+The required Perforce Software redistribution attribution and upstream license
+links are retained in
+[`containers/sandbox/PERFORCE-NOTICE.txt`](containers/sandbox/PERFORCE-NOTICE.txt)
+and copied into the runtime image.
+
 ## Organization RBAC bootstrap
 
 Authenticated deployments can seed a shared organization and its initial owner at

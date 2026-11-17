@@ -77,6 +77,20 @@ def test_get_agent_server_image_honours_custom_repository():
             assert get_agent_server_image() == 'example.com/agent-server:9.9.9-python'
 
 
+def test_get_agent_server_image_honours_immutable_full_reference():
+    image = 'halo.azurecr.io/openhands/agent-server@sha256:abc123'
+    with patch.dict(
+        'os.environ',
+        {
+            'AGENT_SERVER_IMAGE': image,
+            'AGENT_SERVER_IMAGE_REPOSITORY': 'ignored.example.com/agent-server',
+            'AGENT_SERVER_IMAGE_TAG': 'ignored',
+        },
+        clear=False,
+    ):
+        assert get_agent_server_image() == image
+
+
 def test_get_agent_server_image_auto_corrects_stale_canonical_tag():
     """Regression test for the staging 500.
 

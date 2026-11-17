@@ -50,6 +50,14 @@ Everything else has a default; override through config as needed:
 Pod-level concerns live in the `SandboxTemplate` rather than here. That covers the
 image, CPU and memory, `runtimeClassName`, network policy and volumes.
 
+The default Linux image includes the official Perforce `p4` r25.2 client and
+`p4-mcp-server` v2026.4.3126709. The build verifies both published artifacts
+with pinned SHA256 values and exposes them as `/usr/local/bin/p4` and
+`/usr/local/bin/p4-mcp-server`. Perforce credentials are supplied only through
+conversation secrets; keep plaintext `P4PORT`, `P4USER`, and `P4PASSWD` out of
+manifests. The redistribution notice is in
+`containers/sandbox/PERFORCE-NOTICE.txt`.
+
 ### Reaching sandboxes from a browser
 
 The default `sandbox_url_pattern` is cluster-internal, which is right when the app
@@ -94,8 +102,8 @@ kubectl -n agent-sandbox-system rollout status deploy --timeout=240s
 kubectl apply -f deploy/kubernetes/
 
 # optional on kind: preload the image so the first sandbox starts quickly
-docker pull ghcr.io/openhands/agent-server:1.37.1-python
-kind load docker-image ghcr.io/openhands/agent-server:1.37.1-python --name ohk8s
+docker pull ghcr.io/openhands/agent-server:1.37.1-python-p4-r25.2-p4mcp-2026.4.3126709
+kind load docker-image ghcr.io/openhands/agent-server:1.37.1-python-p4-r25.2-p4mcp-2026.4.3126709 --name ohk8s
 
 # 2. run the app server against it
 RUNTIME=kubernetes SERVE_FRONTEND=false make start

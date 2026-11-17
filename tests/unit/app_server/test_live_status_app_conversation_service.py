@@ -36,6 +36,7 @@ from openhands.app_server.app_conversation.live_status_app_conversation_service 
     LiveStatusAppConversationService,
     _exception_detail,
     _resolve_title_llm_profile,
+    bridge_perforce_mcp_secrets,
     effective_disabled_skills,
 )
 from openhands.app_server.errors import SandboxError
@@ -2049,11 +2050,67 @@ class TestLiveStatusAppConversationService:
         assert 'EXISTING_SECRET' in secrets
         assert 'MY_API_KEY' in secrets
         assert 'ANOTHER_SECRET' in secrets
+        assert result.secrets == secrets
 
         # API-provided secrets should be StaticSecret instances
         assert isinstance(secrets['MY_API_KEY'], StaticSecret)
         assert secrets['MY_API_KEY'].value.get_secret_value() == 'my_api_key_value'
         assert secrets['ANOTHER_SECRET'].value.get_secret_value() == 'another_value'
+
+    @patch(
+        'openhands.app_server.app_conversation.live_status_app_conversation_service.get_default_tools',
+        return_value=[],
+    )
+    @pytest.mark.asyncio
+    async def test_perforce_mcp_values_use_request_secret_registry(self, _mock_tools):
+        from openhands.sdk.mcp.config import MCPServer
+
+        self.mock_user_context.get_user_info.return_value = self.mock_user
+        self.service._setup_secrets_for_git_providers = AsyncMock(return_value={})
+        self.service._configure_llm_and_mcp = AsyncMock(
+            return_value=(
+                LLM(model='gpt-4', api_key=SecretStr('test-key')),
+                {
+                    'perforce': MCPServer(
+                        command='p4-mcp-server',
+                        env={
+                            'P4PORT': 'ssl:p4.example.com:1666',
+                            'P4USER': 'builder',
+                            'P4PASSWD': 'ticket-value',
+                            'P4CLIENT': 'workspace-name',
+                        },
+                    )
+                },
+            )
+        )
+
+        result = await self.service._build_start_conversation_request_for_user(
+            sandbox=self.mock_sandbox,
+            conversation_id=uuid4(),
+            initial_message=None,
+            system_message_suffix=None,
+            git_provider=None,
+            working_dir='/test/dir',
+            remote_workspace=None,
+        )
+
+        env = result.agent.mcp_config['perforce'].env or {}
+        assert env['P4CLIENT'].get_secret_value() == 'workspace-name'
+        refs = {
+            env_name: env[env_name].get_secret_value()
+            for env_name in ('P4PORT', 'P4USER', 'P4PASSWD')
+        }
+        registry_values = {
+            f'${{{name}}}': source.value.get_secret_value()
+            for name, source in result.secrets.items()
+        }
+        assert registry_values[refs['P4PORT']] == 'ssl:p4.example.com:1666'
+        assert registry_values[refs['P4USER']] == 'builder'
+        assert registry_values[refs['P4PASSWD']] == 'ticket-value'
+        assert not any(
+            value in result.model_dump_json()
+            for value in ('ssl:p4.example.com:1666', 'builder', 'ticket-value')
+        )
 
     @patch(
         'openhands.app_server.app_conversation.live_status_app_conversation_service.get_default_tools',
@@ -3242,6 +3299,102 @@ class TestLiveStatusAppConversationService:
         assert {
             k: v.get_secret_value() for k, v in (stdio_server.env or {}).items()
         } == {'TOKEN': 'value'}
+
+    def test_perforce_mcp_secrets_are_namespaced_per_server(self):
+        from openhands.sdk.mcp.config import MCPServer
+
+        servers = {
+            'main-perforce': MCPServer(
+                command='p4-mcp-server',
+                env={
+                    'P4PORT': 'ssl:main.example.com:1666',
+                    'P4USER': 'main-user',
+                    'P4PASSWD': 'main-ticket',
+                    'P4CLIENT': 'main-workspace',
+                },
+            ),
+            'main_perforce': MCPServer(
+                command='p4-mcp-server',
+                env={
+                    'P4PORT': 'ssl:backup.example.com:1666',
+                    'P4USER': 'backup-user',
+                    'P4PASSWD': 'backup-ticket',
+                    'P4CHARSET': 'utf8',
+                },
+            ),
+        }
+
+        rewritten, secrets = bridge_perforce_mcp_secrets(servers)
+
+        first_env = rewritten['main-perforce'].env or {}
+        second_env = rewritten['main_perforce'].env or {}
+        assert first_env['P4CLIENT'].get_secret_value() == 'main-workspace'
+        assert second_env['P4CHARSET'].get_secret_value() == 'utf8'
+
+        first_refs = {
+            name: first_env[name].get_secret_value()
+            for name in ('P4PORT', 'P4USER', 'P4PASSWD')
+        }
+        second_refs = {
+            name: second_env[name].get_secret_value()
+            for name in ('P4PORT', 'P4USER', 'P4PASSWD')
+        }
+        assert set(first_refs.values()).isdisjoint(second_refs.values())
+        assert all(value.startswith('${OH_MCP_') for value in first_refs.values())
+        assert all(value.startswith('${OH_MCP_') for value in second_refs.values())
+
+        resolved = {
+            f'${{{name}}}': source.value.get_secret_value()
+            for name, source in secrets.items()
+        }
+        assert resolved[first_refs['P4PORT']] == 'ssl:main.example.com:1666'
+        assert resolved[first_refs['P4USER']] == 'main-user'
+        assert resolved[first_refs['P4PASSWD']] == 'main-ticket'
+        assert resolved[second_refs['P4PORT']] == 'ssl:backup.example.com:1666'
+        assert resolved[second_refs['P4USER']] == 'backup-user'
+        assert resolved[second_refs['P4PASSWD']] == 'backup-ticket'
+
+    def test_perforce_secret_bridge_preserves_oauth_headers_and_hides_values(self):
+        from openhands.sdk.mcp.config import MCPServer
+
+        servers = {
+            'perforce': MCPServer(
+                command='p4-mcp-server',
+                env={
+                    'P4PORT': 'ssl:perforce.example.com:1666',
+                    'P4USER': 'build-user',
+                    'P4PASSWD': 'super-secret-ticket',
+                },
+            ),
+            'remote': MCPServer(
+                url='https://mcp.example.com',
+                transport='http',
+                headers={'Authorization': 'Bearer oauth-secret'},
+            ),
+        }
+
+        rewritten, secrets = bridge_perforce_mcp_secrets(servers)
+
+        assert rewritten['remote'] == servers['remote']
+        assert (
+            rewritten['remote'].headers['Authorization'].get_secret_value()
+            == 'Bearer oauth-secret'
+        )
+        serialized = json.dumps(
+            {
+                'mcp': {
+                    name: server.model_dump(mode='json')
+                    for name, server in rewritten.items()
+                },
+                'secrets': {
+                    name: source.model_dump(mode='json')
+                    for name, source in secrets.items()
+                },
+            }
+        )
+        assert 'ssl:perforce.example.com:1666' not in serialized
+        assert 'build-user' not in serialized
+        assert 'super-secret-ticket' not in serialized
 
     # ------------------------------------------------------------------ #
     #  Regression tests: workspace.working_dir == project_dir             #
@@ -4468,7 +4621,11 @@ class TestBuildAcpStartConversationRequestSecrets:
         )
 
     def _make_acp_user(
-        self, acp_server='claude-code', context_secrets=None, api_key=None
+        self,
+        acp_server='claude-code',
+        context_secrets=None,
+        api_key=None,
+        mcp_config=None,
     ):
         try:
             from openhands.sdk.settings import (
@@ -4499,6 +4656,7 @@ class TestBuildAcpStartConversationRequestSecrets:
                 api_key=SecretStr(api_key) if api_key else None,
             ),
             agent_context=agent_context,
+            mcp_config=mcp_config or {},
         )
         return user
 
@@ -4556,6 +4714,42 @@ class TestBuildAcpStartConversationRequestSecrets:
         assert request.secrets.get('MY_API_KEY') is api_secret
         # Isolation is enabled regardless of whether secrets are present.
         assert request.agent.acp_isolate_data_dir is True
+
+    @pytest.mark.asyncio
+    async def test_perforce_mcp_values_use_acp_request_secret_registry(
+        self, service, tmp_path
+    ):
+        from openhands.sdk.mcp.config import MCPServer
+
+        user = self._make_acp_user(
+            mcp_config={
+                'perforce': MCPServer(
+                    command='p4-mcp-server',
+                    env={
+                        'P4PORT': 'ssl:acp-p4.example.com:1666',
+                        'P4USER': 'acp-builder',
+                        'P4PASSWD': 'acp-ticket',
+                        'P4CLIENT': 'acp-workspace',
+                    },
+                )
+            }
+        )
+
+        request = await self._call_build(service, user, tmp_path)
+
+        env = request.agent.mcp_config['perforce'].env or {}
+        assert env['P4CLIENT'].get_secret_value() == 'acp-workspace'
+        refs = {
+            env_name: env[env_name].get_secret_value()
+            for env_name in ('P4PORT', 'P4USER', 'P4PASSWD')
+        }
+        registry_values = {
+            f'${{{name}}}': source.value.get_secret_value()
+            for name, source in request.secrets.items()
+        }
+        assert registry_values[refs['P4PORT']] == 'ssl:acp-p4.example.com:1666'
+        assert registry_values[refs['P4USER']] == 'acp-builder'
+        assert registry_values[refs['P4PASSWD']] == 'acp-ticket'
 
     @pytest.mark.asyncio
     async def test_acp_request_passes_title_llm_profile(self, service, tmp_path):
