@@ -43,6 +43,22 @@ def test_upgrade_downgrade_upgrade(alembic_config):
 
     command.upgrade(config, 'head')
     assert _revision(db_session) == head
+    with db_session.get_db_engine().connect() as connection:
+        tables = set(sa.inspect(connection).get_table_names())
+        permissions = set(
+            connection.execute(
+                sa.text('SELECT name FROM organization_permissions')
+            ).scalars()
+        )
+    assert {
+        'rbac_users',
+        'organizations',
+        'organization_memberships',
+        'organization_roles',
+        'organization_permissions',
+        'organization_role_permissions',
+    } <= tables
+    assert {'hindsight:recall', 'hindsight:retain'} <= permissions
 
     command.downgrade(config, '001')
     assert _revision(db_session) == '001'

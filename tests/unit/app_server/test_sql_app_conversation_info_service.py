@@ -183,6 +183,7 @@ class TestSQLAppConversationInfoService:
         original_info = AppConversationInfo(
             id=uuid4(),
             created_by_user_id='test_user_456',
+            organization_id=uuid4(),
             sandbox_id='sandbox_full_test',
             selected_repository='https://github.com/full/test',
             selected_branch='feature/test',
@@ -203,6 +204,7 @@ class TestSQLAppConversationInfoService:
         # Verify all fields
         assert retrieved_info is not None
         assert retrieved_info.id == original_info.id
+        assert retrieved_info.organization_id == original_info.organization_id
         assert retrieved_info.sandbox_id == original_info.sandbox_id
         assert retrieved_info.selected_repository == original_info.selected_repository
         assert retrieved_info.selected_branch == original_info.selected_branch

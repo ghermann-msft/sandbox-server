@@ -7,6 +7,9 @@ from alembic import command
 from alembic.config import Config
 
 from openhands.app_server.app_lifespan.app_lifespan_service import AppLifespanService
+from openhands.app_server.organization.organization_service import (
+    bootstrap_organization_from_env,
+)
 
 
 class OssAppLifespanService(AppLifespanService):
@@ -15,6 +18,11 @@ class OssAppLifespanService(AppLifespanService):
     async def __aenter__(self):
         if self.run_alembic_on_startup:
             self.run_alembic()
+            from openhands.app_server.config import get_global_config
+
+            bootstrap_organization_from_env(
+                get_global_config().db_session.get_db_engine()
+            )
         return self
 
     async def __aexit__(self, exc_type, exc_value, traceback):

@@ -19,6 +19,7 @@ from openhands.app_server.integrations.provider import (
     ProviderHandler,
 )
 from openhands.app_server.integrations.service_types import UserGitInfo
+from openhands.app_server.organization.organization_models import AuthenticationIdentity
 from openhands.app_server.secrets.secrets_models import Secrets
 from openhands.app_server.secrets.secrets_store import SecretsStore
 from openhands.app_server.settings.settings_models import Settings
@@ -136,6 +137,17 @@ class UserAuth(ABC):
 
         user: UserGitInfo = await client.get_user()
         return user
+
+    async def get_authentication_identity(self) -> AuthenticationIdentity | None:
+        """Return the immutable identity asserted by the authentication provider.
+
+        Enterprise identity implementations should override this and provide the
+        provider tenant and subject/object identifiers from their trusted assertion.
+        """
+        user_id = await self.get_user_id()
+        if user_id is None:
+            return None
+        return AuthenticationIdentity(provider='user_auth', subject_id=user_id)
 
     @classmethod
     @abstractmethod

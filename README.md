@@ -37,6 +37,23 @@ make lint
 make test
 ```
 
+## Organization RBAC bootstrap
+
+Authenticated deployments can seed a shared organization and its initial owner at
+startup without using identity-provider groups as an authorization source:
+
+```text
+OH_RBAC_BOOTSTRAP_ORGANIZATION_ID=<stable UUID>
+OH_RBAC_BOOTSTRAP_ORGANIZATION_NAME=Halo Studios
+OH_RBAC_BOOTSTRAP_OWNER_PROVIDER=entra
+OH_RBAC_BOOTSTRAP_OWNER_TENANT_ID=<immutable tenant ID>
+OH_RBAC_BOOTSTRAP_OWNER_OBJECT_ID=<immutable object ID>
+```
+
+The configured `UserAuth` implementation must return the same immutable provider,
+tenant, and subject identifiers from `get_authentication_identity()`. Organization
+membership and permissions are then read only from the sandbox-server database.
+
 ## Docker
 
 ```bash

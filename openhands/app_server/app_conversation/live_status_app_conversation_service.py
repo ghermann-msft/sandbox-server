@@ -384,6 +384,12 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
     ) -> AsyncGenerator[AppConversationStartTask, None]:
         # Create and yield the start task
         user_id = await self.user_context.get_user_id()
+        organization_id = (
+            await self.app_conversation_info_service.resolve_organization_id(
+                request.organization_id
+            )
+        )
+        request.organization_id = organization_id
         # Prefer the user's email as the Laminar trace user id so traces are
         # immediately attributable in the Laminar UI instead of showing only
         # a pseudo-anonymous internal id. Falls back to ``user_id`` when no
@@ -513,6 +519,8 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
             # ``StartConversationRequest``.
             if laminar_user_id:
                 body_json['user_id'] = laminar_user_id
+            if organization_id:
+                body_json['organization_id'] = str(organization_id)
             headers = (
                 {'X-Session-API-Key': sandbox.session_api_key}
                 if sandbox.session_api_key
@@ -597,6 +605,7 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
 
             app_conversation_info = AppConversationInfo(
                 id=info.id,
+                organization_id=organization_id,
                 title=f'Conversation {info.id.hex[:5]}',
                 sandbox_id=sandbox.id,
                 created_by_user_id=user_id,

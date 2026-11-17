@@ -35,6 +35,7 @@ from sqlalchemy import (
     Integer,
     Select,
     String,
+    Uuid,
     func,
     select,
 )
@@ -54,6 +55,10 @@ from openhands.app_server.app_conversation.app_conversation_models import (
     ConversationTrigger,
 )
 from openhands.app_server.integrations.provider import ProviderType
+from openhands.app_server.organization.organization_models import (
+    OrganizationPermission,
+)
+from openhands.app_server.organization.organization_service import OrganizationService
 from openhands.app_server.services.injector import InjectorState
 from openhands.app_server.user.user_context import UserContext
 from openhands.app_server.utils.sql_utils import (
@@ -134,6 +139,9 @@ class StoredConversationMetadata(Base):
 
     conversation_id: Mapped[str] = mapped_column(
         String, primary_key=True, default=lambda: str(uuid.uuid4())
+    )
+    organization_id: Mapped[UUID | None] = mapped_column(
+        Uuid, nullable=True, index=True
     )
     selected_repository: Mapped[str | None] = mapped_column(String, nullable=True)
     selected_branch: Mapped[str | None] = mapped_column(String, nullable=True)
@@ -219,6 +227,18 @@ class SQLAppConversationInfoService(AppConversationInfoService):
 
     db_session: AsyncSession
     user_context: UserContext
+
+    async def resolve_organization_id(
+        self, requested_organization_id: UUID | None
+    ) -> UUID | None:
+        if await self.user_context.get_authentication_identity() is None:
+            return requested_organization_id
+        return await OrganizationService(
+            self.db_session, self.user_context
+        ).resolve_organization_id(
+            requested_organization_id,
+            OrganizationPermission.CONVERSATION_CREATE,
+        )
 
     async def search_app_conversation_info(
         self,
@@ -464,9 +484,18 @@ class SQLAppConversationInfoService(AppConversationInfoService):
         )
         if existing_created_at is not None:
             created_at = existing_created_at
+        existing_organization_id = await self.db_session.scalar(
+            select(StoredConversationMetadata.organization_id).where(
+                StoredConversationMetadata.conversation_id == str(info.id)
+            )
+        )
+        organization_id = info.organization_id or existing_organization_id
+        if organization_id is None:
+            organization_id = await self.resolve_organization_id(None)
 
         stored = StoredConversationMetadata(
             conversation_id=str(info.id),
+            organization_id=organization_id,
             selected_repository=info.selected_repository,
             selected_branch=info.selected_branch,
             git_provider=info.git_provider.value if info.git_provider else None,
@@ -756,6 +785,15 @@ class SQLAppConversationInfoService(AppConversationInfoService):
         query = select(StoredConversationMetadata).where(
             StoredConversationMetadata.conversation_version == 'V1'
         )
+        if await self.user_context.get_authentication_identity() is not None:
+            organization_id = await OrganizationService(
+                self.db_session, self.user_context
+            ).resolve_organization_id(
+                permission=OrganizationPermission.CONVERSATION_READ
+            )
+            query = query.where(
+                StoredConversationMetadata.organization_id == organization_id
+            )
         return query
 
     def _to_info(
@@ -791,6 +829,7 @@ class SQLAppConversationInfoService(AppConversationInfoService):
         return AppConversationInfo(
             id=UUID(stored.conversation_id),
             created_by_user_id=None,  # User ID is now stored in ConversationMetadataSaas
+            organization_id=stored.organization_id,
             sandbox_id=sandbox_id,  # Use the asserted non-None value
             selected_repository=stored.selected_repository,
             selected_branch=stored.selected_branch,
