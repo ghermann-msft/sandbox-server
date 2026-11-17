@@ -12,7 +12,7 @@ No cluster is required: the CustomObjectsApi is mocked.
 import contextlib
 import re
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, call, patch
 from uuid import uuid4
 
 import pytest
@@ -118,8 +118,14 @@ def service(mock_sandbox_spec_service, custom_objects, core_v1):
     )
 
 
-def _claim(sandbox_id='sb1', sandbox_name='sb-1', env=None):
-    return {
+def _claim(
+    sandbox_id='sb1',
+    sandbox_name='sb-1',
+    env=None,
+    ready_status=None,
+    ready_reason=None,
+):
+    claim = {
         'metadata': {
             'name': f'oh-agent-server-{sandbox_id}',
             'labels': {
@@ -133,6 +139,15 @@ def _claim(sandbox_id='sb1', sandbox_name='sb-1', env=None):
         # The controller reports the Sandbox it created under status.sandbox.
         'status': {'sandbox': {'name': sandbox_name}},
     }
+    if ready_status is not None:
+        claim['status']['conditions'] = [
+            {
+                'type': 'Ready',
+                'status': ready_status,
+                'reason': ready_reason,
+            }
+        ]
+    return claim
 
 
 def _sandbox(ready=True, operating_mode='Running', reason=None, message=None):
@@ -1323,3 +1338,49 @@ async def test_profile_global_quota_fails_before_claim_creation(
         await service.start_sandbox()
 
     custom_objects.create_namespaced_custom_object.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ('limit_field', 'error_match'),
+    [
+        ('max_concurrent_sandboxes', 'global concurrency limit'),
+        ('max_concurrent_per_user', 'user concurrency limit'),
+    ],
+)
+async def test_profile_quota_counts_active_but_not_suspended_claims(
+    service, custom_objects, limit_field, error_match
+):
+    custom_objects.list_namespaced_custom_object.return_value = {
+        'items': [
+            _claim(sandbox_id='running', ready_status='True'),
+            _claim(
+                sandbox_id='starting',
+                ready_status='False',
+                ready_reason='SandboxProvisioning',
+            ),
+            _claim(
+                sandbox_id='suspended',
+                ready_status='False',
+                ready_reason='SandboxSuspended',
+            ),
+        ]
+    }
+    if limit_field == 'max_concurrent_per_user':
+        service.access_service = AsyncMock()
+        service.access_service.user_id = 'user-1'
+        service.access_service.owner_user_ids.side_effect = lambda sandbox_ids: {
+            sandbox_id: 'user-1' for sandbox_id in sandbox_ids
+        }
+
+    spec = get_default_sandbox_specs()[0].model_copy(update={limit_field: 2})
+    with pytest.raises(SandboxError, match=error_match):
+        await service._enforce_profile_quota(spec)
+
+    spec = get_default_sandbox_specs()[0].model_copy(update={limit_field: 3})
+    await service._enforce_profile_quota(spec)
+
+    if limit_field == 'max_concurrent_per_user':
+        assert service.access_service.owner_user_ids.await_args_list == [
+            call(['running', 'starting']),
+            call(['running', 'starting']),
+        ]

@@ -208,6 +208,17 @@ def _condition_progress_state(resource: dict[str, Any]) -> list[dict[str, Any]]:
     ]
 
 
+def _claim_is_suspended(claim: dict[str, Any]) -> bool:
+    conditions = (claim.get('status') or {}).get('conditions') or []
+    return any(
+        isinstance(condition, dict)
+        and condition.get('type') == 'Ready'
+        and (condition.get('status') is False or condition.get('status') == 'False')
+        and condition.get('reason') == 'SandboxSuspended'
+        for condition in conditions
+    )
+
+
 class ExposedPort(BaseModel):
     """Port within the sandbox pod that should be surfaced as a URL."""
 
@@ -1263,8 +1274,10 @@ class KubernetesSandboxService(SandboxService):
             annotations = metadata.get('annotations') or {}
             labels = metadata.get('labels') or {}
             sandbox_id = labels.get(SANDBOX_ID_LABEL)
-            if annotations.get(SPEC_ID_ANNOTATION) == sandbox_spec.id and isinstance(
-                sandbox_id, str
+            if (
+                annotations.get(SPEC_ID_ANNOTATION) == sandbox_spec.id
+                and isinstance(sandbox_id, str)
+                and not _claim_is_suspended(claim)
             ):
                 matching_ids.append(sandbox_id)
         if max_global is not None and len(matching_ids) >= max_global:
