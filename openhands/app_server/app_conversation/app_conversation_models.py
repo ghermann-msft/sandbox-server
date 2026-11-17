@@ -50,6 +50,7 @@ ARCHIVE_WORKSPACE_PATH_TAG_KEY = 'archiveworkspacepath'
 # tag-key rule forbids underscores, hence the squashed keys.
 AGENT_PROFILE_ID_TAG_KEY = 'agentprofileid'
 AGENT_PROFILE_REVISION_TAG_KEY = 'agentprofilerevision'
+ORGANIZATION_ID_TAG_KEY = 'organizationid'
 
 
 class ConversationTrigger(Enum):
@@ -182,6 +183,12 @@ class AppConversationInfo(BaseModel):
             # Malformed id tag — surface no provenance rather than 500 the list.
             return None
 
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def organization_id(self) -> str | None:
+        """Trusted organization selected when the conversation was created."""
+        return self.tags.get(ORGANIZATION_ID_TAG_KEY)
+
 
 class AppConversationSortOrder(Enum):
     CREATED_AT = 'CREATED_AT'
@@ -241,6 +248,7 @@ class AppConversationStartRequest(OpenHandsModel):
     # Profile (by id) without changing the member's active pointer. When unset,
     # the member's active_agent_profile_id is used.
     agent_profile_id: str | None = None
+    organization_id: str | None = None
 
     # Git parameters
     selected_repository: str | None = None

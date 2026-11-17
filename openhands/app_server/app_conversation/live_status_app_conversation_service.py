@@ -29,6 +29,7 @@ from openhands.app_server.app_conversation.app_conversation_models import (
     AGENT_PROFILE_ID_TAG_KEY,
     AGENT_PROFILE_REVISION_TAG_KEY,
     ARCHIVE_WORKSPACE_PATH_TAG_KEY,
+    ORGANIZATION_ID_TAG_KEY,
     AgentType,
     AppConversation,
     AppConversationInfo,
@@ -594,6 +595,8 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
                 conversation_tags['git_provider'] = request.git_provider.value
             if request.selected_branch:
                 conversation_tags['selected_branch'] = request.selected_branch
+            if request.organization_id:
+                conversation_tags[ORGANIZATION_ID_TAG_KEY] = request.organization_id
 
             app_conversation_info = AppConversationInfo(
                 id=info.id,
