@@ -1,3 +1,4 @@
+import json
 from dataclasses import dataclass
 from uuid import UUID, uuid4
 
@@ -123,7 +124,7 @@ async def test_personal_and_shared_organization_list_and_current_org(db_session)
     assert owner is not None
     assert owner_role is not None
 
-    halo_id = uuid4()
+    halo_id = UUID('c7d82db0-1e82-5c36-ad45-601c5cd3b646')
     db_session.add(
         StoredOrganization(
             id=halo_id,
@@ -269,3 +270,84 @@ def test_bootstrap_shared_organization_owner(tmp_path, monkeypatch):
         assert organization is not None
         assert organization.name == 'Halo Studios'
         assert len(memberships) == 1
+
+
+def test_bootstrap_json_seeds_multiple_roles_without_overwriting(tmp_path, monkeypatch):
+    engine = create_engine(f'sqlite:///{tmp_path / "rbac-json.db"}')
+    Base.metadata.create_all(engine)
+    with Session(engine) as session:
+        roles = {
+            role: StoredRole(id=uuid4(), name=role.value) for role in OrganizationRole
+        }
+        session.add_all(roles.values())
+        session.commit()
+
+    halo_id = UUID('c7d82db0-1e82-5c36-ad45-601c5cd3b646')
+    seed = {
+        'organizations': [
+            {
+                'id': str(halo_id),
+                'name': 'Halo Studios',
+                'kind': 'shared',
+                'members': [
+                    {
+                        'provider': 'entra',
+                        'tenant_id': 'tenant-1',
+                        'subject_id': 'owner-object',
+                        'role': 'owner',
+                    },
+                    {
+                        'provider': 'entra',
+                        'tenant_id': 'tenant-1',
+                        'subject_id': 'admin-object',
+                        'role': 'admin',
+                    },
+                    {
+                        'provider': 'entra',
+                        'tenant_id': 'tenant-1',
+                        'subject_id': 'member-object',
+                        'role': 'member',
+                    },
+                ],
+            }
+        ]
+    }
+    seed_file = tmp_path / 'rbac-bootstrap.json'
+    seed_file.write_text(json.dumps(seed), encoding='utf-8')
+    monkeypatch.setenv('OH_RBAC_BOOTSTRAP_JSON_FILE', str(seed_file))
+
+    bootstrap_organization_from_env(engine)
+    with Session(engine) as session:
+        admin_user = session.scalar(
+            select(StoredUser).where(StoredUser.subject_id == 'admin-object')
+        )
+        assert admin_user is not None
+        admin_membership = session.scalar(
+            select(StoredMembership).where(
+                StoredMembership.organization_id == halo_id,
+                StoredMembership.user_id == admin_user.id,
+            )
+        )
+        assert admin_membership is not None
+        owner_role_id = session.scalar(
+            select(StoredRole.id).where(StoredRole.name == OrganizationRole.OWNER.value)
+        )
+        admin_membership.role_id = owner_role_id
+        session.commit()
+
+    bootstrap_organization_from_env(engine)
+    with Session(engine) as session:
+        memberships = session.scalars(
+            select(StoredMembership).where(StoredMembership.organization_id == halo_id)
+        ).all()
+        assert len(memberships) == 3
+        admin_user = session.scalar(
+            select(StoredUser).where(StoredUser.subject_id == 'admin-object')
+        )
+        admin_membership = session.scalar(
+            select(StoredMembership).where(
+                StoredMembership.organization_id == halo_id,
+                StoredMembership.user_id == admin_user.id,
+            )
+        )
+        assert admin_membership.role_id == owner_role_id

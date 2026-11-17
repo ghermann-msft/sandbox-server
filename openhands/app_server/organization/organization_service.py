@@ -2,12 +2,18 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from pathlib import Path
+from typing import Literal
 from uuid import UUID
 
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 from sqlalchemy import Engine, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import Session
 
+from openhands.app_server.app_conversation.app_conversation_models import (
+    AppConversationStartRequest,
+)
 from openhands.app_server.errors import AuthError, PermissionsError
 from openhands.app_server.organization.organization_models import (
     AuthenticationIdentity,
@@ -192,8 +198,88 @@ class OrganizationService:
         )
 
 
-def bootstrap_organization_from_env(engine: Engine) -> None:
-    """Seed one shared organization and owner from deployment configuration."""
+async def bind_conversation_organization(
+    start_request: AppConversationStartRequest,
+    requested_organization_id: UUID | None,
+    db_session: AsyncSession,
+    user_context: UserContext,
+) -> None:
+    """Validate a browser-requested tenant against durable RBAC."""
+
+    identity = await user_context.get_authentication_identity()
+    if identity is None:
+        if start_request.organization_id is not None:
+            raise PermissionsError('Authenticated organization selection is required')
+        return
+    if requested_organization_id is None:
+        raise PermissionsError('X-Org-Id is required')
+    if (
+        start_request.organization_id is not None
+        and start_request.organization_id != requested_organization_id
+    ):
+        raise PermissionsError('Request organization does not match X-Org-Id')
+    start_request.organization_id = await OrganizationService(
+        db_session, user_context
+    ).resolve_organization_id(
+        requested_organization_id,
+        OrganizationPermission.CONVERSATION_CREATE,
+    )
+
+
+class BootstrapMember(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+
+    provider: str = 'entra'
+    tenant_id: str = Field(min_length=1)
+    subject_id: str = Field(min_length=1)
+    role: OrganizationRole
+
+
+class BootstrapOrganization(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+
+    id: UUID
+    name: str = Field(min_length=1)
+    kind: Literal['shared']
+    is_visible: bool = True
+    members: list[BootstrapMember] = Field(default_factory=list)
+
+    @model_validator(mode='after')
+    def validate_unique_members(self) -> BootstrapOrganization:
+        identities = [
+            (member.provider, member.tenant_id, member.subject_id)
+            for member in self.members
+        ]
+        if len(identities) != len(set(identities)):
+            raise ValueError('Duplicate organization bootstrap member')
+        return self
+
+
+class BootstrapConfig(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+
+    organizations: list[BootstrapOrganization]
+
+    @model_validator(mode='after')
+    def validate_unique_organizations(self) -> BootstrapConfig:
+        organization_ids = [organization.id for organization in self.organizations]
+        if len(organization_ids) != len(set(organization_ids)):
+            raise ValueError('Duplicate bootstrap organization ID')
+        return self
+
+
+def _bootstrap_config_from_env() -> BootstrapConfig | None:
+    inline = os.getenv('OH_RBAC_BOOTSTRAP_JSON')
+    file_name = os.getenv('OH_RBAC_BOOTSTRAP_JSON_FILE')
+    if inline and file_name:
+        raise ValueError(
+            'Configure only one of OH_RBAC_BOOTSTRAP_JSON or '
+            'OH_RBAC_BOOTSTRAP_JSON_FILE'
+        )
+    if file_name:
+        inline = Path(file_name).read_text(encoding='utf-8')
+    if inline:
+        return BootstrapConfig.model_validate_json(inline)
 
     values = {
         'organization_id': os.getenv('OH_RBAC_BOOTSTRAP_ORGANIZATION_ID'),
@@ -203,7 +289,7 @@ def bootstrap_organization_from_env(engine: Engine) -> None:
         'owner_object_id': os.getenv('OH_RBAC_BOOTSTRAP_OWNER_OBJECT_ID'),
     }
     if not any(values.values()):
-        return
+        return None
     required = ('organization_id', 'owner_tenant_id', 'owner_object_id')
     missing = [key for key in required if not values[key]]
     if missing:
@@ -211,54 +297,89 @@ def bootstrap_organization_from_env(engine: Engine) -> None:
             'Incomplete RBAC bootstrap configuration; missing ' + ', '.join(missing)
         )
 
-    organization_id = UUID(values['organization_id'] or '')
-    with Session(engine) as session:
-        user = session.scalar(
-            select(StoredUser).where(
-                StoredUser.identity_provider == (values['owner_provider'] or 'entra'),
-                StoredUser.tenant_id == values['owner_tenant_id'],
-                StoredUser.subject_id == values['owner_object_id'],
-            )
-        )
-        if user is None:
-            user = StoredUser(
-                identity_provider=values['owner_provider'] or 'entra',
-                tenant_id=values['owner_tenant_id'] or '',
-                subject_id=values['owner_object_id'] or '',
-            )
-            session.add(user)
-            session.flush()
-
-        organization = session.get(StoredOrganization, organization_id)
-        if organization is None:
-            organization = StoredOrganization(
-                id=organization_id,
+    return BootstrapConfig(
+        organizations=[
+            BootstrapOrganization(
+                id=UUID(values['organization_id'] or ''),
                 name=values['organization_name'] or 'Halo Studios',
-                kind=OrganizationKind.SHARED.value,
-                is_visible=True,
+                kind='shared',
+                members=[
+                    BootstrapMember(
+                        provider=values['owner_provider'] or 'entra',
+                        tenant_id=values['owner_tenant_id'] or '',
+                        subject_id=values['owner_object_id'] or '',
+                        role=OrganizationRole.OWNER,
+                    )
+                ],
             )
-            session.add(organization)
-            session.flush()
+        ]
+    )
 
-        owner_role = session.scalar(
-            select(StoredRole).where(StoredRole.name == OrganizationRole.OWNER.value)
-        )
-        if owner_role is None:
-            raise RuntimeError('RBAC owner role is not seeded')
-        membership = session.scalar(
-            select(StoredMembership).where(
-                StoredMembership.organization_id == organization.id,
-                StoredMembership.user_id == user.id,
+
+def bootstrap_organization_from_env(engine: Engine) -> None:
+    """Idempotently seed shared organizations and immutable identity memberships."""
+
+    config = _bootstrap_config_from_env()
+    if config is None:
+        return
+
+    with Session(engine) as session:
+        roles = {
+            OrganizationRole(role.name): role
+            for role in session.scalars(select(StoredRole)).all()
+        }
+        missing_roles: set[OrganizationRole] = set(OrganizationRole).difference(roles)
+        if missing_roles:
+            raise RuntimeError(
+                'RBAC roles are not seeded: '
+                + ', '.join(sorted(role.value for role in missing_roles))
             )
-        )
-        if membership is None:
-            session.add(
-                StoredMembership(
-                    organization_id=organization.id,
-                    user_id=user.id,
-                    role_id=owner_role.id,
+
+        for organization_seed in config.organizations:
+            organization = session.get(StoredOrganization, organization_seed.id)
+            if organization is None:
+                organization = StoredOrganization(
+                    id=organization_seed.id,
+                    name=organization_seed.name,
+                    kind=OrganizationKind.SHARED.value,
+                    is_visible=organization_seed.is_visible,
                 )
-            )
-        else:
-            membership.role_id = owner_role.id
+                session.add(organization)
+                session.flush()
+            elif organization.kind != OrganizationKind.SHARED.value:
+                raise ValueError(
+                    f'Bootstrap organization {organization_seed.id} is not shared'
+                )
+
+            for member in organization_seed.members:
+                user = session.scalar(
+                    select(StoredUser).where(
+                        StoredUser.identity_provider == member.provider,
+                        StoredUser.tenant_id == member.tenant_id,
+                        StoredUser.subject_id == member.subject_id,
+                    )
+                )
+                if user is None:
+                    user = StoredUser(
+                        identity_provider=member.provider,
+                        tenant_id=member.tenant_id,
+                        subject_id=member.subject_id,
+                    )
+                    session.add(user)
+                    session.flush()
+
+                membership = session.scalar(
+                    select(StoredMembership).where(
+                        StoredMembership.organization_id == organization.id,
+                        StoredMembership.user_id == user.id,
+                    )
+                )
+                if membership is None:
+                    session.add(
+                        StoredMembership(
+                            organization_id=organization.id,
+                            user_id=user.id,
+                            role_id=roles[member.role].id,
+                        )
+                    )
         session.commit()

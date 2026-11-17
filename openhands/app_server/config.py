@@ -39,6 +39,17 @@ from openhands.app_server.event_callback.event_callback_service import (
 )
 from openhands.app_server.file_store.files import FileStore
 from openhands.app_server.file_store.local import LocalFileStore
+from openhands.app_server.hindsight.hindsight_config import (
+    get_hindsight_api_key_file,
+    get_hindsight_bank_secret_file,
+    get_hindsight_base_url,
+    get_hindsight_broker_url,
+    get_hindsight_deployment_id,
+    get_hindsight_enabled,
+    get_hindsight_fail_open,
+    get_hindsight_linux_only,
+    get_hindsight_scope_bindings_json_file,
+)
 from openhands.app_server.pending_messages.pending_message_service import (
     PendingMessageService,
     PendingMessageServiceInjector,
@@ -211,6 +222,29 @@ class AppServerConfig(OpenHandsModel):
         default_factory=get_default_tavily_api_key,
         description='Tavily API key for search integration (proxied via MCP server)',
     )
+    hindsight_enabled: bool = Field(default_factory=get_hindsight_enabled)
+    hindsight_fail_open: bool = Field(default_factory=get_hindsight_fail_open)
+    hindsight_linux_only: bool = Field(default_factory=get_hindsight_linux_only)
+    hindsight_base_url: str | None = Field(default_factory=get_hindsight_base_url)
+    hindsight_broker_url: str | None = Field(default_factory=get_hindsight_broker_url)
+    hindsight_api_key_file: Path | None = Field(
+        default_factory=get_hindsight_api_key_file
+    )
+    hindsight_bank_secret_file: Path | None = Field(
+        default_factory=get_hindsight_bank_secret_file
+    )
+    hindsight_deployment_id: str | None = Field(
+        default_factory=get_hindsight_deployment_id
+    )
+    hindsight_scope_bindings_json_file: Path | None = Field(
+        default_factory=get_hindsight_scope_bindings_json_file
+    )
+    hindsight_max_outbox_pending: int = Field(default=10_000, ge=1)
+    hindsight_max_attempts: int = Field(default=8, ge=1)
+    hindsight_request_timeout_seconds: float = Field(default=5.0, gt=0, le=30)
+    hindsight_default_token_ceiling: int = Field(default=1024, ge=256, le=1024)
+    hindsight_adaptive_token_ceiling: int = Field(default=2048, ge=1024, le=2048)
+    hindsight_deep_token_ceiling: int = Field(default=4096, ge=2048, le=4096)
     # Dependency Injection Injectors
     llm_model: LLMModelServiceInjector | None = None
     event: EventServiceInjector | None = None

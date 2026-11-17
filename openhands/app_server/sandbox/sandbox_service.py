@@ -124,6 +124,10 @@ def _is_retryable_start_failure(detail: str | None) -> bool:
 class SandboxService(ABC):
     """Service for accessing sandboxes in which conversations may be run."""
 
+    def get_control_plane_base_url(self) -> str | None:
+        """Return a runtime-reachable app-server base URL, when available."""
+        return None
+
     @abstractmethod
     async def search_sandboxes(
         self,

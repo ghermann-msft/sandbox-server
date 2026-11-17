@@ -13,7 +13,7 @@ from typing import Annotated, Any, AsyncGenerator, Literal
 from uuid import UUID
 
 import httpx
-from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, status
 from fastapi.responses import JSONResponse, StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -66,6 +66,9 @@ from openhands.app_server.config import (
     depends_user_context,
     get_app_conversation_service,
 )
+from openhands.app_server.organization.organization_service import (
+    bind_conversation_organization,
+)
 from openhands.app_server.sandbox.sandbox_models import (
     AGENT_SERVER,
     SandboxInfo,
@@ -109,6 +112,7 @@ router = APIRouter(
 )
 logger = logging.getLogger(__name__)
 app_conversation_service_dependency = depends_app_conversation_service()
+user_settings_dependency = Depends(get_user_settings)
 app_conversation_info_service_dependency = depends_app_conversation_info_service()
 app_conversation_start_task_service_dependency = (
     depends_app_conversation_start_task_service()
@@ -365,6 +369,7 @@ async def batch_get_app_conversations(
 async def start_app_conversation(
     request: Request,
     start_request: AppConversationStartRequest,
+    organization_id: Annotated[UUID | None, Header(alias='X-Org-Id')] = None,
     user_context: UserContext = user_context_dependency,
     db_session: AsyncSession = db_session_dependency,
     httpx_client: httpx.AsyncClient = httpx_client_dependency,
@@ -372,6 +377,9 @@ async def start_app_conversation(
         app_conversation_service_dependency
     ),
 ) -> AppConversationStartTask:
+    await bind_conversation_organization(
+        start_request, organization_id, db_session, user_context
+    )
     # Because we are processing after the request finishes, keep the db connection open
     set_db_session_keep_open(request.state, True)
     set_httpx_client_keep_open(request.state, True)
@@ -630,7 +638,7 @@ async def _persist_conversation_model(
 async def switch_conversation_profile(
     conversation_id: UUID,
     request: SwitchProfileRequest,
-    user_settings: Settings | None = Depends(get_user_settings),
+    user_settings: Settings | None = user_settings_dependency,
     app_conversation_service: AppConversationService = (
         app_conversation_service_dependency
     ),
@@ -1032,11 +1040,16 @@ async def delete_app_conversation(
 @router.post('/stream-start')
 async def stream_app_conversation_start(
     request: AppConversationStartRequest,
+    organization_id: Annotated[UUID | None, Header(alias='X-Org-Id')] = None,
     user_context: UserContext = user_context_dependency,
+    db_session: AsyncSession = db_session_dependency,
 ) -> list[AppConversationStartTask]:
     """Start an app conversation start task and stream updates from it.
     Leaves the connection open until either the conversation starts or there was an error
     """
+    await bind_conversation_organization(
+        request, organization_id, db_session, user_context
+    )
     response = StreamingResponse(
         _stream_app_conversation_start(request, user_context),
         media_type='application/json',

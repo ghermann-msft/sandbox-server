@@ -195,7 +195,7 @@ def get_agent_server_env() -> dict[str, str]:
     Raises:
         JSONDecodeError: If OH_AGENT_SERVER_ENV contains invalid JSON.
     """
-    result: dict[str, str] = {}
+    result: dict[str, str] = {'OH_DEFERRED_INIT': 'true'}
 
     # Step 1: Auto-forward environment variables with recognized prefixes
     for key, value in os.environ.items():

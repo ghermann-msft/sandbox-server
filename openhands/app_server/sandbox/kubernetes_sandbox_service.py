@@ -141,6 +141,9 @@ class KubernetesSandboxService(SandboxService):
     default_sandbox_spec_id: str | None = None
     _custom_objects: Any = None
 
+    def get_control_plane_base_url(self) -> str | None:
+        return self.webhook_base_url.rstrip('/')
+
     def __post_init__(self) -> None:
         if self._custom_objects is None:
             try:

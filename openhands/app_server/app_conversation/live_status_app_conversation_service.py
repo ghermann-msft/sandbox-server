@@ -13,13 +13,19 @@ from uuid import UUID, uuid4
 
 import httpx
 from fastapi import Request
-from pydantic import Field, SecretStr, TypeAdapter
+from pydantic import Field, HttpUrl, SecretStr, TypeAdapter
 
 from openhands.agent_server.models import (
     ConversationInfo,
     SendMessageRequest,
     StartConversationRequest,
     TextContent,
+)
+from openhands.app_server.app_conversation.agent_server_init_models import (
+    AgentServerHindsightMemory,
+    AgentServerInitRequest,
+    AgentServerInitStatus,
+    AgentServerMemoryScope,
 )
 from openhands.app_server.app_conversation.app_conversation_info_service import (
     AppConversationInfoService,
@@ -428,12 +434,6 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
             assert sandbox is not None
             agent_server_url = self._get_agent_server_url(sandbox)
 
-            # Mirror the user's LLM profiles into the sandbox so the agent's
-            # built-in switch_llm tool can resolve them (in SaaS profiles live
-            # on the app-server, not the sandbox filesystem). Before conversation
-            # creation, so the tool is enabled; re-runs on every start/resume.
-            await self._seed_sandbox_profiles(agent_server_url, sandbox.session_api_key)
-
             # Get the working dir
             sandbox_spec = await self.sandbox_spec_service.get_sandbox_spec(
                 sandbox.sandbox_spec_id
@@ -450,6 +450,24 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
                 sandbox_grouping_strategy,
                 conversation_id.hex,
             )
+
+            initial_env = getattr(sandbox_spec, 'initial_env', {})
+            if initial_env.get('OH_DEFERRED_INIT', '').lower() == 'true':
+                await self._initialize_agent_server(
+                    agent_server_url=agent_server_url,
+                    sandbox=sandbox,
+                    organization_id=organization_id,
+                    working_dir=working_dir,
+                    git_provider=request.git_provider,
+                    selected_repository=request.selected_repository,
+                    agent_profile_id=request.agent_profile_id,
+                )
+
+            # Mirror the user's LLM profiles into the sandbox so the agent's
+            # built-in switch_llm tool can resolve them (in SaaS profiles live
+            # on the app-server, not the sandbox filesystem). Before conversation
+            # creation, so the tool is enabled; re-runs on every start/resume.
+            await self._seed_sandbox_profiles(agent_server_url, sandbox.session_api_key)
 
             # Run setup scripts
             remote_workspace = AsyncRemoteWorkspace(
@@ -488,6 +506,7 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
                     remote_workspace=remote_workspace,
                     selected_repository=request.selected_repository,
                     selected_branch=request.selected_branch,
+                    organization_id=organization_id,
                     plugins=request.plugins,
                     api_secrets=request.secrets,
                     agent_profile_id=request.agent_profile_id,
@@ -602,7 +621,6 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
                 conversation_tags['git_provider'] = request.git_provider.value
             if request.selected_branch:
                 conversation_tags['selected_branch'] = request.selected_branch
-
             app_conversation_info = AppConversationInfo(
                 id=info.id,
                 organization_id=organization_id,
@@ -1004,6 +1022,130 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
             httpx_client=self.httpx_client,
         )
 
+    async def _initialize_agent_server(
+        self,
+        *,
+        agent_server_url: str,
+        sandbox: SandboxInfo,
+        organization_id: UUID | None,
+        working_dir: str,
+        git_provider: ProviderType | None,
+        selected_repository: str | None,
+        agent_profile_id: str | None,
+    ) -> None:
+        from openhands.app_server.config import get_global_config
+        from openhands.app_server.hindsight.hindsight_service import (
+            normalize_repository,
+        )
+
+        session_api_key = sandbox.session_api_key
+        if not session_api_key:
+            raise SandboxError(
+                'Deferred Agent Server initialization requires a session API key'
+            )
+
+        config = get_global_config()
+        hindsight_memory: AgentServerHindsightMemory | None = None
+        user = await self.user_context.get_user_info(
+            resolve_agent_profile=True,
+            override_agent_profile_id=agent_profile_id,
+        )
+        if config.hindsight_enabled and not isinstance(
+            user.agent_settings, ACPAgentSettings
+        ):
+            broker_url = config.hindsight_broker_url
+            deployment_id = config.hindsight_deployment_id
+            if not broker_url or not deployment_id:
+                raise SandboxError(
+                    'Hindsight requires OH_HINDSIGHT_BROKER_URL and '
+                    'OH_HINDSIGHT_DEPLOYMENT_ID'
+                )
+            if organization_id is None:
+                raise SandboxError('Hindsight requires a validated organization')
+            identity = await self.user_context.get_authentication_identity()
+            user_id = await self.user_context.get_user_id()
+            if identity is None or identity.tenant_id is None or not user_id:
+                raise SandboxError(
+                    'Hindsight requires an authenticated immutable user identity'
+                )
+
+            scopes = [
+                AgentServerMemoryScope(type='server', id=deployment_id),
+                AgentServerMemoryScope(type='organization', id=str(organization_id)),
+            ]
+            if selected_repository and git_provider:
+                scopes.append(
+                    AgentServerMemoryScope(
+                        type='repository',
+                        id=f'{git_provider.value}:{normalize_repository(selected_repository)}',
+                    )
+                )
+            scopes.extend(
+                [
+                    AgentServerMemoryScope(
+                        type='workspace',
+                        id=str(sandbox.id),
+                    ),
+                    AgentServerMemoryScope(
+                        type='private_user',
+                        id=f'{identity.tenant_id}:{identity.subject_id}',
+                    ),
+                ]
+            )
+            signed_identity = self.jwt_service.create_jws_token(
+                {
+                    'purpose': 'hindsight_memory',
+                    'user_id': user_id,
+                    'tenant_id': identity.tenant_id,
+                    'object_id': identity.subject_id,
+                    'sandbox_id': str(sandbox.id),
+                    'organization_id': str(organization_id),
+                },
+                expires_in=timedelta(days=30),
+            )
+            hindsight_memory = AgentServerHindsightMemory(
+                broker_url=HttpUrl(broker_url),
+                identity=signed_identity,
+                scope=scopes,
+            )
+
+        init_request = AgentServerInitRequest(
+            session_api_keys=[session_api_key],
+            secret_key=session_api_key,
+            hindsight_memory=hindsight_memory,
+        )
+        init_url = f'{agent_server_url}/api/init'
+        response = await self.httpx_client.get(
+            init_url, timeout=self.sandbox_startup_timeout
+        )
+        response.raise_for_status()
+        init_status = AgentServerInitStatus.model_validate(response.json())
+        if init_status.state == 'dormant':
+            response = await self.httpx_client.post(
+                init_url,
+                headers={'X-Init-API-Key': session_api_key},
+                json=init_request.model_dump(mode='json', exclude_none=True),
+                timeout=self.sandbox_startup_timeout,
+            )
+            response.raise_for_status()
+            init_status = AgentServerInitStatus.model_validate(response.json())
+
+        deadline = asyncio.get_running_loop().time() + self.sandbox_startup_timeout
+        while init_status.state == 'initializing':
+            if asyncio.get_running_loop().time() >= deadline:
+                raise SandboxError('Timed out waiting for Agent Server initialization')
+            await asyncio.sleep(0.25)
+            response = await self.httpx_client.get(
+                init_url, timeout=self.sandbox_startup_timeout
+            )
+            response.raise_for_status()
+            init_status = AgentServerInitStatus.model_validate(response.json())
+
+        if init_status.state != 'ready' or init_status.error:
+            raise SandboxError(
+                f'Agent Server initialization failed: {init_status.error or init_status.state}'
+            )
+
     async def _seed_sandbox_profiles(
         self, agent_server_url: str, session_api_key: str | None
     ) -> None:
@@ -1174,7 +1316,9 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
 
         return f'{working_dir}/{config_dir}/PLAN.md'
 
-    async def _setup_secrets_for_git_providers(self, user: UserInfo) -> dict:
+    async def _setup_secrets_for_git_providers(
+        self, user: UserInfo, sandbox: SandboxInfo | None = None
+    ) -> dict:
         """Set up secrets for all git provider authentication.
 
         Args:
@@ -1199,8 +1343,21 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
                 secret_name = f'{provider_type.name}_TOKEN'
                 description = f'{provider_type.name} authentication token'
 
-                if self.web_url:
-                    # Create an access token for web-based authentication
+                control_plane_url = self.sandbox_service.get_control_plane_base_url()
+                if (
+                    control_plane_url
+                    and sandbox is not None
+                    and sandbox.session_api_key
+                ):
+                    secrets[secret_name] = LookupSecret(
+                        url=(
+                            f'{control_plane_url.rstrip("/")}/api/v1/sandboxes/'
+                            f'{sandbox.id}/settings/secrets/{secret_name}'
+                        ),
+                        headers={'X-Session-API-Key': sandbox.session_api_key},
+                        description=description,
+                    )
+                elif self.web_url:
                     access_token = self.jwt_service.create_jws_token(
                         payload={
                             'user_id': user.id,
@@ -1208,14 +1365,12 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
                         },
                         expires_in=self.access_token_hard_timeout,
                     )
-                    headers = {'X-Access-Token': access_token}
-
                     secrets[secret_name] = LookupSecret(
                         url=self.web_url + '/api/v1/webhooks/secrets',
-                        headers=headers,
+                        headers={'X-Access-Token': access_token},
                         description=description,
                     )
-                else:
+                elif not self.web_url:
                     # Use static token for environments without web URL access
                     static_token = await self.user_context.get_latest_token(
                         provider_type
@@ -1230,6 +1385,7 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
     async def _setup_conversation_secrets(
         self,
         user: UserInfo,
+        sandbox: SandboxInfo,
         trigger: ConversationTrigger | None,
         system_message_suffix: str | None,
     ) -> tuple[dict, str | None]:
@@ -1243,7 +1399,7 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
         Returns:
             Tuple of secrets and updated system message suffix.
         """
-        secrets = await self._setup_secrets_for_git_providers(user)
+        secrets = await self._setup_secrets_for_git_providers(user, sandbox)
 
         enrichment = await self.conversation_secret_enricher.enrich(
             user_context=self.user_context,
@@ -1904,6 +2060,7 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
         remote_workspace: AsyncRemoteWorkspace | None = None,
         selected_repository: str | None = None,
         selected_branch: str | None = None,
+        organization_id: UUID | None = None,
         plugins: list[PluginSpec] | None = None,
         api_secrets: dict[str, SecretStr] | None = None,
         agent_profile_id: str | None = None,
@@ -1996,6 +2153,7 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
                 git_provider=git_provider,
                 selected_repository=selected_repository,
                 selected_branch=selected_branch,
+                organization_id=organization_id,
                 remote_workspace=remote_workspace,
                 plugins=plugins,
                 api_secrets=api_secrets,
@@ -2023,6 +2181,7 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
         # Start with secrets from git providers and database
         secrets, system_message_suffix = await self._setup_conversation_secrets(
             user,
+            sandbox,
             trigger,
             system_message_suffix,
         )
@@ -2222,7 +2381,11 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
             self._extend_observability_tags(
                 observability_tags, request_observability_tags
             )
-        create_kwargs: dict[str, Any] = {'agent': agent, 'user_id': laminar_user_id}
+        create_kwargs: dict[str, Any] = {
+            'agent': agent,
+            'user_id': laminar_user_id,
+            'organization_id': str(organization_id) if organization_id else None,
+        }
         title_llm_profile = _resolve_title_llm_profile(user)
         if title_llm_profile:
             create_kwargs['title_llm_profile'] = title_llm_profile
@@ -2319,6 +2482,7 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
         git_provider: ProviderType | None = None,
         selected_repository: str | None = None,
         selected_branch: str | None = None,
+        organization_id: UUID | None = None,
         remote_workspace: AsyncRemoteWorkspace | None = None,
         plugins: list[PluginSpec] | None = None,
         api_secrets: dict[str, SecretStr] | None = None,
@@ -2509,6 +2673,7 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
         create_kwargs: dict[str, Any] = {
             'agent': acp_agent,
             'user_id': laminar_user_id,
+            'organization_id': str(organization_id) if organization_id else None,
             'secrets': secrets,
         }
         title_llm_profile = _resolve_title_llm_profile(user)

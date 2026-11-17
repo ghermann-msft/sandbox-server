@@ -41,6 +41,7 @@ from openhands.app_server.app_conversation.live_status_app_conversation_service 
 from openhands.app_server.errors import SandboxError
 from openhands.app_server.integrations.provider import ProviderToken, ProviderType
 from openhands.app_server.integrations.service_types import SuggestedTask, TaskType
+from openhands.app_server.organization.organization_models import AuthenticationIdentity
 from openhands.app_server.sandbox.sandbox_models import (
     AGENT_SERVER,
     ExposedUrl,
@@ -48,6 +49,7 @@ from openhands.app_server.sandbox.sandbox_models import (
     SandboxPage,
     SandboxStatus,
 )
+from openhands.app_server.sandbox.sandbox_service import SandboxService
 from openhands.app_server.sandbox.sandbox_spec_models import SandboxSpecInfo
 from openhands.app_server.settings.llm_profiles import LLMProfiles
 from openhands.app_server.settings.settings_models import (
@@ -260,7 +262,10 @@ class TestLiveStatusAppConversationService:
         self.mock_user_context.user_auth = self.mock_user_auth
         self.mock_user_context.get_user_email = AsyncMock(return_value=None)
         self.mock_jwt_service = Mock()
-        self.mock_sandbox_service = Mock()
+        self.mock_sandbox_service = Mock(spec=SandboxService)
+        self.mock_sandbox_service.get_control_plane_base_url.return_value = (
+            'http://control-plane'
+        )
         self.mock_sandbox_spec_service = Mock()
         self.mock_app_conversation_info_service = Mock()
         self.mock_app_conversation_info_service.resolve_organization_id = AsyncMock(
@@ -311,8 +316,9 @@ class TestLiveStatusAppConversationService:
 
         # Mock sandbox
         self.mock_sandbox = Mock(spec=SandboxInfo)
-        self.mock_sandbox.id = uuid4()
+        self.mock_sandbox.id = 'sandbox-123'
         self.mock_sandbox.status = SandboxStatus.RUNNING
+        self.mock_sandbox.session_api_key = 'session-key'
 
         # Stable conversation ID for tests that call _configure_llm_and_mcp directly
         self.conversation_id = uuid4()
@@ -469,6 +475,73 @@ class TestLiveStatusAppConversationService:
                 self.service._apply_suggested_task(request)
 
     @pytest.mark.asyncio
+    async def test_initialize_agent_server_sends_trusted_hindsight_scope(self):
+        organization_id = uuid4()
+        self.mock_user_context.get_authentication_identity = AsyncMock(
+            return_value=AuthenticationIdentity(
+                provider='entra',
+                tenant_id='11111111-1111-1111-1111-111111111111',
+                subject_id='22222222-2222-2222-2222-222222222222',
+            )
+        )
+        self.mock_user_context.get_user_id = AsyncMock(return_value='user-1')
+        self.mock_user_context.get_user_info = AsyncMock(return_value=self.mock_user)
+        self.mock_jwt_service.create_jws_token.return_value = 'signed-identity'
+        dormant = Mock()
+        dormant.json.return_value = {'state': 'dormant', 'error': None}
+        dormant.raise_for_status.return_value = None
+        ready = Mock()
+        ready.json.return_value = {'state': 'ready', 'error': None}
+        ready.raise_for_status.return_value = None
+        self.mock_httpx_client.get = AsyncMock(return_value=dormant)
+        self.mock_httpx_client.post = AsyncMock(return_value=ready)
+
+        config = Mock(
+            hindsight_enabled=True,
+            hindsight_broker_url='https://control-plane/hindsight',
+            hindsight_deployment_id='halo-ppe',
+        )
+        with patch(
+            'openhands.app_server.config.get_global_config', return_value=config
+        ):
+            await self.service._initialize_agent_server(
+                agent_server_url='http://agent-server',
+                sandbox=self.mock_sandbox,
+                organization_id=organization_id,
+                working_dir='/workspace/project',
+                git_provider=ProviderType.GITHUB,
+                selected_repository='OpenHands/sandbox-server',
+                agent_profile_id=None,
+            )
+
+        post = self.mock_httpx_client.post.await_args
+        assert post.args[0] == 'http://agent-server/api/init'
+        assert post.kwargs['headers'] == {'X-Init-API-Key': 'session-key'}
+        assert post.kwargs['json']['session_api_keys'] == ['session-key']
+        assert post.kwargs['json']['secret_key'] == 'session-key'
+        assert post.kwargs['json']['hindsight_memory'] == {
+            'broker_url': 'https://control-plane/hindsight',
+            'identity': 'signed-identity',
+            'scope': [
+                {'type': 'server', 'id': 'halo-ppe'},
+                {'type': 'organization', 'id': str(organization_id)},
+                {
+                    'type': 'repository',
+                    'id': 'github:openhands/sandbox-server',
+                },
+                {'type': 'workspace', 'id': 'sandbox-123'},
+                {
+                    'type': 'private_user',
+                    'id': (
+                        '11111111-1111-1111-1111-111111111111:'
+                        '22222222-2222-2222-2222-222222222222'
+                    ),
+                },
+            ],
+            'timeout_seconds': 2.0,
+        }
+
+    @pytest.mark.asyncio
     async def test_setup_secrets_for_git_providers_no_provider_tokens(self):
         """Test _setup_secrets_for_git_providers with no provider tokens."""
         # Arrange
@@ -481,7 +554,9 @@ class TestLiveStatusAppConversationService:
         self.mock_jwt_service.create_jws_token.return_value = 'test_access_token'
 
         # Act
-        result = await self.service._setup_secrets_for_git_providers(self.mock_user)
+        result = await self.service._setup_secrets_for_git_providers(
+            self.mock_user, self.mock_sandbox
+        )
 
         # Assert — custom secrets are passed through as-is (no LookupSecret wrapping)
         assert 'existing' in result
@@ -508,7 +583,9 @@ class TestLiveStatusAppConversationService:
         )
 
         # Act
-        result = await self.service._setup_secrets_for_git_providers(self.mock_user)
+        result = await self.service._setup_secrets_for_git_providers(
+            self.mock_user, self.mock_sandbox
+        )
 
         # Assert
         assert 'GITHUB_TOKEN' in result
@@ -517,15 +594,16 @@ class TestLiveStatusAppConversationService:
         assert isinstance(result['GITLAB_TOKEN'], LookupSecret)
         assert (
             result['GITHUB_TOKEN'].url
-            == 'https://test.example.com/api/v1/webhooks/secrets'
+            == 'http://control-plane/api/v1/sandboxes/sandbox-123/settings/secrets/GITHUB_TOKEN'
         )
-        assert result['GITHUB_TOKEN'].headers['X-Access-Token'] == 'test_access_token'
+        assert result['GITHUB_TOKEN'].headers == {'X-Session-API-Key': 'session-key'}
+        assert 'test.example.com' not in result['GITHUB_TOKEN'].url
         # Verify descriptions are included
         assert result['GITHUB_TOKEN'].description == 'GITHUB authentication token'
         assert result['GITLAB_TOKEN'].description == 'GITLAB authentication token'
 
         # Should be called twice, once for each provider
-        assert self.mock_jwt_service.create_jws_token.call_count == 2
+        self.mock_jwt_service.create_jws_token.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_setup_secrets_for_git_providers_with_saas_mode(self):
@@ -545,16 +623,15 @@ class TestLiveStatusAppConversationService:
         )
 
         # Act
-        result = await self.service._setup_secrets_for_git_providers(self.mock_user)
+        result = await self.service._setup_secrets_for_git_providers(
+            self.mock_user, self.mock_sandbox
+        )
 
         # Assert
         assert 'GITLAB_TOKEN' in result
         lookup_secret = result['GITLAB_TOKEN']
         assert isinstance(lookup_secret, LookupSecret)
-        assert 'X-Access-Token' in lookup_secret.headers
-        assert lookup_secret.headers['X-Access-Token'] == 'test_access_token'
-        # Verify no cookie is included (authentication is via X-Access-Token only)
-        assert 'Cookie' not in lookup_secret.headers
+        assert lookup_secret.headers == {'X-Session-API-Key': 'session-key'}
         # Verify description is included
         assert lookup_secret.description == 'GITLAB authentication token'
 
@@ -563,6 +640,7 @@ class TestLiveStatusAppConversationService:
         """Test _setup_secrets_for_git_providers without web URL (uses static token)."""
         # Arrange
         self.service.web_url = None
+        self.mock_sandbox_service.get_control_plane_base_url.return_value = None
         base_secrets = {}
         self.mock_user_context.get_secrets.return_value = base_secrets
         self.mock_user_context.get_latest_token.return_value = 'static_token_value'
@@ -576,7 +654,9 @@ class TestLiveStatusAppConversationService:
         )
 
         # Act
-        result = await self.service._setup_secrets_for_git_providers(self.mock_user)
+        result = await self.service._setup_secrets_for_git_providers(
+            self.mock_user, self.mock_sandbox
+        )
 
         # Assert
         assert 'GITHUB_TOKEN' in result
@@ -593,6 +673,7 @@ class TestLiveStatusAppConversationService:
         """Test _setup_secrets_for_git_providers when no static token is available."""
         # Arrange
         self.service.web_url = None
+        self.mock_sandbox_service.get_control_plane_base_url.return_value = None
         base_secrets = {}
         self.mock_user_context.get_secrets.return_value = base_secrets
         self.mock_user_context.get_latest_token.return_value = None
@@ -606,7 +687,9 @@ class TestLiveStatusAppConversationService:
         )
 
         # Act
-        result = await self.service._setup_secrets_for_git_providers(self.mock_user)
+        result = await self.service._setup_secrets_for_git_providers(
+            self.mock_user, self.mock_sandbox
+        )
 
         # Assert
         assert 'GITHUB_TOKEN' not in result
@@ -631,7 +714,9 @@ class TestLiveStatusAppConversationService:
         )
 
         # Act
-        result = await self.service._setup_secrets_for_git_providers(self.mock_user)
+        result = await self.service._setup_secrets_for_git_providers(
+            self.mock_user, self.mock_sandbox
+        )
 
         # Assert - verify all secrets have correct descriptions
         assert 'GITHUB_TOKEN' in result
@@ -651,6 +736,7 @@ class TestLiveStatusAppConversationService:
         """Test _setup_secrets_for_git_providers includes description for StaticSecret."""
         # Arrange
         self.service.web_url = None
+        self.mock_sandbox_service.get_control_plane_base_url.return_value = None
         base_secrets = {}
         self.mock_user_context.get_secrets.return_value = base_secrets
         self.mock_user_context.get_latest_token.return_value = 'static_token_value'
@@ -665,7 +751,9 @@ class TestLiveStatusAppConversationService:
         )
 
         # Act
-        result = await self.service._setup_secrets_for_git_providers(self.mock_user)
+        result = await self.service._setup_secrets_for_git_providers(
+            self.mock_user, self.mock_sandbox
+        )
 
         # Assert - verify StaticSecret objects have descriptions
         assert 'GITHUB_TOKEN' in result
@@ -707,7 +795,9 @@ class TestLiveStatusAppConversationService:
         )
 
         # Act
-        result = await self.service._setup_secrets_for_git_providers(self.mock_user)
+        result = await self.service._setup_secrets_for_git_providers(
+            self.mock_user, self.mock_sandbox
+        )
 
         # Assert — custom secrets are passed through as-is; descriptions preserved.
         assert 'CUSTOM_API_KEY' in result
@@ -747,7 +837,9 @@ class TestLiveStatusAppConversationService:
         self.mock_jwt_service.create_jws_token.return_value = 'test_access_token'
 
         # Act
-        result = await self.service._setup_secrets_for_git_providers(self.mock_user)
+        result = await self.service._setup_secrets_for_git_providers(
+            self.mock_user, self.mock_sandbox
+        )
 
         # Assert — custom secrets are passed through as-is; empty description preserved
         assert 'MY_SECRET' in result
@@ -1491,7 +1583,7 @@ class TestLiveStatusAppConversationService:
         assert result.workspace.working_dir == '/test/dir/repo'
 
         self.service._setup_secrets_for_git_providers.assert_called_once_with(
-            self.mock_user
+            self.mock_user, self.mock_sandbox
         )
         self.service._configure_llm_and_mcp.assert_called_once_with(
             self.mock_user, 'gpt-4', test_conversation_id
