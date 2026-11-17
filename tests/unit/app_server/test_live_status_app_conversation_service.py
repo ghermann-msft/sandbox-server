@@ -261,6 +261,9 @@ class TestLiveStatusAppConversationService:
         self.mock_sandbox_service = Mock()
         self.mock_sandbox_spec_service = Mock()
         self.mock_app_conversation_info_service = Mock()
+        self.mock_app_conversation_info_service.resolve_organization_id = AsyncMock(
+            return_value=None
+        )
         self.mock_app_conversation_start_task_service = Mock()
         self.mock_event_callback_service = Mock()
         self.mock_event_service = Mock()
@@ -2702,6 +2705,10 @@ class TestLiveStatusAppConversationService:
         from openhands.sdk.settings import ACPAgentSettings
 
         conversation_id = uuid4()
+        organization_id = uuid4()
+        self.mock_app_conversation_info_service.resolve_organization_id = AsyncMock(
+            return_value=organization_id
+        )
 
         self.mock_user_context.get_user_id = AsyncMock(return_value='test_user_123')
         acp_user = _TestUserInfo(
@@ -2768,7 +2775,7 @@ class TestLiveStatusAppConversationService:
         self.mock_app_conversation_info_service.save_app_conversation_info = AsyncMock()
 
         async for _ in self.service._start_app_conversation(
-            AppConversationStartRequest()
+            AppConversationStartRequest(organization_id=organization_id)
         ):
             pass
 
@@ -2778,7 +2785,11 @@ class TestLiveStatusAppConversationService:
         ][0]
         assert saved_info.llm_model == 'gpt-5.5/high'
         assert saved_info.agent_kind == 'acp'
+        assert saved_info.organization_id == organization_id
         assert saved_info.tags.get('acpserver') == 'codex'
+        assert self.mock_httpx_client.post.await_args.kwargs['json'][
+            'organization_id'
+        ] == str(organization_id)
 
     @pytest.mark.asyncio
     async def test_configure_llm_and_mcp_with_custom_remote_servers(self):

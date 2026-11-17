@@ -62,6 +62,11 @@ class AppConversationInfoService(ABC):
             ]
         )
 
+    async def resolve_organization_id(
+        self, requested_organization_id: UUID | None
+    ) -> UUID | None:
+        return requested_organization_id
+
     @abstractmethod
     async def delete_app_conversation_info(self, conversation_id: UUID) -> bool:
         """Delete a conversation info from the database.

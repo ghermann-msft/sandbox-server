@@ -118,6 +118,7 @@ class AppConversationInfo(BaseModel):
     id: OpenHandsUUID = Field(default_factory=uuid4)
 
     created_by_user_id: str | None
+    organization_id: UUID | None = None
     sandbox_id: str
 
     selected_repository: str | None = None
@@ -232,6 +233,7 @@ class AppConversationStartRequest(OpenHandsModel):
     """
 
     sandbox_id: str | None = Field(default=None)
+    organization_id: UUID | None = None
     conversation_id: UUID | None = Field(default=None)
     initial_message: SendMessageRequest | None = None
     system_message_suffix: str | None = None
