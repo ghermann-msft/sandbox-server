@@ -24,6 +24,7 @@ USER root
 COPY --from=p4mcp-builder --chown=root:root /opt/perforce/p4mcp-server /opt/perforce/p4mcp-server
 
 RUN chmod -R a+rX /opt/perforce/p4mcp-server \
+    && chown openhands:openhands /opt/perforce/p4mcp-server/logs \
     && ln -s /opt/perforce/p4mcp-server/p4-mcp-server /usr/local/bin/p4-mcp-server
 
 USER openhands

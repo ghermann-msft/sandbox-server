@@ -35,6 +35,7 @@ def test_perforce_mcp_runtime_image_pins_release_and_non_root_user():
     assert (
         'ln -s /opt/perforce/p4mcp-server/p4-mcp-server /usr/local/bin/p4-mcp-server'
     ) in dockerfile
+    assert ('chown openhands:openhands /opt/perforce/p4mcp-server/logs') in dockerfile
     assert re.findall(r'^USER (.+)$', dockerfile, re.MULTILINE)[-1] == 'openhands'
 
 
