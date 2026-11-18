@@ -77,7 +77,7 @@ from openhands.app_server.config import (
     get_event_callback_service,
     resolve_provider_llm_base_url,
 )
-from openhands.app_server.errors import SandboxError
+from openhands.app_server.errors import SandboxError, SandboxStartupTimeoutError
 from openhands.app_server.event.event_service import EventService
 from openhands.app_server.event_callback.event_callback_models import EventCallback
 from openhands.app_server.event_callback.event_callback_service import (
@@ -98,9 +98,11 @@ from openhands.app_server.sandbox.sandbox_models import (
     SandboxStatus,
 )
 from openhands.app_server.sandbox.sandbox_service import SandboxService
+from openhands.app_server.sandbox.sandbox_spec_models import SandboxOperatingSystem
 from openhands.app_server.sandbox.sandbox_spec_service import (
     SandboxSpecService,
     is_custom_sandbox_spec,
+    resolve_sandbox_spec,
 )
 from openhands.app_server.services.injector import InjectorState
 from openhands.app_server.services.jwt_service import JwtService
@@ -139,7 +141,12 @@ from openhands.sdk.plugin import PluginSource
 from openhands.sdk.secret import LookupSecret, StaticSecret
 from openhands.sdk.settings import ACPAgentSettings
 from openhands.sdk.subagent import get_registered_agent_definitions
+from openhands.sdk.tool import SUB_AGENT_TOOL_NAME
 from openhands.sdk.tool.builtins import SwitchLLMTool
+from openhands.sdk.tool.defaults import (
+    launch_tool_specs,  # type: ignore[attr-defined]
+    selects_tool,  # type: ignore[attr-defined]
+)
 from openhands.sdk.utils.redact import (
     redact_api_key_literals,
     redact_text_secrets,
@@ -147,7 +154,6 @@ from openhands.sdk.utils.redact import (
 )
 from openhands.sdk.workspace.remote.async_remote_workspace import AsyncRemoteWorkspace
 from openhands.tools.preset.default import (
-    get_default_tools,
     register_builtins_agents,
 )
 from openhands.tools.preset.planning import (
@@ -331,6 +337,7 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
     jwt_service: JwtService
     pending_message_service: PendingMessageService
     sandbox_startup_timeout: int
+    sandbox_startup_inactivity_timeout: int
     sandbox_startup_poll_frequency: int
     max_num_conversations_per_sandbox: int
     httpx_client: httpx.AsyncClient
@@ -490,7 +497,7 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
 
             # Get the working dir
             sandbox_spec = await self.sandbox_spec_service.get_sandbox_spec(
-                sandbox.sandbox_spec_id
+                sandbox.sandbox_spec_id, include_unavailable=True
             )
             assert sandbox_spec is not None
 
@@ -503,6 +510,11 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
                 sandbox_spec.working_dir,
                 sandbox_grouping_strategy,
                 conversation_id.hex,
+                getattr(
+                    sandbox_spec,
+                    'operating_system',
+                    SandboxOperatingSystem.LINUX,
+                ),
             )
 
             initial_env = getattr(sandbox_spec, 'initial_env', {})
@@ -680,6 +692,7 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
                 organization_id=organization_id,
                 title=f'Conversation {info.id.hex[:5]}',
                 sandbox_id=sandbox.id,
+                sandbox_spec_id=sandbox.sandbox_spec_id,
                 created_by_user_id=user_id,
                 llm_model=llm_model,
                 agent_kind=agent_kind,
@@ -873,7 +886,9 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
                 result[stored_conversation.sandbox_id].append(stored_conversation.id)
         return result
 
-    async def _find_running_sandbox_for_user(self) -> SandboxInfo | None:
+    async def _find_running_sandbox_for_user(
+        self, sandbox_spec_id: str
+    ) -> SandboxInfo | None:
         """Find a running sandbox for the current user based on the grouping strategy.
 
         Returns:
@@ -899,6 +914,7 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
                     if (
                         sandbox.status == SandboxStatus.RUNNING
                         and sandbox.created_by_user_id == user_id
+                        and sandbox.sandbox_spec_id == sandbox_spec_id
                     ):
                         running_sandboxes.append(sandbox)
 
@@ -1007,10 +1023,19 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
         self, task: AppConversationStartTask
     ) -> AsyncGenerator[AppConversationStartTask, None]:
         """Wait for sandbox to start and return info."""
+        created_sandbox = False
+        sandbox_spec = None
         # Get or create the sandbox
         if not task.request.sandbox_id:
+            requested_spec = await resolve_sandbox_spec(
+                task.request.sandbox_spec_id,
+                await self.user_context.get_default_sandbox_spec_id(),
+                self.sandbox_spec_service,
+                _logger,
+            )
+            task.request.sandbox_spec_id = requested_spec.id
             # First try to find a running sandbox for the current user
-            sandbox = await self._find_running_sandbox_for_user()
+            sandbox = await self._find_running_sandbox_for_user(requested_spec.id)
             if sandbox is None:
                 # No running sandbox found, start a new one
 
@@ -1022,8 +1047,11 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
                 )
 
                 sandbox = await self.sandbox_service.start_sandbox(
-                    sandbox_id=sandbox_id_str
+                    sandbox_spec_id=requested_spec.id,
+                    sandbox_id=sandbox_id_str,
                 )
+                created_sandbox = True
+            sandbox_spec = requested_spec
             task.sandbox_id = sandbox.id
         else:
             sandbox_info = await self.sandbox_service.get_sandbox(
@@ -1031,7 +1059,20 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
             )
             if sandbox_info is None:
                 raise SandboxError(f'Sandbox not found: {task.request.sandbox_id}')
+            if (
+                task.request.sandbox_spec_id is not None
+                and sandbox_info.sandbox_spec_id != task.request.sandbox_spec_id
+            ):
+                raise SandboxError(
+                    f'Sandbox {task.request.sandbox_id} uses execution profile '
+                    f'{sandbox_info.sandbox_spec_id!r}, not requested profile '
+                    f'{task.request.sandbox_spec_id!r}'
+                )
             sandbox = sandbox_info
+            task.request.sandbox_spec_id = sandbox.sandbox_spec_id
+            sandbox_spec = await self.sandbox_spec_service.get_sandbox_spec(
+                sandbox.sandbox_spec_id, include_unavailable=True
+            )
 
         # Update the listener with sandbox info
         task.status = AppConversationStartTaskStatus.WAITING_FOR_SANDBOX
@@ -1068,13 +1109,43 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
         ):
             raise SandboxError(f'Sandbox not startable: {sandbox.id}')
 
-        # Use shared wait_for_sandbox_running utility to poll for ready state
-        await self.sandbox_service.wait_for_sandbox_running(
-            sandbox.id,
-            timeout=self.sandbox_startup_timeout,
-            poll_interval=self.sandbox_startup_poll_frequency,
-            httpx_client=self.httpx_client,
+        # The profile timeout is the absolute safety ceiling. Observable runtime
+        # progress refreshes the shorter inactivity deadline.
+        startup_timeout = (
+            sandbox_spec.startup_timeout_seconds
+            if sandbox_spec is not None
+            and sandbox_spec.startup_timeout_seconds is not None
+            else self.sandbox_startup_timeout
         )
+        try:
+            async for progress in self.sandbox_service.watch_sandbox_startup(
+                sandbox.id,
+                timeout=startup_timeout,
+                inactivity_timeout=min(
+                    self.sandbox_startup_inactivity_timeout,
+                    startup_timeout,
+                ),
+                poll_interval=self.sandbox_startup_poll_frequency,
+                httpx_client=self.httpx_client,
+            ):
+                task.sandbox_startup_progress = progress
+                yield task
+        except SandboxStartupTimeoutError:
+            if created_sandbox:
+                try:
+                    deleted = await self.sandbox_service.delete_sandbox(sandbox.id)
+                    if not deleted:
+                        _logger.warning(
+                            'Timed-out sandbox %s was already absent during cleanup',
+                            sandbox.id,
+                        )
+                except Exception:
+                    _logger.exception(
+                        'Failed to clean up timed-out sandbox %s',
+                        sandbox.id,
+                        stack_info=True,
+                    )
+            raise
 
     async def _initialize_agent_server(
         self,
@@ -1305,9 +1376,16 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
             request: The conversation start request to modify
             parent_info: The parent conversation info to inherit from
         """
-        # Inherit sandbox_id from parent to share the same workspace/environment
-        if not request.sandbox_id:
+        # Share the parent sandbox only when the caller did not explicitly select
+        # a different execution profile. A different profile requires a distinct
+        # compatible sandbox.
+        if not request.sandbox_id and (
+            not request.sandbox_spec_id
+            or request.sandbox_spec_id == parent_info.sandbox_spec_id
+        ):
             request.sandbox_id = parent_info.sandbox_id
+            if not request.sandbox_spec_id:
+                request.sandbox_spec_id = parent_info.sandbox_spec_id
 
         # Inherit git parameters from parent if not provided
         if not request.selected_repository:
@@ -2297,11 +2375,11 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
             tools = get_planning_tools(plan_path=plan_path)
         else:
             register_builtins_agents(enable_browser=True)
-            tools = get_default_tools(
-                enable_browser=True,
-                enable_sub_agents=user.agent_settings.enable_sub_agents,
+            tools = launch_tool_specs(
+                user.agent_settings.tools,
+                browser_available=True,
             )
-            if user.agent_settings.enable_sub_agents:
+            if selects_tool(tools, SUB_AGENT_TOOL_NAME):
                 agent_definitions = list(get_registered_agent_definitions())
 
         # --- build AgentSettings and create agent ---------------------------
@@ -3265,7 +3343,20 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
 
 class LiveStatusAppConversationServiceInjector(AppConversationServiceInjector):
     sandbox_startup_timeout: int = Field(
-        default=120, description='The max timeout time for sandbox startup'
+        default=120,
+        gt=0,
+        description=(
+            'Legacy absolute sandbox startup safety limit when the selected '
+            'execution profile has no startup_timeout_seconds'
+        ),
+    )
+    sandbox_startup_inactivity_timeout: int = Field(
+        default=120,
+        gt=0,
+        description=(
+            'Maximum seconds without verifiable sandbox startup progress before '
+            'the start fails'
+        ),
     )
     sandbox_startup_poll_frequency: int = Field(
         default=2, description='The frequency to poll for sandbox readiness'
@@ -3380,6 +3471,9 @@ class LiveStatusAppConversationServiceInjector(AppConversationServiceInjector):
                 jwt_service=jwt_service,
                 pending_message_service=pending_message_service,
                 sandbox_startup_timeout=self.sandbox_startup_timeout,
+                sandbox_startup_inactivity_timeout=(
+                    self.sandbox_startup_inactivity_timeout
+                ),
                 sandbox_startup_poll_frequency=self.sandbox_startup_poll_frequency,
                 max_num_conversations_per_sandbox=self.max_num_conversations_per_sandbox,
                 httpx_client=httpx_client,

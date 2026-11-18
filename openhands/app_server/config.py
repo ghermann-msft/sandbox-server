@@ -214,6 +214,14 @@ class AppServerConfig(OpenHandsModel):
             'Falls back to legacy PERMITTED_CORS_ORIGINS env var.'
         ),
     )
+    execution_profile_admin_user_ids: list[str] = Field(
+        default_factory=list,
+        description=(
+            'User ids allowed to manage global execution profiles. Configure via '
+            'OH_EXECUTION_PROFILE_ADMIN_USER_IDS_0, _1, etc. Single-user OSS '
+            'mode treats its anonymous local user as the administrator.'
+        ),
+    )
     openhands_provider_base_url: str | None = Field(
         default_factory=get_openhands_provider_base_url,
         description='Base URL for the OpenHands provider',

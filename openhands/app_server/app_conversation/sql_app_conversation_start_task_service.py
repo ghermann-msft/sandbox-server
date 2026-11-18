@@ -40,6 +40,7 @@ from openhands.app_server.app_conversation.app_conversation_start_task_service i
     AppConversationStartTaskService,
     AppConversationStartTaskServiceInjector,
 )
+from openhands.app_server.sandbox.sandbox_models import SandboxStartupProgress
 from openhands.app_server.services.injector import InjectorState
 from openhands.app_server.utils.sql_utils import (
     Base,
@@ -63,6 +64,9 @@ class StoredAppConversationStartTask(Base):
     app_conversation_id: Mapped[UUID | None] = mapped_column(nullable=True)
     sandbox_id: Mapped[str | None] = mapped_column(String, nullable=True)
     agent_server_url: Mapped[str | None] = mapped_column(String, nullable=True)
+    sandbox_startup_progress: Mapped[SandboxStartupProgress | None] = mapped_column(
+        create_json_type_decorator(SandboxStartupProgress), nullable=True
+    )
     request: Mapped[AppConversationStartRequest] = mapped_column(
         create_json_type_decorator(AppConversationStartRequest)
     )

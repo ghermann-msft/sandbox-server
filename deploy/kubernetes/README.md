@@ -58,6 +58,74 @@ conversation secrets; keep plaintext `P4PORT`, `P4USER`, and `P4PASSWD` out of
 manifests. The redistribution notice is in
 `containers/sandbox/PERFORCE-NOTICE.txt`.
 
+Execution profiles are enforced at claim creation:
+
+- The selected profile chooses a `SandboxWarmPool`, whose
+  `sandboxTemplateRef` must match the profile's `template_name`.
+- The claim overrides the template's `workspace` volume claim with the profile's
+  workspace storage class and size. Templates must set
+  `volumeClaimTemplatesPolicy: Overrides`.
+- The durable Azure Files PVC, container image, resource requests/limits, mount
+  roots, node selector, and tolerations are validated against the selected
+  template before a claim is created. A mismatch fails explicitly instead of
+  launching a sandbox with different infrastructure than the profile describes.
+
+The bundled Linux and Windows templates mount the existing Halo Azure Files PVC
+`openhands-halo-conversations`. To use another PVC or storage class, update the
+template and seed the matching profile fields together (the profile can be seeded
+with `OH_HALO_DURABLE_STATE_PVC` and `OH_HALO_DURABLE_STORAGE_CLASS`). Changing
+only the profile is rejected at sandbox creation.
+
+Linux mounts the sandbox's Azure Files directory at `/openhands` with
+`subPathExpr: $(OH_SANDBOX_ID)`. Kubernetes Windows containers do not support
+volume subPath mounts, so Windows mounts the whole share at `C:\OpenHands` and
+the app server expands `{sandbox_id}` into the conversations, bash-events, and
+persistence environment paths. This preserves deterministic per-sandbox
+directories without relying on an unsupported Windows mount feature.
+
+The global legacy startup safety limit is configured with
+`OH_APP_CONVERSATION_SANDBOX_STARTUP_TIMEOUT` (120 seconds by default). Curated
+profiles override that absolute ceiling with `startup_timeout_seconds`; the
+bundled Linux profile uses 300 seconds and Windows uses 600 seconds. The
+independent inactivity deadline is configured with
+`OH_APP_CONVERSATION_SANDBOX_STARTUP_INACTIVITY_TIMEOUT` (120 seconds by
+default). Authoritative Kubernetes progress refreshes only the inactivity
+deadline; it never extends the profile's absolute ceiling. Node warm capacity
+and image pre-pull remain the primary cold-start mitigation.
+
+Conversation start tasks expose `sandbox_startup_progress` while status is
+`WAITING_FOR_SANDBOX`. The object contains:
+
+- `phase`: `WAITING_FOR_CAPACITY`, `PROVISIONING_NODE`, `SCHEDULING`,
+  `PROVISIONING_STORAGE`, `PULLING_IMAGE`, `STARTING_CONTAINER`,
+  `WAITING_FOR_AGENT_SERVER`, `READY`, or `FAILED`.
+- `status`: `PROGRESSING`, `READY`, or `FAILED`.
+- Sanitized `message` and stable `reason` values suitable for display and
+  branching. Raw event messages, registry names, node labels, secret names, and
+  volume paths are not serialized.
+- `started_at`, `updated_at`, `phase_started_at`, `elapsed_seconds`,
+  `phase_elapsed_seconds`, and `inactivity_seconds`.
+
+The same `AppConversationStartTask` shape is emitted item-by-item by
+`POST /app-conversations/stream-start` and persisted for
+`GET /app-conversations/start-tasks/search` and the task lookup endpoints.
+
+The app server observes SandboxClaim/Sandbox conditions and their owned Pod/PVC
+resources plus Kubernetes events. Repeated copies of the same scheduler event do
+not count as progress. Autoscaler activation, scheduling, PVC phase changes,
+image pull, container state, and readiness transitions do. Deterministic
+scheduler constraints and terminal image/storage/container failures fail
+immediately with a sanitized task detail containing the sandbox reference ID.
+
+The default Linux image extends the matching OpenHands agent-server release with the
+official Perforce CLI and MCP server described above.
+
+The Windows profile accepts any digest-pinned registry reference matching the
+runtime contract. Halo publishes its image as
+`ghcr.io/ghermann-msft/agent-server:<sha>-windows-ltsc2025-amd64@sha256:<digest>`;
+the same exact reference must be present in both the profile and Windows
+SandboxTemplate before the profile is marked available.
+
 ### Reaching sandboxes from a browser
 
 The default `sandbox_url_pattern` is cluster-internal, which is right when the app

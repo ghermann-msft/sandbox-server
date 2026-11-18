@@ -4,7 +4,30 @@ This module tests environment variable handling in DefaultWebClientConfigInjecto
 """
 
 import os
+from types import SimpleNamespace
 from unittest.mock import patch
+
+
+def test_acp_provider_without_legacy_model_fields_is_supported():
+    from openhands.app_server.web_client import default_web_client_config_injector
+
+    provider = SimpleNamespace(
+        key='test',
+        display_name='Test',
+        default_command=('test-agent',),
+        api_key_env_var=None,
+        base_url_env_var=None,
+    )
+    with patch.object(
+        default_web_client_config_injector,
+        'ACP_PROVIDERS',
+        {'test': provider},
+    ):
+        injector = default_web_client_config_injector.DefaultWebClientConfigInjector()
+
+    assert len(injector.acp_providers) == 1
+    assert injector.acp_providers[0].default_model is None
+    assert injector.acp_providers[0].available_models == []
 
 
 class TestGetPosthogClientKey:
@@ -638,6 +661,58 @@ class TestGetGithubAppSlug:
         with patch.dict(os.environ, {'GITHUB_APP_SLUG': '   '}):
             result = _get_github_app_slug()
             assert result is None
+
+
+def test_github_oauth_feature_flags_require_complete_configuration():
+    from openhands.app_server.integrations.service_types import ProviderType
+    from openhands.app_server.web_client.default_web_client_config_injector import (
+        _get_feature_flags,
+        _get_providers_configured,
+    )
+
+    with patch.dict(
+        os.environ,
+        {
+            'GITHUB_APP_CLIENT_ID': 'client-id',
+            'GITHUB_APP_CLIENT_SECRET': 'client-secret',
+            'GITHUB_APP_SLUG': 'halo-app',
+            'OH_GITHUB_OAUTH_CALLBACK_URL': (
+                'https://halo.example/oauth/github/callback'
+            ),
+            'OH_GITHUB_OAUTH_SUCCESS_URL': (
+                'https://halo.example/settings/integrations'
+            ),
+        },
+        clear=True,
+    ):
+        flags = _get_feature_flags()
+        providers_configured = _get_providers_configured()
+
+    assert flags.enable_canvas_integrations is True
+    assert flags.enable_oauth_v2_login is True
+    assert ProviderType.GITHUB in providers_configured
+    assert (
+        flags.github_app_install_url
+        == 'https://github.com/apps/halo-app/installations/new'
+    )
+
+    with patch.dict(
+        os.environ,
+        {
+            'GITHUB_APP_CLIENT_ID': 'client-id',
+            'GITHUB_APP_CLIENT_SECRET': 'client-secret',
+            'GITHUB_APP_SLUG': 'halo-app',
+            'OH_GITHUB_OAUTH_CALLBACK_URL': (
+                'https://halo.example/oauth/github/callback'
+            ),
+        },
+        clear=True,
+    ):
+        incomplete_flags = _get_feature_flags()
+
+    assert incomplete_flags.enable_canvas_integrations is False
+    assert incomplete_flags.enable_oauth_v2_login is False
+    assert incomplete_flags.github_app_install_url is None
 
 
 class TestIsGitlabEnabled:

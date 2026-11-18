@@ -4,6 +4,8 @@ This module tests the batch_get_app_conversations endpoint,
 focusing on UUID string parsing, validation, and error handling.
 """
 
+import asyncio
+import contextlib
 import json
 from unittest.mock import AsyncMock, MagicMock, patch
 from uuid import uuid4
@@ -17,6 +19,7 @@ from openhands.app_server.app_conversation.app_conversation_models import (
     AppConversation,
     AppConversationInfo,
     AppConversationPage,
+    AppConversationStartRequest,
     SwitchProfileRequest,
 )
 from openhands.app_server.app_conversation.app_conversation_router import (
@@ -27,11 +30,13 @@ from openhands.app_server.app_conversation.app_conversation_router import (
     get_conversation_git_changes,
     get_conversation_git_diff,
     search_app_conversations,
+    start_app_conversation,
     switch_conversation_profile,
 )
 from openhands.app_server.sandbox.sandbox_models import SandboxStatus
 from openhands.app_server.settings.llm_profiles import LLMProfiles
 from openhands.app_server.settings.settings_models import Settings
+from openhands.app_server.user.specifiy_user_context import USER_CONTEXT_ATTR
 from openhands.sdk.llm import LLM
 from openhands.sdk.settings import OpenHandsAgentSettings
 
@@ -67,6 +72,89 @@ def _make_mock_service(
     )
     service.count_app_conversations = AsyncMock(return_value=count_return)
     return service
+
+
+async def test_start_continuation_owns_its_dependency_scope():
+    continue_start = asyncio.Event()
+    background_finished = asyncio.Event()
+    request_session = MagicMock(closed=False)
+    background_session = MagicMock(closed=False)
+
+    async def close_request_session():
+        request_session.closed = True
+
+    async def close_background_session():
+        background_session.closed = True
+
+    request_session.close = AsyncMock(side_effect=close_request_session)
+    background_session.close = AsyncMock(side_effect=close_background_session)
+    user_context = AsyncMock()
+    user_context.get_user_id.return_value = None
+    user_context.get_authentication_identity.return_value = None
+    start_task = MagicMock(app_conversation_id=None, id='task-id', status='WORKING')
+
+    service = MagicMock()
+
+    async def start(_request):
+        yield start_task
+        await continue_start.wait()
+        assert not background_session.closed
+        start_task.status = 'ERROR'
+        background_finished.set()
+        yield start_task
+
+    service.start_app_conversation = start
+    context_exited = asyncio.Event()
+
+    @contextlib.asynccontextmanager
+    async def service_context(state):
+        assert getattr(state, USER_CONTEXT_ATTR) is user_context
+        try:
+            yield service
+        finally:
+            await background_session.close()
+            context_exited.set()
+
+    created_tasks = []
+    real_create_task = asyncio.create_task
+
+    def capture_task(coro):
+        task = real_create_task(coro)
+        created_tasks.append(task)
+        return task
+
+    with (
+        patch(
+            'openhands.app_server.app_conversation.app_conversation_router.get_app_conversation_service',
+            service_context,
+        ),
+        patch(
+            'openhands.app_server.app_conversation.app_conversation_router.get_analytics_service',
+            return_value=None,
+        ),
+        patch(
+            'openhands.app_server.app_conversation.app_conversation_router.asyncio.create_task',
+            side_effect=capture_task,
+        ),
+    ):
+        result = await start_app_conversation(
+            start_request=AppConversationStartRequest(),
+            user_context=user_context,
+        )
+
+    assert result is start_task
+    await request_session.close()
+    assert request_session.closed
+    assert not background_session.closed
+    assert not context_exited.is_set()
+    continue_start.set()
+    await created_tasks[0]
+
+    request_session.close.assert_awaited_once()
+    assert background_finished.is_set()
+    assert start_task.status == 'ERROR'
+    assert background_session.closed
+    assert context_exited.is_set()
 
 
 @pytest.mark.asyncio

@@ -15,3 +15,15 @@ spec:
   replicas: 0
   sandboxTemplateRef:
     name: openhands-agent-server
+---
+# Zero replicas is intentional: claims inject per-sandbox environment, so this
+# pool is a template/claim selector rather than a pre-warmed pod cache.
+apiVersion: extensions.agents.x-k8s.io/v1beta1
+kind: SandboxWarmPool
+metadata:
+  name: windows-server-2025-amd64
+  namespace: default
+spec:
+  replicas: 0
+  sandboxTemplateRef:
+    name: openhands-agent-server-windows-2025

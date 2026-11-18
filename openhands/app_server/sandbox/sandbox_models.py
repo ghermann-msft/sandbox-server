@@ -15,6 +15,37 @@ class SandboxStatus(Enum):
     """Missing - possibly deleted"""
 
 
+class SandboxStartupPhase(str, Enum):
+    WAITING_FOR_CAPACITY = 'WAITING_FOR_CAPACITY'
+    PROVISIONING_NODE = 'PROVISIONING_NODE'
+    SCHEDULING = 'SCHEDULING'
+    PROVISIONING_STORAGE = 'PROVISIONING_STORAGE'
+    PULLING_IMAGE = 'PULLING_IMAGE'
+    STARTING_CONTAINER = 'STARTING_CONTAINER'
+    WAITING_FOR_AGENT_SERVER = 'WAITING_FOR_AGENT_SERVER'
+    READY = 'READY'
+    FAILED = 'FAILED'
+
+
+class SandboxStartupProgressStatus(str, Enum):
+    PROGRESSING = 'PROGRESSING'
+    READY = 'READY'
+    FAILED = 'FAILED'
+
+
+class SandboxStartupProgress(BaseModel):
+    phase: SandboxStartupPhase
+    status: SandboxStartupProgressStatus
+    message: str
+    reason: str | None = None
+    started_at: datetime
+    updated_at: datetime
+    phase_started_at: datetime
+    elapsed_seconds: int = Field(ge=0)
+    phase_elapsed_seconds: int = Field(ge=0)
+    inactivity_seconds: int = Field(ge=0)
+
+
 class ExposedUrl(BaseModel):
     """URL to access some named service within the container."""
 
