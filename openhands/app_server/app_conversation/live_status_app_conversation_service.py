@@ -7,7 +7,7 @@ import logging
 import re
 import zipfile
 from collections import defaultdict
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any, AsyncGenerator, BinaryIO, Sequence, cast
@@ -141,7 +141,7 @@ from openhands.sdk.llm import LLM
 from openhands.sdk.llm.llm_profile_store import PROFILE_NAME_REGEX
 from openhands.sdk.mcp.config import MCPServer
 from openhands.sdk.plugin import PluginSource
-from openhands.sdk.secret import LookupSecret, SecretSource, StaticSecret
+from openhands.sdk.secret import LookupSecret, StaticSecret
 from openhands.sdk.settings import ACPAgentSettings
 from openhands.sdk.subagent import get_registered_agent_definitions
 from openhands.sdk.tool import SUB_AGENT_TOOL_NAME
@@ -170,30 +170,39 @@ _logger = logging.getLogger(__name__)
 _EXPORT_LOCK_KEY_PREFIX = 'app_conversation_export'
 _PERFORCE_SECRET_ENV_VARS = ('P4PORT', 'P4USER', 'P4PASSWD')
 _SECRET_REFERENCE_PATTERN = re.compile(r'^\$\{[A-Za-z_][A-Za-z0-9_]*\}$')
-_COPILOT_GITHUB_TOKEN_SECRET = 'COPILOT_GITHUB_TOKEN'
 
 
-def add_copilot_github_token_secret(
-    agent_settings: Any,
-    secrets: dict[str, SecretSource],
-    provider_tokens: PROVIDER_TOKEN_TYPE | None,
-) -> None:
-    """Add the effective GitHub OAuth token only to Copilot ACP launches."""
+def should_forward_provider_token_to_acp(
+    agent_settings: Any, provider_type: ProviderType
+) -> bool:
+    """Copilot ACP authentication comes only from its explicit PAT secret."""
 
-    if (
-        not isinstance(agent_settings, ACPAgentSettings)
-        or agent_settings.acp_server != 'copilot-cli'
-        or _COPILOT_GITHUB_TOKEN_SECRET in secrets
-        or not provider_tokens
-    ):
-        return
-    github_token = provider_tokens.get(ProviderType.GITHUB)
-    if github_token is None or github_token.token is None:
-        return
-    secrets[_COPILOT_GITHUB_TOKEN_SECRET] = StaticSecret(
-        value=github_token.token,
-        description='Effective GitHub OAuth token for Copilot CLI',
+    return not (
+        isinstance(agent_settings, ACPAgentSettings)
+        and agent_settings.acp_server == 'copilot-cli'
+        and provider_type == ProviderType.GITHUB
     )
+
+
+async def add_acp_provider_token_secrets(
+    agent_settings: Any,
+    secrets: dict[str, Any],
+    provider_tokens: PROVIDER_TOKEN_TYPE | None,
+    get_latest_token: Callable[[ProviderType], Awaitable[str | None]],
+) -> None:
+    if not provider_tokens:
+        return
+    for provider_type, provider_token in provider_tokens.items():
+        if not provider_token.token or not should_forward_provider_token_to_acp(
+            agent_settings, provider_type
+        ):
+            continue
+        static_token = await get_latest_token(provider_type)
+        if static_token:
+            secrets[f'{provider_type.name}_TOKEN'] = StaticSecret(
+                value=SecretStr(static_token),
+                description=f'{provider_type.name} authentication token',
+            )
 
 
 def _resolve_title_llm_profile(user: UserInfo) -> str | None:
@@ -2724,28 +2733,17 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
         # causing provider auth to silently fail at subprocess launch.
         # Use raw custom secrets, static git provider tokens, and static
         # integration-scoped secrets for ACP conversations.
-        secrets: dict[str, SecretSource] = await self.user_context.get_secrets()
+        secrets: dict = await self.user_context.get_secrets()
         provider_tokens = cast(
             PROVIDER_TOKEN_TYPE | None,
             await self.user_context.get_provider_tokens(),
         )
-        if provider_tokens:
-            for provider_type, provider_token in provider_tokens.items():
-                if not provider_token.token:
-                    continue
-                secret_name = f'{provider_type.name}_TOKEN'
-                static_token = await self.user_context.get_latest_token(provider_type)
-                if static_token:
-                    secrets[secret_name] = StaticSecret(
-                        value=SecretStr(static_token),
-                        description=f'{provider_type.name} authentication token',
-                    )
-        add_copilot_github_token_secret(
+        await add_acp_provider_token_secrets(
             user.agent_settings,
             secrets,
             provider_tokens,
+            self.user_context.get_latest_token,
         )
-
         enrichment = await self.conversation_secret_enricher.enrich(
             user_context=self.user_context,
             user=user,
