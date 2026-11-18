@@ -9,6 +9,9 @@ from alembic import command
 from alembic.config import Config
 
 from openhands.app_server.app_lifespan.app_lifespan_service import AppLifespanService
+from openhands.app_server.organization.agent_profile_service import (
+    get_organization_agent_profile_seeds,
+)
 from openhands.app_server.organization.organization_service import (
     bootstrap_organization_from_env,
 )
@@ -23,6 +26,7 @@ class OssAppLifespanService(AppLifespanService):
     run_alembic_on_startup: bool = True
 
     async def __aenter__(self):
+        get_organization_agent_profile_seeds()
         if self.run_alembic_on_startup:
             self.run_alembic()
             from openhands.app_server.config import get_global_config

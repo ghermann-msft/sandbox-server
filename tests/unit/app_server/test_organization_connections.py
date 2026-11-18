@@ -1,10 +1,10 @@
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from unittest.mock import AsyncMock, MagicMock, patch
-from uuid import UUID, uuid4
+from uuid import UUID, uuid4, uuid5
 
 import pytest
-from pydantic import SecretStr
+from pydantic import SecretStr, ValidationError
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.pool import StaticPool
@@ -12,10 +12,13 @@ from sqlalchemy.pool import StaticPool
 from openhands.app_server.errors import PermissionsError
 from openhands.app_server.integrations.provider import ProviderToken
 from openhands.app_server.organization.agent_profile_models import (
+    OrganizationAgentProfileSeeds,
     StoredOrganizationAgentProfiles,
 )
+from openhands.app_server.organization.agent_profile_router import save_agent_profile
 from openhands.app_server.organization.agent_profile_service import (
     OrganizationAgentProfileService,
+    get_organization_agent_profile_seeds,
 )
 from openhands.app_server.organization.connection_models import (
     MCPConnectionUpsert,
@@ -54,7 +57,7 @@ from openhands.app_server.settings.sql_settings_store import StoredUserSettings
 from openhands.app_server.user.auth_user_context import AuthUserContext
 from openhands.app_server.user.specifiy_user_context import SpecifyUserContext
 from openhands.app_server.utils.encryption_key import EncryptionKey
-from openhands.app_server.utils.sql_utils import Base
+from openhands.app_server.utils.sql_utils import Base, UtcDateTime
 from openhands.sdk.mcp.config import MCPServer
 from openhands.sdk.profiles import validate_agent_profile
 from openhands.sdk.settings import ACPAgentSettings
@@ -706,6 +709,153 @@ async def test_agent_profiles_are_scoped_durable_and_member_read_only(db_session
     deleted = await owner.delete(organization_id, 'copilot-renamed')
     assert deleted.active is None
     assert deleted.profiles == {}
+
+
+def _agent_profile_seeds() -> OrganizationAgentProfileSeeds:
+    return OrganizationAgentProfileSeeds.model_validate(
+        {
+            'profiles': {
+                'codex': {
+                    'agent_kind': 'acp',
+                    'acp_server': 'codex',
+                    'acp_prompt_timeout': 1800,
+                    'acp_startup_timeout': 90,
+                },
+                'default': {
+                    'agent_kind': 'openhands',
+                    'llm_profile_ref': 'default',
+                },
+            },
+            'active_profile': 'codex',
+        }
+    )
+
+
+@pytest.mark.asyncio
+async def test_agent_profile_seeds_initialize_missing_durable_state(db_session):
+    organization_id = await _add_shared_membership(
+        db_session, 'owner', OrganizationRole.OWNER
+    )
+    service = OrganizationAgentProfileService(
+        db_session,
+        _context('owner', organization_id),
+        seeds=_agent_profile_seeds(),
+    )
+
+    profiles = await service.load(organization_id)
+
+    expected_codex_id = str(uuid5(organization_id, 'codex'))
+    assert {profile.name for profile in profiles.profiles.values()} == {
+        'codex',
+        'default',
+    }
+    assert profiles.active == expected_codex_id
+    assert profiles.profiles[expected_codex_id].acp_server == 'codex'
+    row = await db_session.get(StoredOrganizationAgentProfiles, organization_id)
+    assert row is not None
+    assert AgentProfiles.model_validate_json(row.payload) == profiles
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('existing_profiles', [AgentProfiles(), None])
+async def test_agent_profile_seeds_preserve_existing_durable_state(
+    db_session,
+    existing_profiles,
+):
+    organization_id = await _add_shared_membership(
+        db_session, 'owner', OrganizationRole.OWNER
+    )
+    if existing_profiles is None:
+        existing_profiles = AgentProfiles()
+        custom = validate_agent_profile(
+            {
+                'name': 'custom',
+                'agent_kind': 'acp',
+                'acp_server': 'codex',
+            }
+        )
+        existing_profiles.save(custom)
+    user = await db_session.scalar(
+        select(StoredUser).where(StoredUser.subject_id == 'owner')
+    )
+    assert user is not None
+    db_session.add(
+        StoredOrganizationAgentProfiles(
+            organization_id=organization_id,
+            payload=existing_profiles.model_dump_json(),
+            created_by_user_id=user.id,
+            updated_by_user_id=user.id,
+        )
+    )
+    await db_session.flush()
+    service = OrganizationAgentProfileService(
+        db_session,
+        _context('owner', organization_id),
+        seeds=_agent_profile_seeds(),
+    )
+
+    loaded = await service.load(organization_id)
+
+    assert loaded == existing_profiles
+
+
+def test_invalid_agent_profile_seed_configuration_surfaces(monkeypatch):
+    monkeypatch.setenv(
+        'OH_ORGANIZATION_AGENT_PROFILE_SEEDS_JSON',
+        '{"profiles":{"codex":{"agent_kind":"acp","acp_server":"invalid"}},"active_profile":"codex"}',
+    )
+    get_organization_agent_profile_seeds.cache_clear()
+
+    with pytest.raises(ValidationError):
+        get_organization_agent_profile_seeds()
+
+    get_organization_agent_profile_seeds.cache_clear()
+
+
+def test_agent_profile_seed_configuration_is_parsed_once(monkeypatch):
+    monkeypatch.setenv(
+        'OH_ORGANIZATION_AGENT_PROFILE_SEEDS_JSON',
+        '{"profiles":{"codex":{"agent_kind":"acp","acp_server":"codex"}},"active_profile":"codex"}',
+    )
+    get_organization_agent_profile_seeds.cache_clear()
+    parsed = get_organization_agent_profile_seeds()
+    monkeypatch.setenv('OH_ORGANIZATION_AGENT_PROFILE_SEEDS_JSON', 'invalid')
+
+    assert get_organization_agent_profile_seeds() is parsed
+
+    get_organization_agent_profile_seeds.cache_clear()
+
+
+@pytest.mark.asyncio
+async def test_first_agent_profile_api_save_creates_durable_row(db_session):
+    organization_id = await _add_shared_membership(
+        db_session, 'owner', OrganizationRole.OWNER
+    )
+    response = await save_agent_profile(
+        name='codex',
+        body={
+            'agent_kind': 'acp',
+            'acp_server': 'codex',
+            'acp_prompt_timeout': 1800,
+            'acp_startup_timeout': 90,
+        },
+        db_session=db_session,
+        user_context=_context('owner', organization_id),
+    )
+
+    row = await db_session.get(StoredOrganizationAgentProfiles, organization_id)
+    assert row is not None
+    assert response.name == 'codex'
+    assert AgentProfiles.model_validate_json(row.payload).load('codex').acp_server == (
+        'codex'
+    )
+
+
+def test_agent_profile_timestamps_use_utc_server_defaults():
+    for column_name in ('created_at', 'updated_at'):
+        column = StoredOrganizationAgentProfiles.__table__.c[column_name]
+        assert isinstance(column.type, UtcDateTime)
+        assert column.server_default is not None
 
 
 @pytest.mark.asyncio

@@ -150,6 +150,28 @@ Owners and admins can update shared-organization roles. Personal-organization
 roles are immutable, and the final owner of a shared organization cannot be
 demoted. Identity provider, tenant, and subject identifiers are response-only.
 
+Deployments can initialize organization Agent Profiles by setting
+`OH_ORGANIZATION_AGENT_PROFILE_SEEDS_JSON` to one JSON object with a
+name-keyed `profiles` map and an `active_profile` name:
+
+```json
+{
+  "profiles": {
+    "default": {
+      "agent_kind": "openhands",
+      "llm_profile_ref": "default"
+    }
+  },
+  "active_profile": "default"
+}
+```
+
+Each map value is the same profile body accepted by
+`POST /api/v1/agent-profiles/{name}`; names, stable IDs, and revisions remain
+server-managed. The configuration is validated once at startup and seeds an
+organization only when no durable Agent Profile row exists. An existing row,
+including an explicitly empty one, is never replaced.
+
 Self-hosted deployments advertise Canvas integration settings through
 `feature_flags.enable_canvas_integrations` in `GET /api/v1/web-client/config`.
 Set `ENABLE_CANVAS_INTEGRATIONS=false` to hide them explicitly.

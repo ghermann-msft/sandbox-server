@@ -1,19 +1,25 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from uuid import UUID
+import os
+from dataclasses import dataclass, field
+from functools import cache
+from uuid import UUID, uuid5
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from openhands.app_server.organization.agent_profile_models import (
+    OrganizationAgentProfileSeeds,
     StoredOrganizationAgentProfiles,
 )
 from openhands.app_server.organization.organization_models import (
     OrganizationPermission,
 )
 from openhands.app_server.organization.organization_service import OrganizationService
-from openhands.app_server.settings.agent_profiles import AgentProfiles
+from openhands.app_server.settings.agent_profiles import (
+    MAX_AGENT_PROFILES,
+    AgentProfiles,
+)
 from openhands.app_server.user.user_context import UserContext
 from openhands.sdk.profiles import (
     AgentProfile,
@@ -25,12 +31,24 @@ _MANAGE_PERMISSIONS = {
     OrganizationPermission.ORG_MANAGE,
     OrganizationPermission.ORG_MANAGE_MEMBERS,
 }
+_SEEDS_ENV = 'OH_ORGANIZATION_AGENT_PROFILE_SEEDS_JSON'
+
+
+@cache
+def get_organization_agent_profile_seeds() -> OrganizationAgentProfileSeeds | None:
+    value = os.getenv(_SEEDS_ENV)
+    if value is None:
+        return None
+    return OrganizationAgentProfileSeeds.model_validate_json(value)
 
 
 @dataclass
 class OrganizationAgentProfileService:
     db_session: AsyncSession
     user_context: UserContext
+    seeds: OrganizationAgentProfileSeeds | None = field(
+        default_factory=get_organization_agent_profile_seeds
+    )
 
     @property
     def organizations(self) -> OrganizationService:
@@ -60,17 +78,42 @@ class OrganizationAgentProfileService:
     def _deserialize(row: StoredOrganizationAgentProfiles) -> AgentProfiles:
         return AgentProfiles.model_validate_json(row.payload)
 
+    def _initial_profiles(self, organization_id: UUID) -> AgentProfiles:
+        profiles = AgentProfiles()
+        if self.seeds is None:
+            return profiles
+        ids_by_name = {}
+        for name, profile in self.seeds.validated_profiles.items():
+            profile_id = uuid5(organization_id, name)
+            profiles.save(
+                profile.model_copy(update={'id': profile_id, 'revision': 0}),
+                max_profiles=MAX_AGENT_PROFILES,
+            )
+            ids_by_name[name] = str(profile_id)
+        profiles.active = ids_by_name[self.seeds.active_profile]
+        return profiles
+
     async def load(self, organization_id: UUID) -> AgentProfiles:
         await self._authorize(organization_id, manage=False)
         row = await self._row(organization_id)
-        return self._deserialize(row) if row is not None else AgentProfiles()
+        if row is not None:
+            return self._deserialize(row)
+        profiles = self._initial_profiles(organization_id)
+        if self.seeds is not None:
+            await self._store(organization_id, row, profiles)
+        return profiles
 
     async def _mutate(
         self, organization_id: UUID
     ) -> tuple[StoredOrganizationAgentProfiles | None, AgentProfiles]:
         await self._authorize(organization_id, manage=True)
         row = await self._row(organization_id, for_update=True)
-        return row, self._deserialize(row) if row is not None else AgentProfiles()
+        return (
+            row,
+            self._deserialize(row)
+            if row is not None
+            else self._initial_profiles(organization_id),
+        )
 
     async def _store(
         self,
@@ -104,7 +147,7 @@ class OrganizationAgentProfileService:
         save_profile_preserving_identity(
             profiles,
             profile,
-            max_profiles=50,
+            max_profiles=MAX_AGENT_PROFILES,
         )
         await self._store(organization_id, row, profiles)
         return profiles
