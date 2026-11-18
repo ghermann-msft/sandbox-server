@@ -858,6 +858,13 @@ def test_agent_profile_timestamps_use_utc_server_defaults():
         assert column.server_default is not None
 
 
+def test_organization_connection_timestamps_use_utc_server_defaults():
+    for column_name in ('created_at', 'updated_at'):
+        column = StoredOrganizationConnection.__table__.c[column_name]
+        assert isinstance(column.type, UtcDateTime)
+        assert column.server_default is not None
+
+
 @pytest.mark.asyncio
 async def test_explicit_agent_profile_override_resolves_acp_and_provenance():
     organization_id = uuid4()

@@ -5,11 +5,10 @@ from enum import StrEnum
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
-from sqlalchemy import JSON, ForeignKey, Integer, String, Text
+from sqlalchemy import JSON, ForeignKey, Integer, String, Text, func
 from sqlalchemy.orm import Mapped, mapped_column
 
-from openhands.agent_server.utils import utc_now
-from openhands.app_server.utils.sql_utils import Base
+from openhands.app_server.utils.sql_utils import Base, UtcDateTime
 from openhands.sdk.mcp.config import MCPServer
 
 
@@ -35,9 +34,11 @@ class StoredOrganizationConnection(Base):
     updated_by_user_id: Mapped[UUID] = mapped_column(
         ForeignKey('rbac_users.id'), nullable=False
     )
-    created_at: Mapped[datetime] = mapped_column(nullable=False, default=utc_now)
+    created_at: Mapped[datetime] = mapped_column(
+        UtcDateTime, nullable=False, server_default=func.now()
+    )
     updated_at: Mapped[datetime] = mapped_column(
-        nullable=False, default=utc_now, onupdate=utc_now
+        UtcDateTime, nullable=False, server_default=func.now(), onupdate=func.now()
     )
 
 
