@@ -180,6 +180,21 @@ class TestSQLAppConversationInfoService:
         assert result is None
 
     @pytest.mark.asyncio
+    async def test_get_conversation_info_accepts_compact_uuid(
+        self,
+        service: SQLAppConversationInfoService,
+        sample_conversation_info: AppConversationInfo,
+    ):
+        await service.save_app_conversation_info(sample_conversation_info)
+
+        result = await service.get_app_conversation_info(
+            sample_conversation_info.id.hex
+        )
+
+        assert result is not None
+        assert result.id == sample_conversation_info.id
+
+    @pytest.mark.asyncio
     async def test_round_trip_with_all_fields(
         self, service: SQLAppConversationInfoService
     ):
@@ -291,6 +306,22 @@ class TestSQLAppConversationInfoService:
         """Test batch get with empty list."""
         results = await service.batch_get_app_conversation_info([])
         assert results == []
+
+    @pytest.mark.asyncio
+    async def test_batch_get_accepts_compact_ready_ids(
+        self,
+        service: SQLAppConversationInfoService,
+        multiple_conversation_infos: list[AppConversationInfo],
+    ):
+        for info in multiple_conversation_infos:
+            await service.save_app_conversation_info(info)
+        compact_ids = [info.id.hex for info in multiple_conversation_infos]
+
+        results = await service.batch_get_app_conversation_info(compact_ids)
+
+        assert [result.id if result else None for result in results] == [
+            info.id for info in multiple_conversation_infos
+        ]
 
     @pytest.mark.asyncio
     async def test_count_conversations_by_sandbox_id(

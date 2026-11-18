@@ -93,6 +93,10 @@ def _normalize_event_timestamp(value: datetime | None) -> datetime:
     return value
 
 
+def _canonical_conversation_id(value: UUID | str) -> str:
+    return str(UUID(str(value)))
+
+
 def _combine_usage_metrics(
     usage_to_metrics: Mapping[str, MetricsSnapshot],
 ) -> tuple[float, TokenUsage | None]:
@@ -391,7 +395,7 @@ class SQLAppConversationInfoService(AppConversationInfoService):
         return query
 
     async def get_sub_conversation_ids(
-        self, parent_conversation_id: UUID
+        self, parent_conversation_id: UUID | str
     ) -> list[UUID]:
         """Get all sub-conversation IDs for a given parent conversation.
 
@@ -404,7 +408,7 @@ class SQLAppConversationInfoService(AppConversationInfoService):
         query = await self._secure_select()
         query = query.where(
             StoredConversationMetadata.parent_conversation_id
-            == str(parent_conversation_id)
+            == _canonical_conversation_id(parent_conversation_id)
         )
         result_set = await self.db_session.execute(query)
         rows = result_set.scalars().all()
@@ -438,12 +442,11 @@ class SQLAppConversationInfoService(AppConversationInfoService):
         return result.scalar() or 0
 
     async def get_app_conversation_info(
-        self, conversation_id: UUID
+        self, conversation_id: UUID | str
     ) -> AppConversationInfo | None:
+        canonical_id = _canonical_conversation_id(conversation_id)
         query = await self._secure_select()
-        query = query.where(
-            StoredConversationMetadata.conversation_id == str(conversation_id)
-        )
+        query = query.where(StoredConversationMetadata.conversation_id == canonical_id)
         result_set = await self.db_session.execute(query)
         result = result_set.scalar_one_or_none()
         if result:
@@ -453,10 +456,11 @@ class SQLAppConversationInfoService(AppConversationInfoService):
         return None
 
     async def batch_get_app_conversation_info(
-        self, conversation_ids: list[UUID]
+        self, conversation_ids: list[UUID | str]
     ) -> list[AppConversationInfo | None]:
         conversation_id_strs = [
-            str(conversation_id) for conversation_id in conversation_ids
+            _canonical_conversation_id(conversation_id)
+            for conversation_id in conversation_ids
         ]
         query = await self._secure_select()
         query = query.where(
@@ -485,6 +489,7 @@ class SQLAppConversationInfoService(AppConversationInfoService):
     ) -> AppConversationInfo:
         metrics = info.metrics or MetricsSnapshot()
         usage = metrics.accumulated_token_usage or TokenUsage()
+        conversation_id = _canonical_conversation_id(info.id)
 
         # Preserve the original creation time on update.
         #
@@ -502,14 +507,14 @@ class SQLAppConversationInfoService(AppConversationInfoService):
         created_at = info.created_at
         existing_created_at = await self.db_session.scalar(
             select(StoredConversationMetadata.created_at).where(
-                StoredConversationMetadata.conversation_id == str(info.id)
+                StoredConversationMetadata.conversation_id == conversation_id
             )
         )
         if existing_created_at is not None:
             created_at = existing_created_at
         existing_organization_id = await self.db_session.scalar(
             select(StoredConversationMetadata.organization_id).where(
-                StoredConversationMetadata.conversation_id == str(info.id)
+                StoredConversationMetadata.conversation_id == conversation_id
             )
         )
         organization_id = info.organization_id or existing_organization_id
@@ -517,7 +522,7 @@ class SQLAppConversationInfoService(AppConversationInfoService):
             organization_id = await self.resolve_organization_id(None)
 
         stored = StoredConversationMetadata(
-            conversation_id=str(info.id),
+            conversation_id=conversation_id,
             organization_id=organization_id,
             selected_repository=info.selected_repository,
             selected_branch=info.selected_branch,
@@ -543,7 +548,7 @@ class SQLAppConversationInfoService(AppConversationInfoService):
             sandbox_id=info.sandbox_id,
             sandbox_spec_id=info.sandbox_spec_id,
             parent_conversation_id=(
-                str(info.parent_conversation_id)
+                _canonical_conversation_id(info.parent_conversation_id)
                 if info.parent_conversation_id
                 else None
             ),
@@ -581,7 +586,8 @@ class SQLAppConversationInfoService(AppConversationInfoService):
         # No-op on SQLite.
         query = await self._secure_select()
         query = query.where(
-            StoredConversationMetadata.conversation_id == str(conversation_id)
+            StoredConversationMetadata.conversation_id
+            == _canonical_conversation_id(conversation_id)
         ).with_for_update()
         result = await self.db_session.execute(query)
         stored = result.scalar_one_or_none()
@@ -797,7 +803,8 @@ class SQLAppConversationInfoService(AppConversationInfoService):
         """
         query = await self._secure_select()
         query = query.where(
-            StoredConversationMetadata.conversation_id == str(conversation_id)
+            StoredConversationMetadata.conversation_id
+            == _canonical_conversation_id(conversation_id)
         )
         result = await self.db_session.execute(query)
         stored = result.scalar_one_or_none()
@@ -912,7 +919,8 @@ class SQLAppConversationInfoService(AppConversationInfoService):
 
         # Build secure delete query with user context filtering
         delete_query = delete(StoredConversationMetadata).where(
-            StoredConversationMetadata.conversation_id == str(conversation_id)
+            StoredConversationMetadata.conversation_id
+            == _canonical_conversation_id(conversation_id)
         )
 
         # Execute the secure delete query
