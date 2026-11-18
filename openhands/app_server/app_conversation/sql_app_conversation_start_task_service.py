@@ -247,7 +247,11 @@ class SQLAppConversationStartTaskService(AppConversationStartTaskService):
             existing = result.scalar_one_or_none()
             assert existing is None or existing.created_by_user_id == self.user_id
         task.updated_at = utc_now()
-        await self.session.merge(StoredAppConversationStartTask(**task.model_dump()))
+        await self.session.merge(
+            StoredAppConversationStartTask(
+                **task.model_dump(exclude={'session_api_key'})
+            )
+        )
         await self.session.commit()
         return task
 

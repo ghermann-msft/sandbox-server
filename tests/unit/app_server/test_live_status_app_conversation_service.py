@@ -4941,6 +4941,70 @@ class TestAgentKindConversationUrl:
         )
 
 
+@pytest.mark.asyncio
+async def test_batch_conversation_returns_session_key_to_sandbox_owner():
+    service = LiveStatusAppConversationService.__new__(LiveStatusAppConversationService)
+    service.user_context = AsyncMock()
+    service.user_context.get_user_id.return_value = 'user-1'
+    service.sandbox_service = AsyncMock()
+    service.sandbox_service.batch_get_sandboxes.return_value = [
+        SandboxInfo(
+            id='sandbox-a',
+            created_by_user_id='user-1',
+            sandbox_spec_id='spec',
+            status=SandboxStatus.RUNNING,
+            session_api_key='session-key',
+            exposed_urls=[
+                ExposedUrl(name=AGENT_SERVER, url='http://localhost:8000', port=8000)
+            ],
+        )
+    ]
+    service._get_live_conversation_info = AsyncMock(return_value=[])
+    info = AppConversationInfo(
+        id=uuid4(),
+        created_by_user_id=None,
+        sandbox_id='sandbox-a',
+    )
+
+    result = await service._build_app_conversations([info])
+
+    assert result[0] is not None
+    assert result[0].session_api_key == 'session-key'
+    service._get_live_conversation_info.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_batch_conversation_hides_session_key_from_other_org_user():
+    service = LiveStatusAppConversationService.__new__(LiveStatusAppConversationService)
+    service.user_context = AsyncMock()
+    service.user_context.get_user_id.return_value = 'user-2'
+    service.sandbox_service = AsyncMock()
+    service.sandbox_service.batch_get_sandboxes.return_value = [
+        SandboxInfo(
+            id='sandbox-a',
+            created_by_user_id='user-1',
+            sandbox_spec_id='spec',
+            status=SandboxStatus.RUNNING,
+            session_api_key='session-key',
+            exposed_urls=[
+                ExposedUrl(name=AGENT_SERVER, url='http://localhost:8000', port=8000)
+            ],
+        )
+    ]
+    service._get_live_conversation_info = AsyncMock(return_value=[])
+    info = AppConversationInfo(
+        id=uuid4(),
+        created_by_user_id=None,
+        sandbox_id='sandbox-a',
+    )
+
+    result = await service._build_app_conversations([info])
+
+    assert result[0] is not None
+    assert result[0].session_api_key is None
+    service._get_live_conversation_info.assert_not_awaited()
+
+
 class TestBuildAcpStartConversationRequestSecrets:
     """Tests for secret injection in ``_build_acp_start_conversation_request``.
 

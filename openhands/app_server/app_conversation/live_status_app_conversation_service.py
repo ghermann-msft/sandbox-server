@@ -92,6 +92,9 @@ from openhands.app_server.pending_messages.pending_message_service import (
     PendingMessageService,
 )
 from openhands.app_server.sandbox.docker_sandbox_service import DockerSandboxService
+from openhands.app_server.sandbox.sandbox_access import (
+    can_access_sandbox_credentials,
+)
 from openhands.app_server.sandbox.sandbox_models import (
     AGENT_SERVER,
     SandboxInfo,
@@ -733,6 +736,7 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
             # Update the start task
             task.status = AppConversationStartTaskStatus.READY
             task.app_conversation_id = info.id
+            task.session_api_key = sandbox.session_api_key
             yield task
 
             # Process any pending messages queued while waiting for conversation
@@ -764,6 +768,14 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
             list(sandbox_id_to_conversation_ids)
         )
         sandboxes_by_id = {sandbox.id: sandbox for sandbox in sandboxes if sandbox}
+        user_id = await self.user_context.get_user_id()
+        credential_access_by_id = {
+            sandbox.id: can_access_sandbox_credentials(
+                user_id, sandbox.created_by_user_id
+            )
+            for sandbox in sandboxes
+            if sandbox
+        }
 
         # Gather the running conversations
         tasks = [
@@ -772,7 +784,9 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
                 sandbox_id_to_conversation_ids.get(sandbox.id),
             )
             for sandbox in sandboxes
-            if sandbox and sandbox.status == SandboxStatus.RUNNING
+            if sandbox
+            and sandbox.status == SandboxStatus.RUNNING
+            and credential_access_by_id.get(sandbox.id, False)
         ]
         if tasks:
             sandbox_conversation_infos = await asyncio.gather(*tasks)
@@ -792,6 +806,9 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
                     app_conversation_info,
                     sandboxes_by_id.get(app_conversation_info.sandbox_id),
                     conversation_info_by_id.get(app_conversation_info.id),
+                    credential_access_by_id.get(
+                        app_conversation_info.sandbox_id, False
+                    ),
                 )
                 if app_conversation_info
                 else None
@@ -847,6 +864,7 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
         app_conversation_info: AppConversationInfo | None,
         sandbox: SandboxInfo | None,
         conversation_info: ConversationInfo | None,
+        include_session_api_key: bool = True,
     ) -> AppConversation | None:
         if app_conversation_info is None:
             return None
@@ -867,7 +885,8 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
             )
             if conversation_url:
                 conversation_url += f'/api/conversations/{app_conversation_info.id.hex}'
-            session_api_key = sandbox.session_api_key
+            if include_session_api_key:
+                session_api_key = sandbox.session_api_key
 
         return AppConversation(
             **app_conversation_info.model_dump(),

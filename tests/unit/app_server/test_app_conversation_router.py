@@ -20,11 +20,14 @@ from openhands.app_server.app_conversation.app_conversation_models import (
     AppConversationInfo,
     AppConversationPage,
     AppConversationStartRequest,
+    AppConversationStartTask,
+    AppConversationStartTaskStatus,
     SwitchProfileRequest,
 )
 from openhands.app_server.app_conversation.app_conversation_router import (
     AgentServerContext,
     _finalize_sandbox_delete,
+    batch_get_app_conversation_start_tasks,
     batch_get_app_conversations,
     count_app_conversations,
     get_conversation_git_changes,
@@ -33,7 +36,7 @@ from openhands.app_server.app_conversation.app_conversation_router import (
     start_app_conversation,
     switch_conversation_profile,
 )
-from openhands.app_server.sandbox.sandbox_models import SandboxStatus
+from openhands.app_server.sandbox.sandbox_models import SandboxInfo, SandboxStatus
 from openhands.app_server.settings.llm_profiles import LLMProfiles
 from openhands.app_server.settings.settings_models import Settings
 from openhands.app_server.user.specifiy_user_context import USER_CONTEXT_ATTR
@@ -322,6 +325,68 @@ class TestBatchGetAppConversations:
         assert result[0] is not None
         assert result[0].id == uuid1
         assert result[1] is None
+
+
+@pytest.mark.asyncio
+async def test_ready_start_task_returns_session_key_to_creator():
+    task = AppConversationStartTask(
+        created_by_user_id='user-1',
+        status=AppConversationStartTaskStatus.READY,
+        sandbox_id='sandbox-1',
+        request=AppConversationStartRequest(),
+    )
+    task_service = AsyncMock()
+    task_service.batch_get_app_conversation_start_tasks.return_value = [task]
+    sandbox_service = AsyncMock()
+    sandbox_service.batch_get_sandboxes.return_value = [
+        SandboxInfo(
+            id='sandbox-1',
+            created_by_user_id='user-1',
+            sandbox_spec_id='spec',
+            status=SandboxStatus.RUNNING,
+            session_api_key='session-key',
+        )
+    ]
+    user_context = AsyncMock()
+    user_context.get_user_id.return_value = 'user-1'
+
+    result = await batch_get_app_conversation_start_tasks(
+        ids=[task.id],
+        app_conversation_start_task_service=task_service,
+        sandbox_service=sandbox_service,
+        user_context=user_context,
+    )
+
+    assert result[0] is not None
+    assert result[0].session_api_key == 'session-key'
+    assert result[0].model_dump(mode='json')['session_api_key'] == 'session-key'
+
+
+@pytest.mark.asyncio
+async def test_ready_start_task_does_not_return_session_key_to_other_user():
+    task = AppConversationStartTask(
+        created_by_user_id='user-1',
+        status=AppConversationStartTaskStatus.READY,
+        sandbox_id='sandbox-1',
+        request=AppConversationStartRequest(),
+    )
+    task_service = AsyncMock()
+    task_service.batch_get_app_conversation_start_tasks.return_value = [task]
+    sandbox_service = AsyncMock()
+    user_context = AsyncMock()
+    user_context.get_user_id.return_value = 'user-2'
+
+    result = await batch_get_app_conversation_start_tasks(
+        ids=[task.id],
+        app_conversation_start_task_service=task_service,
+        sandbox_service=sandbox_service,
+        user_context=user_context,
+    )
+
+    assert result[0] is not None
+    assert result[0].session_api_key is None
+    assert result[0].model_dump(mode='json')['session_api_key'] is None
+    sandbox_service.batch_get_sandboxes.assert_awaited_once_with([])
 
 
 @pytest.mark.asyncio

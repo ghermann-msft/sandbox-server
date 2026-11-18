@@ -362,6 +362,10 @@ class AppConversationStartTask(OpenHandsModel):
     agent_server_url: str | None = Field(
         default=None, description='The agent server url, if READY'
     )
+    session_api_key: str | None = Field(
+        default=None,
+        description='The session API key, if READY and requested by the creator.',
+    )
     sandbox_startup_progress: SandboxStartupProgress | None = Field(
         default=None,
         description=(

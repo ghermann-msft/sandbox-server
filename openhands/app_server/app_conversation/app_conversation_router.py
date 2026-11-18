@@ -7,6 +7,7 @@ import logging
 import os
 import sys
 import tempfile
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Annotated, Any, AsyncGenerator, Literal
@@ -31,6 +32,7 @@ from openhands.app_server.app_conversation.app_conversation_models import (
     AppConversationStartTask,
     AppConversationStartTaskPage,
     AppConversationStartTaskSortOrder,
+    AppConversationStartTaskStatus,
     AppConversationUpdateRequest,
     AppSendMessageRequest,
     AppSendMessageResponse,
@@ -68,6 +70,9 @@ from openhands.app_server.config import (
 )
 from openhands.app_server.organization.organization_service import (
     bind_conversation_organization,
+)
+from openhands.app_server.sandbox.sandbox_access import (
+    can_access_sandbox_credentials,
 )
 from openhands.app_server.sandbox.sandbox_lifecycle import (
     release_sandbox_if_inactive,
@@ -1048,6 +1053,33 @@ async def stream_app_conversation_start(
     return response
 
 
+async def _hydrate_start_task_session_api_keys(
+    tasks: Sequence[AppConversationStartTask | None],
+    sandbox_service: SandboxService,
+    user_context: UserContext,
+) -> None:
+    user_id = await user_context.get_user_id()
+    eligible_tasks = [
+        task
+        for task in tasks
+        if task is not None
+        and task.status == AppConversationStartTaskStatus.READY
+        and task.sandbox_id
+        and task.created_by_user_id == user_id
+    ]
+    sandbox_ids = list(dict.fromkeys(task.sandbox_id for task in eligible_tasks))
+    sandboxes = await sandbox_service.batch_get_sandboxes(sandbox_ids)
+    sandboxes_by_id = {
+        sandbox.id: sandbox for sandbox in sandboxes if sandbox is not None
+    }
+    for task in eligible_tasks:
+        sandbox = sandboxes_by_id.get(task.sandbox_id)
+        if sandbox is None:
+            continue
+        if can_access_sandbox_credentials(user_id, sandbox.created_by_user_id):
+            task.session_api_key = sandbox.session_api_key
+
+
 @router.get('/start-tasks/search')
 async def search_app_conversation_start_tasks(
     conversation_id__eq: Annotated[
@@ -1077,9 +1109,11 @@ async def search_app_conversation_start_tasks(
     app_conversation_start_task_service: AppConversationStartTaskService = (
         app_conversation_start_task_service_dependency
     ),
+    sandbox_service: SandboxService = sandbox_service_dependency,
+    user_context: UserContext = user_context_dependency,
 ) -> AppConversationStartTaskPage:
     """Search / List conversation start tasks."""
-    return (
+    page = (
         await app_conversation_start_task_service.search_app_conversation_start_tasks(
             conversation_id__eq=conversation_id__eq,
             created_at__gte=created_at__gte,
@@ -1088,6 +1122,10 @@ async def search_app_conversation_start_tasks(
             limit=limit,
         )
     )
+    await _hydrate_start_task_session_api_keys(
+        page.items, sandbox_service, user_context
+    )
+    return page
 
 
 @router.get('/start-tasks/count')
@@ -1117,6 +1155,8 @@ async def batch_get_app_conversation_start_tasks(
     app_conversation_start_task_service: AppConversationStartTaskService = (
         app_conversation_start_task_service_dependency
     ),
+    sandbox_service: SandboxService = sandbox_service_dependency,
+    user_context: UserContext = user_context_dependency,
 ) -> list[AppConversationStartTask | None]:
     """Get a batch of start app conversation tasks given their ids. Return None for any missing."""
     if len(ids) > 100:
@@ -1126,6 +1166,9 @@ async def batch_get_app_conversation_start_tasks(
         )
     start_tasks = await app_conversation_start_task_service.batch_get_app_conversation_start_tasks(
         ids
+    )
+    await _hydrate_start_task_session_api_keys(
+        start_tasks, sandbox_service, user_context
     )
     return start_tasks
 

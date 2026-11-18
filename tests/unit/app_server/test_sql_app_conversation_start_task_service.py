@@ -159,6 +159,19 @@ class TestSQLAppConversationStartTaskService:
             'inactivity_seconds',
         }
 
+    async def test_session_key_is_rehydrated_instead_of_stored(
+        self,
+        service: SQLAppConversationStartTaskService,
+        sample_task: AppConversationStartTask,
+    ):
+        sample_task.session_api_key = 'session-key'
+
+        await service.save_app_conversation_start_task(sample_task)
+        retrieved_task = await service.get_app_conversation_start_task(sample_task.id)
+
+        assert retrieved_task is not None
+        assert retrieved_task.session_api_key is None
+
     async def test_get_nonexistent_task(
         self, service: SQLAppConversationStartTaskService
     ):

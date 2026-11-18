@@ -33,6 +33,14 @@ def format_entra_user_id(tenant_id: str, object_id: str) -> str:
     return f'{ENTRA_USER_ID_PREFIX}:{tenant_id}:{object_id}'
 
 
+def can_access_sandbox_credentials(
+    user_id: str | None, owner_user_id: str | None
+) -> bool:
+    if owner_user_id is not None:
+        return owner_user_id == user_id
+    return parse_entra_user_id(user_id) is None
+
+
 class StoredSandboxAccess(Base):
     __tablename__ = 'v1_sandbox_access'
 
