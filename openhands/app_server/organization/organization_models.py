@@ -17,6 +17,8 @@ from sqlalchemy.orm import Mapped, mapped_column
 from openhands.agent_server.utils import utc_now
 from openhands.app_server.utils.sql_utils import Base
 
+ORGANIZATION_ID_HEADER = 'X-Org-Id'
+
 
 class OrganizationKind(StrEnum):
     PERSONAL = 'personal'

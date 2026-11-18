@@ -10,8 +10,13 @@ from unittest.mock import AsyncMock, MagicMock
 from uuid import uuid4
 
 import pytest
+from starlette.datastructures import State
+from starlette.requests import Request
 
-from openhands.app_server.user.auth_user_context import AuthUserContext
+from openhands.app_server.user.auth_user_context import (
+    AuthUserContext,
+    AuthUserContextInjector,
+)
 from openhands.app_server.user.specifiy_user_context import (
     ADMIN,
     SpecifyUserContext,
@@ -68,6 +73,33 @@ class TestAuthUserContextEffectiveOrg:
         ctx = AuthUserContext(user_auth=user_auth)
 
         assert await ctx.get_effective_org_id() is None
+
+    @pytest.mark.asyncio
+    async def test_request_org_takes_precedence_over_user_auth_default(self):
+        requested_org_id = uuid4()
+        user_auth = MagicMock(spec=UserAuth)
+        user_auth.get_effective_org_id = AsyncMock(return_value=uuid4())
+        ctx = AuthUserContext(
+            user_auth=user_auth,
+            requested_org_id=requested_org_id,
+        )
+
+        assert await ctx.get_effective_org_id() == requested_org_id
+        user_auth.get_effective_org_id.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_injector_binds_request_org_header(self):
+        requested_org_id = uuid4()
+        request = Request(
+            {
+                'type': 'http',
+                'headers': [(b'x-org-id', str(requested_org_id).encode())],
+            }
+        )
+        request.state.user_auth = MagicMock(spec=UserAuth)
+
+        async with AuthUserContextInjector().context(State(), request) as ctx:
+            assert await ctx.get_effective_org_id() == requested_org_id
 
 
 class TestSpecifyUserContextEmail:

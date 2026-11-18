@@ -15,7 +15,10 @@ from openhands.app_server.integrations.provider import (
     ProviderType,
 )
 from openhands.app_server.integrations.service_types import UserGitInfo
-from openhands.app_server.organization.organization_models import AuthenticationIdentity
+from openhands.app_server.organization.organization_models import (
+    ORGANIZATION_ID_HEADER,
+    AuthenticationIdentity,
+)
 from openhands.app_server.services.injector import InjectorState
 from openhands.app_server.user.specifiy_user_context import USER_CONTEXT_ATTR
 from openhands.app_server.user.user_context import UserContext, UserContextInjector
@@ -33,6 +36,7 @@ class AuthUserContext(UserContext):
     this to use true database asyncio."""
 
     user_auth: UserAuth
+    requested_org_id: UUID | None = None
     _user_info: UserInfo | None = None
     _resolved_user_info: UserInfo | None = None
     _provider_handler: ProviderHandler | None = None
@@ -185,6 +189,8 @@ class AuthUserContext(UserContext):
         return user_info.default_sandbox_spec_id
 
     async def get_effective_org_id(self) -> UUID | None:
+        if self.requested_org_id is not None:
+            return self.requested_org_id
         get_effective_org_id = getattr(self.user_auth, 'get_effective_org_id', None)
         if get_effective_org_id is None:
             return None
@@ -205,7 +211,17 @@ class AuthUserContextInjector(UserContextInjector):
             if request is None:
                 raise AuthError()
             user_auth = await get_user_auth(request)
-            user_context = AuthUserContext(user_auth=user_auth)
+            requested_org_id = None
+            raw_org_id = request.headers.get(ORGANIZATION_ID_HEADER)
+            if raw_org_id:
+                try:
+                    requested_org_id = UUID(raw_org_id)
+                except ValueError as exc:
+                    raise AuthError(f'Invalid {ORGANIZATION_ID_HEADER} header') from exc
+            user_context = AuthUserContext(
+                user_auth=user_auth,
+                requested_org_id=requested_org_id,
+            )
             setattr(state, USER_CONTEXT_ATTR, user_context)
 
         yield user_context

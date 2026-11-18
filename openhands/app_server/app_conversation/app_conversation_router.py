@@ -68,6 +68,9 @@ from openhands.app_server.config import (
     depends_user_context,
     get_app_conversation_service,
 )
+from openhands.app_server.organization.organization_models import (
+    ORGANIZATION_ID_HEADER,
+)
 from openhands.app_server.organization.organization_service import (
     bind_conversation_organization,
 )
@@ -378,7 +381,9 @@ async def batch_get_app_conversations(
 @router.post('')
 async def start_app_conversation(
     start_request: AppConversationStartRequest,
-    organization_id: Annotated[UUID | None, Header(alias='X-Org-Id')] = None,
+    organization_id: Annotated[
+        UUID | None, Header(alias=ORGANIZATION_ID_HEADER)
+    ] = None,
     user_context: UserContext = user_context_dependency,
     db_session: AsyncSession = db_session_dependency,
 ) -> AppConversationStartTask:
@@ -1036,7 +1041,9 @@ async def delete_app_conversation(
 @router.post('/stream-start')
 async def stream_app_conversation_start(
     request: AppConversationStartRequest,
-    organization_id: Annotated[UUID | None, Header(alias='X-Org-Id')] = None,
+    organization_id: Annotated[
+        UUID | None, Header(alias=ORGANIZATION_ID_HEADER)
+    ] = None,
     user_context: UserContext = user_context_dependency,
     db_session: AsyncSession = db_session_dependency,
 ) -> list[AppConversationStartTask]:

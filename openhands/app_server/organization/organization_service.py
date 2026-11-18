@@ -16,6 +16,7 @@ from openhands.app_server.app_conversation.app_conversation_models import (
 )
 from openhands.app_server.errors import AuthError, PermissionsError
 from openhands.app_server.organization.organization_models import (
+    ORGANIZATION_ID_HEADER,
     AuthenticationIdentity,
     OrganizationKind,
     OrganizationListResponse,
@@ -212,12 +213,14 @@ async def bind_conversation_organization(
             raise PermissionsError('Authenticated organization selection is required')
         return
     if requested_organization_id is None:
-        raise PermissionsError('X-Org-Id is required')
+        raise PermissionsError(f'{ORGANIZATION_ID_HEADER} is required')
     if (
         start_request.organization_id is not None
         and start_request.organization_id != requested_organization_id
     ):
-        raise PermissionsError('Request organization does not match X-Org-Id')
+        raise PermissionsError(
+            f'Request organization does not match {ORGANIZATION_ID_HEADER}'
+        )
     start_request.organization_id = await OrganizationService(
         db_session, user_context
     ).resolve_organization_id(
