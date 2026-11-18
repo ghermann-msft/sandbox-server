@@ -42,7 +42,10 @@ from openhands.app_server.organization.profile_models import (
     OrganizationProfileSaveRequest,
     StoredOrganizationProfiles,
 )
-from openhands.app_server.organization.profile_service import OrganizationProfileService
+from openhands.app_server.organization.profile_service import (
+    OrganizationProfileService,
+    ProfileNotFoundError,
+)
 from openhands.app_server.services.jwt_service import JwtService
 from openhands.app_server.settings.agent_profiles import AgentProfiles
 from openhands.app_server.settings.llm_profiles import LLMProfiles
@@ -458,6 +461,92 @@ async def test_organization_profiles_are_encrypted_and_member_read_only(db_sessi
                 {'llm': {'model': 'openai/gpt-4o'}}
             ),
         )
+
+
+@pytest.mark.asyncio
+async def test_organization_profiles_use_deployment_defaults_without_stored_row(
+    db_session, monkeypatch
+):
+    monkeypatch.setenv('LLM_MODEL', 'azure/gpt-5.6-sol')
+    monkeypatch.setenv(
+        'LLM_BASE_URL',
+        'https://example.openai.azure.com/openai/deployments/gpt-5.6-sol',
+    )
+    monkeypatch.setenv('LLM_API_VERSION', '2025-04-01-preview')
+    monkeypatch.setenv('LLM_AUTH_TYPE', 'api_key')
+    organization_id = await _add_shared_membership(
+        db_session, 'member', OrganizationRole.MEMBER
+    )
+
+    profiles = await OrganizationProfileService(
+        db_session, _context('member', organization_id), _jwt_service()
+    ).load(organization_id)
+
+    assert profiles.active == 'default'
+    default = profiles.require('default')
+    assert default.model == 'azure/gpt-5.6-sol'
+    assert (
+        default.base_url
+        == 'https://example.openai.azure.com/openai/deployments/gpt-5.6-sol'
+    )
+    assert default.api_version == '2025-04-01-preview'
+    assert default.auth_type == 'api_key'
+    assert await db_session.get(StoredOrganizationProfiles, organization_id) is None
+
+
+@pytest.mark.asyncio
+async def test_organization_profile_mutation_seeds_defaults_before_activation(
+    db_session, monkeypatch
+):
+    monkeypatch.setenv('LLM_MODEL', 'azure/gpt-5.6-sol')
+    organization_id = await _add_shared_membership(
+        db_session, 'owner', OrganizationRole.OWNER
+    )
+    service = OrganizationProfileService(
+        db_session, _context('owner', organization_id), _jwt_service()
+    )
+
+    profiles = await service.save(
+        organization_id,
+        'custom',
+        OrganizationProfileSaveRequest.model_validate(
+            {'llm': {'model': 'openai/gpt-4.1'}}
+        ),
+    )
+    assert set(profiles.profiles) == {'default', 'custom'}
+    assert profiles.active == 'default'
+
+    profiles = await service.activate(organization_id, 'custom')
+
+    assert profiles.active == 'custom'
+    row = await db_session.get(StoredOrganizationProfiles, organization_id)
+    assert row is not None
+    persisted = await service.load(organization_id)
+    assert set(persisted.profiles) == {'default', 'custom'}
+    assert persisted.active == 'custom'
+
+
+@pytest.mark.asyncio
+async def test_explicitly_stored_empty_organization_profiles_remain_authoritative(
+    db_session, monkeypatch
+):
+    monkeypatch.setenv('LLM_MODEL', 'azure/gpt-5.6-sol')
+    organization_id = await _add_shared_membership(
+        db_session, 'owner', OrganizationRole.OWNER
+    )
+    service = OrganizationProfileService(
+        db_session, _context('owner', organization_id), _jwt_service()
+    )
+
+    await service.delete(organization_id, 'default')
+
+    assert await db_session.get(StoredOrganizationProfiles, organization_id) is not None
+    monkeypatch.setenv('LLM_MODEL', 'azure/gpt-6')
+    profiles = await service.load(organization_id)
+    assert profiles.profiles == {}
+    assert profiles.active is None
+    with pytest.raises(ProfileNotFoundError, match="Profile 'default' not found"):
+        await service.activate(organization_id, 'default')
 
 
 @pytest.mark.asyncio

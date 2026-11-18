@@ -23,6 +23,9 @@ from openhands.app_server.settings.llm_profiles import (
     ProfileLimitExceededError,
     ProfileNotFoundError,
 )
+from openhands.app_server.settings.sql_settings_store import (
+    _default_hosted_llm_profiles,
+)
 from openhands.app_server.user.user_context import UserContext
 
 _MANAGE_PERMISSIONS = {
@@ -95,14 +98,17 @@ class OrganizationProfileService:
         if not is_shared:
             return LLMProfiles()
         row = await self._row(organization_id)
-        return self._decrypt(row) if row is not None else LLMProfiles()
+        return self._decrypt(row) if row is not None else _default_hosted_llm_profiles()
 
     async def _mutate(
         self, organization_id: UUID
     ) -> tuple[StoredOrganizationProfiles | None, LLMProfiles]:
         await self._authorize(organization_id, manage=True)
         row = await self._row(organization_id, for_update=True)
-        return row, self._decrypt(row) if row is not None else LLMProfiles()
+        return (
+            row,
+            self._decrypt(row) if row is not None else _default_hosted_llm_profiles(),
+        )
 
     async def _store(
         self,
@@ -146,7 +152,7 @@ class OrganizationProfileService:
 
     async def delete(self, organization_id: UUID, name: str) -> None:
         row, profiles = await self._mutate(organization_id)
-        if row is not None and profiles.delete(name):
+        if profiles.delete(name):
             await self._store(organization_id, row, profiles)
 
     async def activate(self, organization_id: UUID, name: str) -> LLMProfiles:

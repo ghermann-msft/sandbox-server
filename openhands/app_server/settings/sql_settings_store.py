@@ -8,6 +8,7 @@ from sqlalchemy import Integer, String, Text, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Mapped, mapped_column
 
+from openhands.app_server.settings.llm_profiles import LLMProfiles
 from openhands.app_server.settings.settings_models import Settings
 from openhands.app_server.settings.settings_store import SettingsStore
 from openhands.app_server.utils.sql_utils import Base
@@ -20,10 +21,8 @@ _FOUNDRY_WEB_SEARCH_MCP_NAME = 'foundry-web-search'
 _FOUNDRY_WEB_SEARCH_MCP_AUTH_TYPE = 'azure_workload_identity'
 
 
-def _default_hosted_settings() -> Settings:
-    settings = Settings()
-    agent_updates: dict[str, Any] = {}
-
+def _default_hosted_llm_profiles() -> LLMProfiles:
+    profiles = LLMProfiles()
     model = os.getenv('LLM_MODEL')
     if model:
         llm_updates = {'model': model}
@@ -37,9 +36,18 @@ def _default_hosted_settings() -> Settings:
                 llm_updates[field_name] = value
 
         llm = LLM.model_validate(llm_updates)
+        profiles.save(_DEFAULT_LLM_PROFILE, llm)
+        profiles.active = _DEFAULT_LLM_PROFILE
+    return profiles
+
+
+def _default_hosted_settings() -> Settings:
+    settings = Settings()
+    agent_updates: dict[str, Any] = {}
+    settings.llm_profiles = _default_hosted_llm_profiles()
+    llm = settings.llm_profiles.get(_DEFAULT_LLM_PROFILE)
+    if llm is not None:
         agent_updates['llm'] = llm
-        settings.llm_profiles.save(_DEFAULT_LLM_PROFILE, llm)
-        settings.llm_profiles.active = _DEFAULT_LLM_PROFILE
         settings.title_llm_profile = _DEFAULT_LLM_PROFILE
 
     mcp_endpoint = os.getenv('FOUNDRY_WEB_SEARCH_MCP_ENDPOINT')
