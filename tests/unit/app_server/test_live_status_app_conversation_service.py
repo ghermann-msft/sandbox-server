@@ -1855,18 +1855,16 @@ class TestLiveStatusAppConversationService:
         }
 
     @pytest.mark.asyncio
-    async def test_build_request_routes_acp_user_to_observability_metadata(self):
-        """End-to-end through the *routing* entrypoint (not the ACP builder
-        directly): an ACP user hits the ``isinstance(..., ACPAgentSettings)``
-        branch in ``_build_start_conversation_request_for_user``, which must
-        forward git_provider/selected_branch/remote_workspace into
-        ``_build_acp_start_conversation_request`` for this to populate.
+    async def test_build_request_routes_copilot_acp_without_llm(self):
+        """A canonical Copilot ACP profile routes without OpenHands LLM settings.
+
+        This exercises the routing entrypoint rather than calling the ACP builder
+        directly, matching organization Agent Profile resolution at chat start.
         """
         from openhands.sdk.settings import ACPAgentSettings
 
         self.mock_user.agent_settings = ACPAgentSettings(
-            acp_server='claude-code',
-            llm=LLM(model='claude-sonnet-4-5', api_key=SecretStr('k')),
+            acp_server='copilot-cli',
         )
         self.mock_user_context.get_user_info.return_value = self.mock_user
         self.mock_user_context.get_secrets = AsyncMock(return_value={})
@@ -3143,7 +3141,6 @@ class TestLiveStatusAppConversationService:
         conversation_id = uuid4()
         self.mock_user.agent_settings = ACPAgentSettings(
             acp_server='claude-code',
-            llm=LLM(model='claude-sonnet-4-5', api_key=SecretStr('sk-ui-key')),
         )
         self.mock_user_context.get_user_id = AsyncMock(return_value='test_user_123')
         self.mock_user_context.get_user_info = AsyncMock(return_value=self.mock_user)
@@ -5043,7 +5040,6 @@ class TestBuildAcpStartConversationRequestSecrets:
         self,
         acp_server='claude-code',
         context_secrets=None,
-        api_key=None,
         mcp_config=None,
     ):
         try:
@@ -5070,10 +5066,6 @@ class TestBuildAcpStartConversationRequestSecrets:
         )
         user.agent_settings = ACPAgentSettings(
             acp_server=acp_server,  # type: ignore[arg-type]
-            llm=LLM(
-                model='claude-sonnet-4-5',
-                api_key=SecretStr(api_key) if api_key else None,
-            ),
             agent_context=agent_context,
             mcp_config=mcp_config or {},
         )
@@ -5217,16 +5209,9 @@ class TestBuildAcpStartConversationRequestSecrets:
         assert request.secrets.get('OTHER') is other_secret
 
     @pytest.mark.asyncio
-    async def test_llm_api_key_not_forwarded_to_request_secrets(
-        self, service, tmp_path
-    ):
-        """llm.api_key must not bleed into request.secrets for ACP.
-
-        ACP does not use the SDK's LLM layer — the CLI subprocess handles its
-        own model calls.  Credentials must be supplied via the Secrets panel
-        (request.secrets channel), not via llm.api_key.
-        """
-        user = self._make_acp_user(acp_server='claude-code', api_key='sk-ui-key')
+    async def test_acp_credentials_require_request_secrets(self, service, tmp_path):
+        """ACP credentials are not synthesized without request secrets."""
+        user = self._make_acp_user(acp_server='claude-code')
 
         request = await self._call_build(service, user, tmp_path)
 
@@ -5347,12 +5332,8 @@ class TestBuildAcpStartConversationRequestSecrets:
 
     @pytest.mark.asyncio
     async def test_panel_secret_is_sole_credentials_channel(self, service, tmp_path):
-        """Panel secret is the only credentials channel; llm.api_key is ignored.
-
-        When a panel secret and llm.api_key both target the same env var, only
-        the panel secret appears in request.secrets — llm.api_key is not read.
-        """
-        user = self._make_acp_user(acp_server='claude-code', api_key='sk-ui-key')
+        """Panel secrets are the ACP credentials channel."""
+        user = self._make_acp_user(acp_server='claude-code')
         panel_secret = StaticSecret(value=SecretStr('sk-from-secrets-panel'))
 
         request = await self._call_build(
