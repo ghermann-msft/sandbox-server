@@ -442,7 +442,10 @@ async def on_conversation_update(
 
     app_conversation_info = AppConversationInfo(
         id=conversation_info.id,
-        title=existing.title or f'Conversation {conversation_info.id.hex}',
+        title=_merge_agent_server_title(
+            conversation_info.id, existing.title, conversation_info.title
+        )
+        or f'Conversation {conversation_info.id.hex}',
         sandbox_id=sandbox_record.id,
         created_by_user_id=sandbox_record.created_by_user_id,
         llm_model=llm_model,
@@ -506,6 +509,22 @@ _LIVE_STATS_PULL_STATUSES = {
 }
 
 
+def _merge_agent_server_title(
+    conversation_id: UUID,
+    current_title: str | None,
+    agent_server_title: str | None,
+) -> str | None:
+    """Accept an agent-generated title only while the cloud title is a placeholder."""
+    placeholder_titles = {
+        None,
+        f'Conversation {conversation_id.hex[:5]}',
+        f'Conversation {conversation_id.hex}',
+    }
+    if agent_server_title and current_title in placeholder_titles:
+        return agent_server_title
+    return current_title
+
+
 async def _sync_live_conversation_stats(
     conversation_id: UUID,
     app_conversation_info: AppConversationInfo,
@@ -544,6 +563,16 @@ async def _sync_live_conversation_stats(
         response = await client.get(conversation_url, headers=headers)
         response.raise_for_status()
         info = ConversationInfo.model_validate(response.json())
+    stored_info = await app_conversation_info_service.get_app_conversation_info(
+        conversation_id
+    )
+    if stored_info is not None:
+        title = _merge_agent_server_title(
+            conversation_id, stored_info.title, info.title
+        )
+        if title != stored_info.title:
+            stored_info.title = title
+            await app_conversation_info_service.save_app_conversation_info(stored_info)
     if info.stats and info.stats.usage_to_metrics:
         await app_conversation_info_service.update_conversation_statistics(
             conversation_id, info.stats
