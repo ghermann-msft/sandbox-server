@@ -36,6 +36,7 @@ from openhands.app_server.app_conversation.live_status_app_conversation_service 
     LiveStatusAppConversationService,
     _exception_detail,
     _resolve_title_llm_profile,
+    add_copilot_github_token_secret,
     bridge_perforce_mcp_secrets,
     effective_disabled_skills,
 )
@@ -5243,6 +5244,88 @@ class TestBuildAcpStartConversationRequestSecrets:
         request = await self._call_build(service, user, tmp_path)
 
         assert request.secrets == {}
+
+    def test_copilot_cli_uses_effective_organization_github_token(self):
+        from openhands.sdk.settings import ACPAgentSettings
+
+        settings = ACPAgentSettings.model_construct(acp_server='copilot-cli')
+        secrets = {}
+        add_copilot_github_token_secret(
+            settings,
+            secrets,
+            {ProviderType.GITHUB: ProviderToken(token=SecretStr('organization-token'))},
+        )
+
+        assert (
+            secrets['COPILOT_GITHUB_TOKEN'].value.get_secret_value()
+            == 'organization-token'
+        )
+
+    def test_copilot_cli_uses_effective_personal_github_token(self):
+        from openhands.sdk.settings import ACPAgentSettings
+
+        settings = ACPAgentSettings.model_construct(acp_server='copilot-cli')
+        secrets = {}
+        add_copilot_github_token_secret(
+            settings,
+            secrets,
+            {ProviderType.GITHUB: ProviderToken(token=SecretStr('personal-token'))},
+        )
+
+        assert (
+            secrets['COPILOT_GITHUB_TOKEN'].value.get_secret_value() == 'personal-token'
+        )
+
+    def test_copilot_cli_omits_alias_without_github_token(self):
+        from openhands.sdk.settings import ACPAgentSettings
+
+        secrets = {}
+        add_copilot_github_token_secret(
+            ACPAgentSettings.model_construct(acp_server='copilot-cli'),
+            secrets,
+            {},
+        )
+
+        assert 'COPILOT_GITHUB_TOKEN' not in secrets
+
+    def test_explicit_copilot_secret_wins_without_token_leakage(self):
+        from openhands.sdk.settings import ACPAgentSettings
+
+        explicit = StaticSecret(value=SecretStr('explicit-token'))
+        secrets = {'COPILOT_GITHUB_TOKEN': explicit}
+        add_copilot_github_token_secret(
+            ACPAgentSettings.model_construct(acp_server='copilot-cli'),
+            secrets,
+            {ProviderType.GITHUB: ProviderToken(token=SecretStr('provider-token'))},
+        )
+
+        assert secrets['COPILOT_GITHUB_TOKEN'] is explicit
+        assert 'explicit-token' not in repr(secrets)
+        assert 'provider-token' not in repr(secrets)
+
+    @pytest.mark.parametrize(
+        'settings',
+        [
+            OpenHandsAgentSettings(),
+            pytest.param(
+                'other-acp',
+                id='other-acp',
+            ),
+        ],
+    )
+    def test_non_copilot_launches_do_not_receive_alias(self, settings):
+        if settings == 'other-acp':
+            from openhands.sdk.settings import ACPAgentSettings
+
+            settings = ACPAgentSettings(acp_server='claude-code')
+        secrets = {}
+        add_copilot_github_token_secret(
+            settings,
+            secrets,
+            {ProviderType.GITHUB: ProviderToken(token=SecretStr('github-token'))},
+        )
+
+        assert 'COPILOT_GITHUB_TOKEN' not in secrets
 
     @pytest.mark.asyncio
     async def test_isolate_data_dir_enabled(self, service, tmp_path):

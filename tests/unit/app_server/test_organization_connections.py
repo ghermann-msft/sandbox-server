@@ -250,8 +250,16 @@ async def test_owner_and_admin_manage_connections_member_reads_only(db_session):
     other_organization_id = await _add_shared_membership(
         db_session, 'other-owner', OrganizationRole.OWNER
     )
+    await OrganizationConnectionService(
+        db_session, _context('other-owner', other_organization_id), jwt_service
+    ).store_github_token(
+        other_organization_id,
+        ProviderToken(token=SecretStr('other-organization-token')),
+    )
     with pytest.raises(PermissionsError, match='Not a member'):
         await owner.list(other_organization_id)
+    with pytest.raises(PermissionsError, match='Not a member'):
+        await owner.github_token(other_organization_id)
 
 
 @pytest.mark.asyncio

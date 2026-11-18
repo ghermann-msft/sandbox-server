@@ -141,7 +141,7 @@ from openhands.sdk.llm import LLM
 from openhands.sdk.llm.llm_profile_store import PROFILE_NAME_REGEX
 from openhands.sdk.mcp.config import MCPServer
 from openhands.sdk.plugin import PluginSource
-from openhands.sdk.secret import LookupSecret, StaticSecret
+from openhands.sdk.secret import LookupSecret, SecretSource, StaticSecret
 from openhands.sdk.settings import ACPAgentSettings
 from openhands.sdk.subagent import get_registered_agent_definitions
 from openhands.sdk.tool import SUB_AGENT_TOOL_NAME
@@ -170,6 +170,30 @@ _logger = logging.getLogger(__name__)
 _EXPORT_LOCK_KEY_PREFIX = 'app_conversation_export'
 _PERFORCE_SECRET_ENV_VARS = ('P4PORT', 'P4USER', 'P4PASSWD')
 _SECRET_REFERENCE_PATTERN = re.compile(r'^\$\{[A-Za-z_][A-Za-z0-9_]*\}$')
+_COPILOT_GITHUB_TOKEN_SECRET = 'COPILOT_GITHUB_TOKEN'
+
+
+def add_copilot_github_token_secret(
+    agent_settings: Any,
+    secrets: dict[str, SecretSource],
+    provider_tokens: PROVIDER_TOKEN_TYPE | None,
+) -> None:
+    """Add the effective GitHub OAuth token only to Copilot ACP launches."""
+
+    if (
+        not isinstance(agent_settings, ACPAgentSettings)
+        or agent_settings.acp_server != 'copilot-cli'
+        or _COPILOT_GITHUB_TOKEN_SECRET in secrets
+        or not provider_tokens
+    ):
+        return
+    github_token = provider_tokens.get(ProviderType.GITHUB)
+    if github_token is None or github_token.token is None:
+        return
+    secrets[_COPILOT_GITHUB_TOKEN_SECRET] = StaticSecret(
+        value=github_token.token,
+        description='Effective GitHub OAuth token for Copilot CLI',
+    )
 
 
 def _resolve_title_llm_profile(user: UserInfo) -> str | None:
@@ -2700,7 +2724,7 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
         # causing provider auth to silently fail at subprocess launch.
         # Use raw custom secrets, static git provider tokens, and static
         # integration-scoped secrets for ACP conversations.
-        secrets: dict = await self.user_context.get_secrets()
+        secrets: dict[str, SecretSource] = await self.user_context.get_secrets()
         provider_tokens = cast(
             PROVIDER_TOKEN_TYPE | None,
             await self.user_context.get_provider_tokens(),
@@ -2716,6 +2740,11 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
                         value=SecretStr(static_token),
                         description=f'{provider_type.name} authentication token',
                     )
+        add_copilot_github_token_secret(
+            user.agent_settings,
+            secrets,
+            provider_tokens,
+        )
 
         enrichment = await self.conversation_secret_enricher.enrich(
             user_context=self.user_context,
