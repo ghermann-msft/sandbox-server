@@ -139,6 +139,20 @@ Conversation creation accepts the requested tenant in `X-Org-Id`, verifies the
 authenticated user's durable membership, and persists the stable organization
 ID with the conversation. A body-supplied organization cannot bypass that check.
 
+Authenticated organization members can inspect membership through:
+
+- `GET /api/organizations/{organization_id}/members`
+- `PATCH /api/organizations/{organization_id}/members/{user_id}` with
+  `{"role": "owner" | "admin" | "member"}`
+
+Owners and admins can update shared-organization roles. Personal-organization
+roles are immutable, and the final owner of a shared organization cannot be
+demoted. Identity provider, tenant, and subject identifiers are response-only.
+
+Self-hosted deployments advertise Canvas integration settings through
+`feature_flags.enable_canvas_integrations` in `GET /api/v1/web-client/config`.
+Set `ENABLE_CANVAS_INTEGRATIONS=false` to hide them explicitly.
+
 ## Docker
 
 ```bash

@@ -168,6 +168,36 @@ class TestGetFeatureFlags:
             assert result.enable_jira is False
             assert result.enable_jira_dc is False
             assert result.enable_linear is False
+            assert result.enable_canvas_integrations is False
+
+    def test_canvas_integrations_enabled_for_self_hosted_deployment(self):
+        from openhands.app_server.web_client.default_web_client_config_injector import (
+            _get_feature_flags,
+        )
+
+        with patch.dict(
+            os.environ,
+            {'OH_DEPLOYMENT_MODE': 'self_hosted'},
+            clear=True,
+        ):
+            result = _get_feature_flags()
+            assert result.enable_canvas_integrations is True
+
+    def test_canvas_integrations_can_be_disabled_for_self_hosted_deployment(self):
+        from openhands.app_server.web_client.default_web_client_config_injector import (
+            _get_feature_flags,
+        )
+
+        with patch.dict(
+            os.environ,
+            {
+                'OH_DEPLOYMENT_MODE': 'self_hosted',
+                'ENABLE_CANVAS_INTEGRATIONS': 'false',
+            },
+            clear=True,
+        ):
+            result = _get_feature_flags()
+            assert result.enable_canvas_integrations is False
 
     def test_enable_billing_true_when_env_var_true(self):
         """When ENABLE_BILLING is 'true', enable_billing flag is True."""

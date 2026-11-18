@@ -12,6 +12,9 @@ from openhands.app_server.integrations.service_types import ProviderType
 from openhands.app_server.web_client.web_client_config_injector import (
     WebClientConfigInjector,
 )
+from openhands.app_server.web_client.web_client_deployment_mode import (
+    get_deployment_mode,
+)
 from openhands.app_server.web_client.web_client_models import (
     ACPModelOption,
     ACPProviderConfig,
@@ -192,6 +195,14 @@ def _get_feature_flags() -> WebClientFeatureFlags:
         and _is_absolute_https_url(github_success_url)
         and github_app_slug
     )
+    canvas_integrations = os.getenv('ENABLE_CANVAS_INTEGRATIONS')
+    if canvas_integrations is None:
+        enable_canvas_integrations = (
+            get_deployment_mode() == 'self_hosted' or github_oauth_configured
+        )
+    else:
+        enable_canvas_integrations = canvas_integrations == 'true'
+
     return WebClientFeatureFlags(
         enable_billing=os.getenv('ENABLE_BILLING', 'false') == 'true',
         hide_llm_settings=os.getenv('HIDE_LLM_SETTINGS', 'false') == 'true',
@@ -210,7 +221,7 @@ def _get_feature_flags() -> WebClientFeatureFlags:
         enable_acp=os.getenv('ENABLE_ACP', 'true') == 'true',
         enable_onboarding=os.getenv('OH_ENABLE_ONBOARDING', 'false') == 'true',
         enable_automations=os.getenv('ENABLE_AUTOMATIONS', 'true') == 'true',
-        enable_canvas_integrations=github_oauth_configured,
+        enable_canvas_integrations=enable_canvas_integrations,
         enable_oauth_v2_login=github_oauth_configured,
         github_app_install_url=(
             f'https://github.com/apps/{github_app_slug}/installations/new'

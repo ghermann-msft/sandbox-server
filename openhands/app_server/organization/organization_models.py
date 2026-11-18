@@ -4,7 +4,7 @@ from datetime import datetime
 from enum import StrEnum
 from uuid import UUID, uuid4
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import (
     Boolean,
     DateTime,
@@ -160,3 +160,25 @@ class OrganizationMembershipResponse(BaseModel):
     user_id: UUID
     role: OrganizationRole
     permissions: list[OrganizationPermission]
+
+
+class OrganizationMemberIdentity(BaseModel):
+    provider: str
+    tenant_id: str | None = None
+    subject_id: str
+
+
+class OrganizationMember(BaseModel):
+    user_id: UUID
+    identity: OrganizationMemberIdentity
+    role: OrganizationRole
+
+
+class OrganizationMemberListResponse(BaseModel):
+    items: list[OrganizationMember]
+
+
+class OrganizationRoleUpdate(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+
+    role: OrganizationRole
