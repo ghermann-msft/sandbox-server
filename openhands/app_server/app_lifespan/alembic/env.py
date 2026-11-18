@@ -34,6 +34,9 @@ from openhands.app_server.hindsight.hindsight_service import (  # noqa: E402
 from openhands.app_server.integrations.github.oauth_models import (  # noqa: E402
     StoredGitHubOAuthState,  # noqa: F401
 )
+from openhands.app_server.organization.agent_profile_models import (  # noqa: E402
+    StoredOrganizationAgentProfiles,  # noqa: F401
+)
 from openhands.app_server.organization.connection_models import (  # noqa: E402
     StoredOrganizationConnection,  # noqa: F401
 )

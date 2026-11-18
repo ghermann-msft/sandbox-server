@@ -15,6 +15,9 @@ from openhands.app_server.integrations.provider import (
     ProviderType,
 )
 from openhands.app_server.integrations.service_types import UserGitInfo
+from openhands.app_server.organization.agent_profile_service import (
+    OrganizationAgentProfileService,
+)
 from openhands.app_server.organization.connection_service import (
     OrganizationConnectionService,
 )
@@ -28,6 +31,7 @@ from openhands.app_server.user.specifiy_user_context import USER_CONTEXT_ATTR
 from openhands.app_server.user.user_context import UserContext, UserContextInjector
 from openhands.app_server.user.user_models import UserInfo
 from openhands.app_server.user_auth.user_auth import UserAuth, get_user_auth
+from openhands.sdk.profiles import resolve_agent_profile as resolve_profile_settings
 from openhands.sdk.secret import SecretSource, StaticSecret
 
 USER_AUTH_ATTR = 'user_auth'
@@ -77,7 +81,11 @@ class AuthUserContext(UserContext):
                 override_agent_profile_id=override_agent_profile_id,
             )
             override_user_info = self._user_info_from_settings(user_id, settings)
-            return await self._with_organization_settings(override_user_info)
+            return await self._with_organization_settings(
+                override_user_info,
+                resolve_agent_profile=True,
+                override_agent_profile_id=override_agent_profile_id,
+            )
         if resolve_agent_profile:
             resolved_user_info = self._resolved_user_info
             if resolved_user_info is None:
@@ -87,7 +95,10 @@ class AuthUserContext(UserContext):
                 )
                 resolved_user_info = self._user_info_from_settings(user_id, settings)
                 self._resolved_user_info = resolved_user_info
-            return await self._with_organization_settings(resolved_user_info)
+            return await self._with_organization_settings(
+                resolved_user_info,
+                resolve_agent_profile=True,
+            )
         cached_user_info = self._user_info
         if cached_user_info is None:
             user_id = await self.get_user_id()
@@ -96,7 +107,13 @@ class AuthUserContext(UserContext):
             self._user_info = cached_user_info
         return await self._with_organization_settings(cached_user_info)
 
-    async def _with_organization_settings(self, user_info: UserInfo) -> UserInfo:
+    async def _with_organization_settings(
+        self,
+        user_info: UserInfo,
+        *,
+        resolve_agent_profile: bool = False,
+        override_agent_profile_id: str | None = None,
+    ) -> UserInfo:
         organization_id = await self.get_effective_org_id()
         if organization_id is None:
             return user_info
@@ -113,9 +130,10 @@ class AuthUserContext(UserContext):
             organization_profiles = await OrganizationProfileService(
                 session, self, config.jwt.get_jwt_service()
             ).load(organization_id, shared_required=False)
+            agent_profiles = await OrganizationAgentProfileService(session, self).load(
+                organization_id
+            )
             await session.commit()
-        if not organization_mcp and not organization_profiles.profiles:
-            return user_info
         merged_mcp = dict(user_info.agent_settings.mcp_config)
         merged_mcp.update(organization_mcp)
         agent_updates: dict[str, Any] = {'mcp_config': merged_mcp}
@@ -123,12 +141,48 @@ class AuthUserContext(UserContext):
             agent_updates['llm'] = organization_profiles.require(
                 organization_profiles.active
             )
-        return user_info.model_copy(
+        llm_profiles = (
+            organization_profiles
+            if organization_profiles.profiles
+            else user_info.llm_profiles
+        )
+        effective_user = user_info.model_copy(
             update={
                 'agent_settings': user_info.agent_settings.model_copy(
                     update=agent_updates
                 ),
-                'llm_profiles': organization_profiles,
+                'llm_profiles': llm_profiles,
+            }
+        )
+        if not resolve_agent_profile:
+            return effective_user
+
+        profile_id = override_agent_profile_id or agent_profiles.active
+        if profile_id is None:
+            return effective_user
+        profile = agent_profiles.profiles.get(profile_id)
+        if profile is None:
+            raise ValueError(f'Agent profile id {profile_id!r} not found')
+
+        class _LLMProfileLoader:
+            def load(self, name: str, cipher: Any = None):
+                del cipher
+                llm = llm_profiles.get(name)
+                if llm is None:
+                    raise FileNotFoundError(name)
+                return llm
+
+        resolved_settings = resolve_profile_settings(
+            profile,
+            llm_store=_LLMProfileLoader(),
+            mcp_config=effective_user.agent_settings.mcp_config,
+            available_skills=None,
+        )
+        return effective_user.model_copy(
+            update={
+                'agent_settings': resolved_settings,
+                'active_agent_profile_id': str(profile.id),
+                'active_agent_profile_revision': profile.revision,
             }
         )
 

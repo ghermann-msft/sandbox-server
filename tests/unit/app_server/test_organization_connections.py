@@ -11,6 +11,12 @@ from sqlalchemy.pool import StaticPool
 
 from openhands.app_server.errors import PermissionsError
 from openhands.app_server.integrations.provider import ProviderToken
+from openhands.app_server.organization.agent_profile_models import (
+    StoredOrganizationAgentProfiles,
+)
+from openhands.app_server.organization.agent_profile_service import (
+    OrganizationAgentProfileService,
+)
 from openhands.app_server.organization.connection_models import (
     MCPConnectionUpsert,
     OrganizationConnectionKind,
@@ -38,6 +44,7 @@ from openhands.app_server.organization.profile_models import (
 )
 from openhands.app_server.organization.profile_service import OrganizationProfileService
 from openhands.app_server.services.jwt_service import JwtService
+from openhands.app_server.settings.agent_profiles import AgentProfiles
 from openhands.app_server.settings.llm_profiles import LLMProfiles
 from openhands.app_server.settings.settings_models import Settings
 from openhands.app_server.settings.sql_settings_store import StoredUserSettings
@@ -46,6 +53,8 @@ from openhands.app_server.user.specifiy_user_context import SpecifyUserContext
 from openhands.app_server.utils.encryption_key import EncryptionKey
 from openhands.app_server.utils.sql_utils import Base
 from openhands.sdk.mcp.config import MCPServer
+from openhands.sdk.profiles import validate_agent_profile
+from openhands.sdk.settings import ACPAgentSettings
 
 
 @dataclass(frozen=True)
@@ -533,6 +542,8 @@ async def test_shared_connections_and_active_profile_overlay_conversation_settin
     profiles.active = 'halo'
     organization_profiles = MagicMock()
     organization_profiles.load = AsyncMock(return_value=profiles)
+    agent_profiles = MagicMock()
+    agent_profiles.load = AsyncMock(return_value=AgentProfiles())
 
     with (
         patch(
@@ -547,6 +558,10 @@ async def test_shared_connections_and_active_profile_overlay_conversation_settin
             'openhands.app_server.user.auth_user_context.OrganizationProfileService',
             return_value=organization_profiles,
         ),
+        patch(
+            'openhands.app_server.user.auth_user_context.OrganizationAgentProfileService',
+            return_value=agent_profiles,
+        ),
     ):
         effective = await AuthUserContext(user_auth).get_user_info()
 
@@ -554,3 +569,116 @@ async def test_shared_connections_and_active_profile_overlay_conversation_settin
     assert 'shared-secret' in perforce.model_dump_json(context={'expose_secrets': True})
     assert effective.llm_profiles.active == 'halo'
     assert effective.agent_settings.llm.model == 'openai/gpt-4.1'
+
+
+@pytest.mark.asyncio
+async def test_agent_profiles_are_scoped_durable_and_member_read_only(db_session):
+    organization_id = await _add_shared_membership(
+        db_session, 'owner', OrganizationRole.OWNER
+    )
+    await _add_shared_membership(
+        db_session, 'member', OrganizationRole.MEMBER, organization_id
+    )
+    owner = OrganizationAgentProfileService(
+        db_session, _context('owner', organization_id)
+    )
+    profile = validate_agent_profile(
+        {
+            'name': 'copilot-ui',
+            'agent_kind': 'acp',
+            'acp_server': 'claude-code',
+        }
+    )
+
+    saved = await owner.save(organization_id, profile)
+    profile_id = next(iter(saved.profiles))
+    await owner.activate(organization_id, profile_id)
+    await db_session.commit()
+
+    row = await db_session.get(StoredOrganizationAgentProfiles, organization_id)
+    assert row is not None
+    assert 'copilot-ui' in row.payload
+    assert 'api_key' not in row.payload
+
+    member = OrganizationAgentProfileService(
+        db_session, _context('member', organization_id)
+    )
+    loaded = await member.load(organization_id)
+    assert loaded.active == profile_id
+    assert loaded.profiles[profile_id].agent_kind == 'acp'
+    assert loaded.profiles[profile_id].acp_server == 'claude-code'
+
+    with pytest.raises(PermissionsError):
+        await member.save(organization_id, profile)
+
+    renamed = await owner.rename(organization_id, 'copilot-ui', 'copilot-renamed')
+    assert renamed.active == profile_id
+    assert renamed.profiles[profile_id].name == 'copilot-renamed'
+    deleted = await owner.delete(organization_id, 'copilot-renamed')
+    assert deleted.active is None
+    assert deleted.profiles == {}
+
+
+@pytest.mark.asyncio
+async def test_explicit_agent_profile_override_resolves_acp_and_provenance():
+    organization_id = uuid4()
+    profile = validate_agent_profile(
+        {
+            'name': 'copilot-ui',
+            'agent_kind': 'acp',
+            'acp_server': 'claude-code',
+        }
+    )
+    profiles = AgentProfiles()
+    profiles.save(profile)
+    profile_id = str(profile.id)
+
+    user_auth = MagicMock()
+    user_auth.get_user_id = AsyncMock(return_value='entra:tenant-1:member')
+    user_auth.get_user_settings = AsyncMock(return_value=Settings())
+    user_auth.get_effective_org_id = AsyncMock(return_value=organization_id)
+
+    session = MagicMock()
+    session.commit = AsyncMock()
+
+    @asynccontextmanager
+    async def session_context():
+        yield session
+
+    config = MagicMock()
+    config.db_session.get_async_session_maker = AsyncMock(
+        return_value=lambda: session_context()
+    )
+    config.jwt.get_jwt_service.return_value = _jwt_service()
+
+    connections = MagicMock()
+    connections.mcp_servers = AsyncMock(return_value={})
+    organization_profiles = MagicMock()
+    organization_profiles.load = AsyncMock(return_value=LLMProfiles())
+    agent_profiles = MagicMock()
+    agent_profiles.load = AsyncMock(return_value=profiles)
+
+    with (
+        patch('openhands.app_server.config.get_global_config', return_value=config),
+        patch(
+            'openhands.app_server.user.auth_user_context.OrganizationConnectionService',
+            return_value=connections,
+        ),
+        patch(
+            'openhands.app_server.user.auth_user_context.OrganizationProfileService',
+            return_value=organization_profiles,
+        ),
+        patch(
+            'openhands.app_server.user.auth_user_context.OrganizationAgentProfileService',
+            return_value=agent_profiles,
+        ),
+    ):
+        effective = await AuthUserContext(user_auth).get_user_info(
+            resolve_agent_profile=True,
+            override_agent_profile_id=profile_id,
+        )
+
+    assert isinstance(effective.agent_settings, ACPAgentSettings)
+    assert effective.agent_settings.acp_server == 'claude-code'
+    assert effective.active_agent_profile_id == profile_id
+    assert effective.active_agent_profile_revision == profile.revision
