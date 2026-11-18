@@ -135,9 +135,10 @@ membership, roles, and permissions. Organization memory requires
 `hindsight:recall` or `hindsight:retain`; scope-binding files contain metadata
 and repository allowlists only.
 
-Conversation creation accepts the requested tenant in `X-Org-Id`, verifies the
-authenticated user's durable membership, and persists the stable organization
-ID with the conversation. A body-supplied organization cannot bypass that check.
+Conversation creation accepts the requested tenant in
+`X-OpenHands-Organization-ID`, verifies the authenticated user's durable
+membership, and persists the stable organization ID with the conversation. A
+body-supplied organization cannot bypass that check.
 
 Authenticated organization members can inspect membership through:
 

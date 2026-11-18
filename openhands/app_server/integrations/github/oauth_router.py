@@ -6,10 +6,11 @@ from datetime import datetime, timedelta, timezone
 from types import MappingProxyType
 from typing import cast
 from urllib.parse import urlencode, urlparse
+from uuid import UUID
 
 import httpx
 import jwt
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, status
 from fastapi.responses import RedirectResponse
 from pydantic import BaseModel, SecretStr
 from sqlalchemy import update
@@ -17,17 +18,30 @@ from sqlalchemy.engine import CursorResult
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from openhands.agent_server.utils import utc_now
-from openhands.app_server.config import depends_jwt_service
+from openhands.app_server.config import depends_jwt_service, depends_user_context
 from openhands.app_server.integrations.github.github_service import GitHubService
 from openhands.app_server.integrations.github.oauth_models import (
     StoredGitHubOAuthState,
 )
 from openhands.app_server.integrations.provider import ProviderToken
 from openhands.app_server.integrations.service_types import ProviderType
+from openhands.app_server.organization.connection_models import (
+    OrganizationConnectionKind,
+)
+from openhands.app_server.organization.connection_service import (
+    OrganizationConnectionService,
+)
+from openhands.app_server.organization.organization_models import (
+    OrganizationKind,
+    OrganizationPermission,
+    StoredOrganization,
+)
+from openhands.app_server.organization.organization_service import OrganizationService
 from openhands.app_server.secrets.secrets_models import Secrets
 from openhands.app_server.secrets.secrets_store import SecretsStore
 from openhands.app_server.services.db_session import depends_db_session
 from openhands.app_server.services.jwt_service import JwtService
+from openhands.app_server.user.user_context import UserContext
 from openhands.app_server.user_auth import (
     get_secrets_store,
     get_user_id,
@@ -77,17 +91,36 @@ def _normalize_db_datetime(value: datetime) -> datetime:
 router = APIRouter(prefix='/oauth', tags=['OAuth'])
 jwt_service_dependency = depends_jwt_service()
 db_session_dependency = depends_db_session()
+user_context_dependency = depends_user_context()
+requested_org_id_header = Header(default=None, alias='X-OpenHands-Organization-ID')
 
 
 @router.get('/git-providers', response_model=list[GitProviderStatus])
 async def list_git_provider_status(
+    requested_org_id: UUID | None = requested_org_id_header,
     secrets_store: SecretsStore = Depends(get_secrets_store),
+    user_context: UserContext = user_context_dependency,
+    jwt_service: JwtService = jwt_service_dependency,
+    db_session: AsyncSession = db_session_dependency,
 ) -> list[GitProviderStatus]:
-    user_secrets = await secrets_store.load()
-    github_token = (
-        user_secrets.provider_tokens.get(ProviderType.GITHUB) if user_secrets else None
+    organization_service = OrganizationService(db_session, user_context)
+    organization_id = await organization_service.resolve_organization_id(
+        requested_org_id, OrganizationPermission.ORG_VIEW
     )
-    connected = bool(github_token and github_token.token)
+    organization = await db_session.get(StoredOrganization, organization_id)
+    if organization and organization.kind == OrganizationKind.SHARED.value:
+        connection = await OrganizationConnectionService(
+            db_session, user_context, jwt_service
+        ).github_token(organization_id)
+        connected = connection is not None
+    else:
+        user_secrets = await secrets_store.load()
+        github_token = (
+            user_secrets.provider_tokens.get(ProviderType.GITHUB)
+            if user_secrets
+            else None
+        )
+        connected = bool(github_token and github_token.token)
     return [
         GitProviderStatus(
             id=_GITHUB_PROVIDER_ID,
@@ -101,7 +134,9 @@ async def list_git_provider_status(
 @router.post('/{provider_id}/link', response_model=GitProviderLinkResponse)
 async def link_git_provider(
     provider_id: int,
+    requested_org_id: UUID | None = requested_org_id_header,
     user_id: str | None = Depends(get_user_id),
+    user_context: UserContext = user_context_dependency,
     jwt_service: JwtService = jwt_service_dependency,
     db_session: AsyncSession = db_session_dependency,
 ) -> GitProviderLinkResponse:
@@ -115,6 +150,17 @@ async def link_git_provider(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail='Authenticated user required',
         )
+    organization_service = OrganizationService(db_session, user_context)
+    organization_id = await organization_service.resolve_organization_id(
+        requested_org_id, OrganizationPermission.ORG_VIEW
+    )
+    await organization_service.require_any_permission(
+        organization_id,
+        {
+            OrganizationPermission.ORG_MANAGE,
+            OrganizationPermission.ORG_MANAGE_MEMBERS,
+        },
+    )
     client_id, _, callback_url, _ = _github_oauth_config()
     nonce = secrets.token_urlsafe(32)
     expires_at = utc_now() + _STATE_LIFETIME
@@ -122,6 +168,7 @@ async def link_git_provider(
         StoredGitHubOAuthState(
             nonce=nonce,
             user_id=user_id,
+            organization_id=organization_id,
             expires_at=expires_at,
         )
     )
@@ -131,6 +178,7 @@ async def link_git_provider(
             'purpose': 'github-oauth',
             'nonce': nonce,
             'user_id': user_id,
+            'organization_id': str(organization_id),
         },
         expires_in=_STATE_LIFETIME,
     )
@@ -150,6 +198,7 @@ async def github_oauth_callback(
     state_token: str = Query(alias='state', min_length=1),
     user_id: str | None = Depends(get_user_id),
     secrets_store: SecretsStore = Depends(get_secrets_store),
+    user_context: UserContext = user_context_dependency,
     jwt_service: JwtService = jwt_service_dependency,
     db_session: AsyncSession = db_session_dependency,
 ) -> RedirectResponse:
@@ -170,6 +219,7 @@ async def github_oauth_callback(
         state_claims.get('purpose') != 'github-oauth'
         or state_claims.get('user_id') != user_id
         or not isinstance(state_claims.get('nonce'), str)
+        or not isinstance(state_claims.get('organization_id'), str)
     ):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -177,11 +227,19 @@ async def github_oauth_callback(
         )
 
     nonce = state_claims['nonce']
+    try:
+        organization_id = UUID(state_claims['organization_id'])
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail='Invalid OAuth state',
+        ) from exc
     stored_state = await db_session.get(StoredGitHubOAuthState, nonce)
     now = utc_now()
     if (
         stored_state is None
         or stored_state.user_id != user_id
+        or stored_state.organization_id != organization_id
         or stored_state.consumed_at is not None
         or _normalize_db_datetime(stored_state.expires_at) <= now
     ):
@@ -189,6 +247,14 @@ async def github_oauth_callback(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail='Invalid or already used OAuth state',
         )
+    organization_service = OrganizationService(db_session, user_context)
+    await organization_service.require_any_permission(
+        organization_id,
+        {
+            OrganizationPermission.ORG_MANAGE,
+            OrganizationPermission.ORG_MANAGE_MEMBERS,
+        },
+    )
     consume_result = cast(
         CursorResult,
         await db_session.execute(
@@ -233,19 +299,31 @@ async def github_oauth_callback(
 
     github = GitHubService(token=SecretStr(access_token))
     github_user = await github.get_user()
-    existing = await secrets_store.load()
-    provider_tokens = dict(existing.provider_tokens) if existing else {}
-    provider_tokens[ProviderType.GITHUB] = ProviderToken(
+    provider_token = ProviderToken(
         token=SecretStr(access_token),
         user_id=github_user.id,
         host='github.com',
     )
-    await secrets_store.store(
-        Secrets(
-            provider_tokens=MappingProxyType(provider_tokens),
-            custom_secrets=existing.custom_secrets if existing else {},
+    organization = await db_session.get(StoredOrganization, organization_id)
+    if organization is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail='OAuth organization no longer exists',
         )
-    )
+    if organization.kind == OrganizationKind.SHARED.value:
+        await OrganizationConnectionService(
+            db_session, user_context, jwt_service
+        ).store_github_token(organization_id, provider_token)
+    else:
+        existing = await secrets_store.load()
+        provider_tokens = dict(existing.provider_tokens) if existing else {}
+        provider_tokens[ProviderType.GITHUB] = provider_token
+        await secrets_store.store(
+            Secrets(
+                provider_tokens=MappingProxyType(provider_tokens),
+                custom_secrets=existing.custom_secrets if existing else {},
+            )
+        )
 
     return RedirectResponse(success_url, status_code=status.HTTP_303_SEE_OTHER)
 
@@ -253,13 +331,34 @@ async def github_oauth_callback(
 @router.delete('/{provider_id}/link')
 async def unlink_git_provider(
     provider_id: int,
+    requested_org_id: UUID | None = requested_org_id_header,
     secrets_store: SecretsStore = Depends(get_secrets_store),
+    user_context: UserContext = user_context_dependency,
+    jwt_service: JwtService = jwt_service_dependency,
+    db_session: AsyncSession = db_session_dependency,
 ) -> dict[str, bool]:
     if provider_id != _GITHUB_PROVIDER_ID:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail='Git provider not found',
         )
+    organization_service = OrganizationService(db_session, user_context)
+    organization_id = await organization_service.resolve_organization_id(
+        requested_org_id, OrganizationPermission.ORG_VIEW
+    )
+    await organization_service.require_any_permission(
+        organization_id,
+        {
+            OrganizationPermission.ORG_MANAGE,
+            OrganizationPermission.ORG_MANAGE_MEMBERS,
+        },
+    )
+    organization = await db_session.get(StoredOrganization, organization_id)
+    if organization and organization.kind == OrganizationKind.SHARED.value:
+        await OrganizationConnectionService(
+            db_session, user_context, jwt_service
+        ).delete(organization_id, OrganizationConnectionKind.GITHUB)
+        return {'connected': False}
     existing = await secrets_store.load()
     if existing and ProviderType.GITHUB in existing.provider_tokens:
         provider_tokens = dict(existing.provider_tokens)

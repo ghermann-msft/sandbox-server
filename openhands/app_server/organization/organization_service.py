@@ -163,6 +163,21 @@ class OrganizationService:
             permissions=[OrganizationPermission(value) for value in permissions],
         )
 
+    async def require_any_permission(
+        self,
+        organization_id: UUID,
+        permissions: set[OrganizationPermission],
+    ) -> OrganizationMembershipResponse:
+        membership = await self.require_permission(
+            organization_id, OrganizationPermission.ORG_VIEW
+        )
+        if not permissions.intersection(membership.permissions):
+            names = ', '.join(sorted(permission.value for permission in permissions))
+            raise PermissionsError(
+                f'Missing one of the required organization permissions: {names}'
+            )
+        return membership
+
     async def list_organizations(
         self, requested_org_id: UUID | None = None
     ) -> OrganizationListResponse:
@@ -429,7 +444,7 @@ def bootstrap_organization_from_env(engine: Engine) -> None:
             OrganizationRole(role.name): role
             for role in session.scalars(select(StoredRole)).all()
         }
-        missing_roles: set[OrganizationRole] = set(OrganizationRole).difference(roles)
+        missing_roles = {role for role in OrganizationRole if role not in roles}
         if missing_roles:
             raise RuntimeError(
                 'RBAC roles are not seeded: '
