@@ -78,7 +78,7 @@ from openhands.app_server.sandbox.sandbox_access import (
     can_access_sandbox_credentials,
 )
 from openhands.app_server.sandbox.sandbox_lifecycle import (
-    release_sandbox_if_inactive,
+    release_sandbox_if_unreferenced,
 )
 from openhands.app_server.sandbox.sandbox_models import (
     AGENT_SERVER,
@@ -921,7 +921,7 @@ async def _finalize_sandbox_delete(
                 sandbox_id,
             )
         else:
-            await release_sandbox_if_inactive(
+            await release_sandbox_if_unreferenced(
                 app_conversation_info_service,
                 sandbox_service,
                 sandbox_id,

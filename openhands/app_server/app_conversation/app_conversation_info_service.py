@@ -98,10 +98,6 @@ class AppConversationInfoService(ABC):
         conversation is removed (only delete if count is 0).
         """
 
-    @abstractmethod
-    async def count_active_conversations_by_sandbox_id(self, sandbox_id: str) -> int:
-        """Count non-terminal V1 conversations that reference a sandbox."""
-
     # Mutators
 
     @abstractmethod

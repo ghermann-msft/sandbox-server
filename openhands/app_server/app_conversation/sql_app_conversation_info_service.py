@@ -37,7 +37,6 @@ from sqlalchemy import (
     String,
     Uuid,
     func,
-    or_,
     select,
 )
 from sqlalchemy.engine import CursorResult
@@ -66,7 +65,7 @@ from openhands.app_server.utils.sql_utils import (
     Base,
     create_json_type_decorator,
 )
-from openhands.sdk import ConversationExecutionStatus, ConversationStats
+from openhands.sdk import ConversationStats
 from openhands.sdk.event import ConversationStateUpdateEvent
 from openhands.sdk.llm import MetricsSnapshot, TokenUsage
 
@@ -421,25 +420,6 @@ class SQLAppConversationInfoService(AppConversationInfoService):
         result = await self.db_session.execute(count_query)
         count = result.scalar()
         return count or 0
-
-    async def count_active_conversations_by_sandbox_id(self, sandbox_id: str) -> int:
-        query = await self._secure_select()
-        terminal_statuses = tuple(
-            status.value
-            for status in ConversationExecutionStatus
-            if status.is_terminal()
-        )
-        query = query.where(
-            StoredConversationMetadata.sandbox_id == sandbox_id,
-            or_(
-                StoredConversationMetadata.execution_status.is_(None),
-                StoredConversationMetadata.execution_status.not_in(terminal_statuses),
-            ),
-        )
-        result = await self.db_session.execute(
-            select(func.count()).select_from(query.subquery())
-        )
-        return result.scalar() or 0
 
     async def get_app_conversation_info(
         self, conversation_id: UUID | str

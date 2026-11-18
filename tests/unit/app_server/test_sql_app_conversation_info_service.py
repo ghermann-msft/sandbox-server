@@ -22,6 +22,7 @@ from openhands.app_server.app_conversation.sql_app_conversation_info_service imp
     SQLAppConversationInfoService,
 )
 from openhands.app_server.integrations.service_types import ProviderType
+from openhands.app_server.sandbox.sandbox_lifecycle import active_sandbox_ids
 from openhands.app_server.user.specifiy_user_context import SpecifyUserContext
 from openhands.app_server.utils.sql_utils import Base
 from openhands.sdk.llm import MetricsSnapshot, TokenUsage
@@ -372,9 +373,10 @@ class TestSQLAppConversationInfoService:
         assert await service.count_conversations_by_sandbox_id('no_such_sandbox') == 0
 
     @pytest.mark.asyncio
-    async def test_count_active_conversations_excludes_terminal_statuses(
+    async def test_active_sandbox_ids_include_completed_conversations(
         self,
         service: SQLAppConversationInfoService,
+        async_session: AsyncSession,
     ):
         sandbox_id = 'shared-sandbox'
         conversation_ids = [uuid4(), uuid4(), uuid4()]
@@ -389,7 +391,7 @@ class TestSQLAppConversationInfoService:
         await service.update_execution_status(conversation_ids[1], 'finished')
         await service.update_execution_status(conversation_ids[2], 'running')
 
-        assert await service.count_active_conversations_by_sandbox_id(sandbox_id) == 2
+        assert await active_sandbox_ids(async_session) == {sandbox_id}
 
     @pytest.mark.asyncio
     async def test_search_conversation_info_no_filters(
