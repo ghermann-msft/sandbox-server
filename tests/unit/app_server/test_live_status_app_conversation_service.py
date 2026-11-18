@@ -489,6 +489,9 @@ class TestLiveStatusAppConversationService:
     @pytest.mark.asyncio
     async def test_initialize_agent_server_sends_trusted_hindsight_scope(self):
         organization_id = uuid4()
+        self.mock_sandbox_service.get_sandbox_internal_url = AsyncMock(
+            return_value='http://sandbox.agents.svc.cluster.local:8000'
+        )
         self.mock_sandbox_service.get_sandbox_init_api_key = AsyncMock(
             return_value='bootstrap-key'
         )
@@ -530,7 +533,9 @@ class TestLiveStatusAppConversationService:
             )
 
         post = self.mock_httpx_client.post.await_args
-        assert post.args[0] == 'http://agent-server/api/init'
+        assert post.args[0] == 'http://sandbox.agents.svc.cluster.local:8000/api/init'
+        get = self.mock_httpx_client.get.await_args
+        assert get.args[0] == 'http://sandbox.agents.svc.cluster.local:8000/api/init'
         assert post.kwargs['headers'] == {'X-Init-API-Key': 'bootstrap-key'}
         assert post.kwargs['json']['session_api_keys'] == ['session-key']
         assert post.kwargs['json']['secret_key'] == 'session-key'
@@ -558,6 +563,9 @@ class TestLiveStatusAppConversationService:
 
     @pytest.mark.asyncio
     async def test_initialize_agent_server_requires_dormant_bootstrap_key(self):
+        self.mock_sandbox_service.get_sandbox_internal_url = AsyncMock(
+            return_value='http://sandbox.agents.svc.cluster.local:8000'
+        )
         self.mock_sandbox_service.get_sandbox_init_api_key = AsyncMock(
             return_value=None
         )

@@ -1239,7 +1239,10 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
             secret_key=session_api_key,
             hindsight_memory=hindsight_memory,
         )
-        init_url = f'{agent_server_url}/api/init'
+        internal_url = await self.sandbox_service.get_sandbox_internal_url(
+            sandbox.id, AGENT_SERVER
+        )
+        init_url = f'{internal_url or agent_server_url}/api/init'
         response = await self.httpx_client.get(
             init_url, timeout=self.sandbox_startup_timeout
         )

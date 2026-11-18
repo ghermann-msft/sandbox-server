@@ -1040,6 +1040,41 @@ class KubernetesSandboxService(SandboxService):
             return None
         return self._init_api_key(claim)
 
+    async def get_sandbox_internal_url(
+        self, sandbox_id: str, service_name: str
+    ) -> str | None:
+        claim = await asyncio.to_thread(self._get_claim_sync, sandbox_id)
+        if claim is None:
+            return None
+        sandbox_name = _sandbox_name(claim)
+        if not sandbox_name:
+            raise SandboxError(
+                f'Sandbox controller has not assigned a runtime for {sandbox_id}'
+            )
+        sandbox = await asyncio.to_thread(self._get_sandbox_object_sync, sandbox_name)
+        if sandbox is None:
+            raise SandboxError(f'Sandbox runtime not found: {sandbox_id}')
+        service_fqdn = _value(
+            sandbox.get('status') or {}, 'serviceFQDN', 'service_fqdn'
+        )
+        if not isinstance(service_fqdn, str) or not service_fqdn:
+            raise SandboxError(
+                f'Sandbox runtime has no internal service address: {sandbox_id}'
+            )
+        port = next(
+            (
+                exposed_port.container_port
+                for exposed_port in self.exposed_ports
+                if exposed_port.name == service_name
+            ),
+            None,
+        )
+        if port is None:
+            raise SandboxError(
+                f'Sandbox service port is not configured: {service_name}'
+            )
+        return f'http://{service_fqdn}:{port}'
+
     async def get_sandbox_startup_observation(
         self, sandbox_id: str
     ) -> SandboxStartupObservation:

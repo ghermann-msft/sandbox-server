@@ -179,6 +179,12 @@ class SandboxService(ABC):
         """
         return None
 
+    async def get_sandbox_internal_url(
+        self, sandbox_id: str, service_name: str
+    ) -> str | None:
+        """Return a control-plane-only URL for a service, when available."""
+        return None
+
     @abstractmethod
     async def get_sandbox_by_session_api_key(
         self, session_api_key: str

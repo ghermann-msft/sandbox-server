@@ -138,10 +138,17 @@ def _claim(sandbox_id='sb1', sandbox_name='sb-1', env=None):
     }
 
 
-def _sandbox(ready=True, operating_mode='Running', reason=None, message=None):
+def _sandbox(
+    ready=True,
+    operating_mode='Running',
+    reason=None,
+    message=None,
+    service_fqdn='sb-1.agents.svc.cluster.local',
+):
     return {
         'spec': {'operatingMode': operating_mode},
         'status': {
+            'serviceFQDN': service_fqdn,
             'conditions': [
                 {
                     'type': 'Ready',
@@ -149,7 +156,7 @@ def _sandbox(ready=True, operating_mode='Running', reason=None, message=None):
                     'reason': reason,
                     'message': message,
                 }
-            ]
+            ],
         },
     }
 
@@ -415,6 +422,30 @@ async def test_get_sandbox_init_api_key_does_not_fall_back_to_session_key(
     }
 
     assert await service.get_sandbox_init_api_key('sb1') is None
+
+
+async def test_get_sandbox_internal_url_uses_controller_service_fqdn(
+    service, custom_objects
+):
+    service.exposed_ports = [
+        type('P', (), {'name': AGENT_SERVER, 'container_port': 8000})()
+    ]
+    custom_objects.list_namespaced_custom_object.return_value = {'items': [_claim()]}
+    custom_objects.get_namespaced_custom_object.return_value = _sandbox()
+
+    url = await service.get_sandbox_internal_url('sb1', AGENT_SERVER)
+
+    assert url == 'http://sb-1.agents.svc.cluster.local:8000'
+
+
+async def test_get_sandbox_internal_url_requires_service_fqdn(service, custom_objects):
+    custom_objects.list_namespaced_custom_object.return_value = {'items': [_claim()]}
+    custom_objects.get_namespaced_custom_object.return_value = _sandbox(
+        service_fqdn=None
+    )
+
+    with pytest.raises(SandboxError, match='no internal service address'):
+        await service.get_sandbox_internal_url('sb1', AGENT_SERVER)
 
 
 async def test_get_legacy_sandbox_adopts_warm_pool_profile(service, custom_objects):
