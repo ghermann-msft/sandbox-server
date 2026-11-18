@@ -734,6 +734,92 @@ def test_recovered_storage_event_is_not_terminal(service):
     assert progress.phase != SandboxStartupPhase.FAILED
 
 
+@pytest.mark.asyncio
+async def test_transient_topology_provisioning_failure_continues_until_ready(service):
+    transient = service._startup_progress_from(
+        _claim(),
+        None,
+        [],
+        [
+            {
+                'metadata': {'name': 'workspace-pvc'},
+                'status': {'phase': 'Pending'},
+            }
+        ],
+        [
+            {
+                'reason': 'ProvisioningFailed',
+                'message': (
+                    'error generating accessibility requirements: '
+                    'no topology key found for node akshalo2500000e'
+                ),
+            }
+        ],
+    )
+    ready = service._startup_progress_from(
+        _claim(),
+        _sandbox(ready=True),
+        [],
+        [
+            {
+                'metadata': {'name': 'workspace-pvc'},
+                'status': {'phase': 'Bound'},
+            }
+        ],
+        [
+            {
+                'reason': 'ProvisioningFailed',
+                'message': (
+                    'error generating accessibility requirements: '
+                    'no topology key found for node akshalo2500000e'
+                ),
+            },
+            {'reason': 'ProvisioningSucceeded', 'message': 'provisioned'},
+        ],
+    )
+    service.get_sandbox_startup_observation = AsyncMock(side_effect=[transient, ready])
+    service.get_sandbox = AsyncMock(return_value=MagicMock(exposed_urls=[]))
+
+    progress = [
+        item
+        async for item in service.watch_sandbox_startup(
+            '6NM1Of5uSwiXtRgUXT4n84',
+            timeout=10,
+            inactivity_timeout=10,
+            poll_interval=0,
+        )
+    ]
+
+    assert [item.status for item in progress] == [
+        SandboxStartupProgressStatus.PROGRESSING,
+        SandboxStartupProgressStatus.READY,
+    ]
+    assert progress[0].phase == SandboxStartupPhase.PROVISIONING_STORAGE
+    assert progress[0].reason == 'WORKSPACE_STORAGE_PENDING'
+
+
+def test_terminal_storage_provisioning_failure_remains_terminal(service):
+    observation = service._startup_progress_from(
+        _claim(),
+        None,
+        [],
+        [],
+        [
+            {
+                'reason': 'ProvisioningFailed',
+                'message': (
+                    'failed to provision volume: rpc error: code = InvalidArgument '
+                    'desc = invalid storage account configuration'
+                ),
+            }
+        ],
+    )
+
+    assert observation.progress.status == SandboxStartupProgressStatus.FAILED
+    assert observation.progress.reason == 'STORAGE_PROVISIONING_FAILED'
+    assert 'invalid storage account configuration' in (observation.failure_detail or '')
+
+
 def test_terminal_storage_event_has_safe_structured_reason(service):
     observation = service._startup_progress_from(
         _claim(),

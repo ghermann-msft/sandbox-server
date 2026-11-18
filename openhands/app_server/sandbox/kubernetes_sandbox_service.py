@@ -133,6 +133,7 @@ _SAFE_STORAGE_REASON = {
 _TERMINAL_STORAGE_EVENT_REASONS = frozenset(
     {'FailedAttachVolume', 'FailedMount', 'ProvisioningFailed'}
 )
+_TRANSIENT_STORAGE_PROVISIONING_MARKERS = ('no topology key found for node',)
 _CAPACITY_EVENT_REASONS = frozenset(
     {'FailedScheduling', 'NotTriggerScaleUp', 'TriggeredScaleUp'}
 )
@@ -743,6 +744,11 @@ class KubernetesSandboxService(SandboxService):
             if latest_storage_event_reason in _TERMINAL_STORAGE_EVENT_REASONS
             else None
         )
+        if terminal_storage_reason == 'ProvisioningFailed' and any(
+            marker in latest_storage_event_message.lower()
+            for marker in _TRANSIENT_STORAGE_PROVISIONING_MARKERS
+        ):
+            terminal_storage_reason = None
         latest_scheduling_event = next(
             (
                 event
