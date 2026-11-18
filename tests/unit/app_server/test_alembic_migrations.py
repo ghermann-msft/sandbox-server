@@ -57,6 +57,7 @@ def test_upgrade_downgrade_upgrade(alembic_config):
         'organization_roles',
         'organization_permissions',
         'organization_role_permissions',
+        'conversation_cost_events',
     } <= tables
     assert {'hindsight:recall', 'hindsight:retain'} <= permissions
 

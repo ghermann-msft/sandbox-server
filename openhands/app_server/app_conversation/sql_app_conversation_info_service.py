@@ -775,6 +775,14 @@ class SQLAppConversationInfoService(AppConversationInfoService):
                 conversation_id,
                 stack_info=True,
             )
+            try:
+                await self.db_session.rollback()
+            except Exception:
+                logger.exception(
+                    'Failed to roll back session after statistics error for '
+                    'conversation %s',
+                    conversation_id,
+                )
 
     async def update_execution_status(
         self,

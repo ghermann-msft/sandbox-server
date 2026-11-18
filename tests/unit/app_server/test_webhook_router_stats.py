@@ -777,6 +777,7 @@ class TestProcessStatsEvent:
     ):
         """Test that errors from service are caught and logged."""
         conversation_id = uuid4()
+        rollback = AsyncMock()
 
         # Should not raise an exception
         with (
@@ -788,6 +789,7 @@ class TestProcessStatsEvent:
             patch(
                 'openhands.app_server.app_conversation.sql_app_conversation_info_service.logger'
             ) as mock_logger,
+            patch.object(service.db_session, 'rollback', rollback),
         ):
             await service.process_stats_event(
                 stats_event_with_dict_value, conversation_id
@@ -795,6 +797,7 @@ class TestProcessStatsEvent:
 
             # Verify error was logged
             mock_logger.exception.assert_called_once()
+            rollback.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_process_stats_event_empty_usage_to_metrics(
