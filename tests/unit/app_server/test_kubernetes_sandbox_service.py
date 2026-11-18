@@ -21,6 +21,9 @@ from kubernetes.client.rest import ApiException
 from pydantic import ValidationError
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
+from openhands.app_server.app_conversation.sql_app_conversation_info_service import (
+    StoredConversationMetadata,
+)
 from openhands.app_server.errors import SandboxError
 from openhands.app_server.sandbox.kubernetes_sandbox_service import (
     DURABLE_PVC_ANNOTATION,
@@ -381,6 +384,37 @@ async def test_get_sandbox_running_exposes_urls_and_key(service, custom_objects)
     assert info.session_api_key == 'secret-key'
     # DNS resolves the Sandbox resource name, not the app-level id.
     assert info.exposed_urls[0].url == 'https://sb-1.example.com:8000'
+
+
+async def test_get_sandbox_init_api_key_returns_dormant_secret(service, custom_objects):
+    custom_objects.list_namespaced_custom_object.return_value = {
+        'items': [
+            _claim(
+                env=[
+                    {'name': SECRET_KEY_VARIABLE, 'value': 'bootstrap-key'},
+                    {'name': SESSION_API_KEY_VARIABLE, 'value': 'session-key'},
+                ]
+            )
+        ]
+    }
+
+    assert await service.get_sandbox_init_api_key('sb1') == 'bootstrap-key'
+
+
+async def test_get_sandbox_init_api_key_does_not_fall_back_to_session_key(
+    service, custom_objects
+):
+    custom_objects.list_namespaced_custom_object.return_value = {
+        'items': [
+            _claim(
+                env=[
+                    {'name': SESSION_API_KEY_VARIABLE, 'value': 'session-key'},
+                ]
+            )
+        ]
+    }
+
+    assert await service.get_sandbox_init_api_key('sb1') is None
 
 
 async def test_get_legacy_sandbox_adopts_warm_pool_profile(service, custom_objects):
@@ -815,6 +849,7 @@ async def test_persisted_owner_authorizes_conversation_webhook(service, custom_o
     engine = create_async_engine('sqlite+aiosqlite:///:memory:')
     async with engine.begin() as connection:
         await connection.run_sync(StoredSandboxAccess.__table__.create)
+        await connection.run_sync(StoredConversationMetadata.__table__.create)
     session_maker = async_sessionmaker(engine, expire_on_commit=False)
 
     try:
@@ -885,6 +920,43 @@ async def test_delete_sandbox(service, custom_objects):
 
     custom_objects.list_namespaced_custom_object.return_value = {'items': []}
     assert await service.delete_sandbox('sb1') is False
+
+
+async def test_reconcile_orphaned_sandboxes_preserves_active_claims(
+    service, custom_objects
+):
+    active = _claim()
+    orphan = _claim()
+    orphan['metadata']['name'] = 'oh-agent-server-orphan'
+    orphan['metadata']['labels'][SANDBOX_ID_LABEL] = 'orphan'
+    custom_objects.list_namespaced_custom_object.return_value = {
+        'items': [active, orphan]
+    }
+
+    deleted = await service.reconcile_orphaned_sandboxes({'sb1'})
+
+    assert deleted == ['orphan']
+    assert (
+        custom_objects.delete_namespaced_custom_object.call_args.kwargs['name']
+        == 'oh-agent-server-orphan'
+    )
+
+
+async def test_creation_reconciliation_removes_access_for_orphans(
+    service, custom_objects
+):
+    orphan = _claim()
+    custom_objects.list_namespaced_custom_object.return_value = {'items': [orphan]}
+    access_service = AsyncMock()
+    service.access_service = access_service
+
+    with patch(
+        'openhands.app_server.sandbox.sandbox_lifecycle.active_sandbox_ids',
+        new=AsyncMock(return_value=set()),
+    ):
+        await service._reconcile_orphaned_capacity()
+
+    access_service.delete_sandbox.assert_awaited_once_with('sb1')
 
 
 @pytest.mark.parametrize(

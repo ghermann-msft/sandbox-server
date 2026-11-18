@@ -960,6 +960,45 @@ class TestRunEndLiveStatsPull:
     """Run-end statuses trigger a pull of combined stats from the agent-server."""
 
     @pytest.mark.asyncio
+    async def test_terminal_status_schedules_sandbox_release(self):
+        from openhands.app_server.event_callback import webhook_router
+        from openhands.app_server.event_callback.webhook_router import on_event
+
+        conversation_id = uuid4()
+        info = AppConversationInfo(
+            id=conversation_id,
+            sandbox_id='sb-terminal',
+            created_by_user_id='user-123',
+        )
+        background_tasks = BackgroundTasks()
+        with (
+            patch.object(
+                webhook_router, '_track_conversation_terminal', new_callable=AsyncMock
+            ),
+            patch.object(
+                webhook_router, '_sync_live_conversation_stats', new_callable=AsyncMock
+            ),
+            patch.object(webhook_router, '_run_callbacks_in_bg_and_close'),
+        ):
+            await on_event(
+                background_tasks=background_tasks,
+                events=[
+                    ConversationStateUpdateEvent(
+                        key='execution_status', value='finished'
+                    )
+                ],
+                conversation_id=conversation_id,
+                app_conversation_info=info,
+                app_conversation_info_service=AsyncMock(),
+                event_service=AsyncMock(),
+            )
+
+        assert any(
+            task.func is webhook_router._release_terminal_sandbox
+            for task in background_tasks.tasks
+        )
+
+    @pytest.mark.asyncio
     async def test_on_event_pulls_live_stats_at_run_end(self):
         from types import SimpleNamespace
 

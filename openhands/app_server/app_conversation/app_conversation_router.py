@@ -69,6 +69,9 @@ from openhands.app_server.config import (
 from openhands.app_server.organization.organization_service import (
     bind_conversation_organization,
 )
+from openhands.app_server.sandbox.sandbox_lifecycle import (
+    release_sandbox_if_inactive,
+)
 from openhands.app_server.sandbox.sandbox_models import (
     AGENT_SERVER,
     SandboxInfo,
@@ -908,13 +911,11 @@ async def _finalize_sandbox_delete(
                 sandbox_id,
             )
         else:
-            conversation_count = (
-                await app_conversation_info_service.count_conversations_by_sandbox_id(
-                    sandbox_id
-                )
+            await release_sandbox_if_inactive(
+                app_conversation_info_service,
+                sandbox_service,
+                sandbox_id,
             )
-            if conversation_count == 0:
-                await sandbox_service.delete_sandbox(sandbox_id)
         await db_session.commit()
     except Exception:
         # Any failure in the finalizer (a transient stop/lookup error, the count

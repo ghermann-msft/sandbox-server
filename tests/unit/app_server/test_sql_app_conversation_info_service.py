@@ -341,6 +341,26 @@ class TestSQLAppConversationInfoService:
         assert await service.count_conversations_by_sandbox_id('no_such_sandbox') == 0
 
     @pytest.mark.asyncio
+    async def test_count_active_conversations_excludes_terminal_statuses(
+        self,
+        service: SQLAppConversationInfoService,
+    ):
+        sandbox_id = 'shared-sandbox'
+        conversation_ids = [uuid4(), uuid4(), uuid4()]
+        for conversation_id in conversation_ids:
+            await service.save_app_conversation_info(
+                AppConversationInfo(
+                    id=conversation_id,
+                    created_by_user_id=None,
+                    sandbox_id=sandbox_id,
+                )
+            )
+        await service.update_execution_status(conversation_ids[1], 'finished')
+        await service.update_execution_status(conversation_ids[2], 'running')
+
+        assert await service.count_active_conversations_by_sandbox_id(sandbox_id) == 2
+
+    @pytest.mark.asyncio
     async def test_search_conversation_info_no_filters(
         self,
         service: SQLAppConversationInfoService,

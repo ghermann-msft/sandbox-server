@@ -1246,9 +1246,17 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
         response.raise_for_status()
         init_status = AgentServerInitStatus.model_validate(response.json())
         if init_status.state == 'dormant':
+            init_api_key = await self.sandbox_service.get_sandbox_init_api_key(
+                sandbox.id
+            )
+            if not init_api_key:
+                raise SandboxError(
+                    'Deferred Agent Server initialization requires the dormant '
+                    'server bootstrap key'
+                )
             response = await self.httpx_client.post(
                 init_url,
-                headers={'X-Init-API-Key': session_api_key},
+                headers={'X-Init-API-Key': init_api_key},
                 json=init_request.model_dump(mode='json', exclude_none=True),
                 timeout=self.sandbox_startup_timeout,
             )

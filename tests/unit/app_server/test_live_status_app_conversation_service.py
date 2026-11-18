@@ -489,6 +489,9 @@ class TestLiveStatusAppConversationService:
     @pytest.mark.asyncio
     async def test_initialize_agent_server_sends_trusted_hindsight_scope(self):
         organization_id = uuid4()
+        self.mock_sandbox_service.get_sandbox_init_api_key = AsyncMock(
+            return_value='bootstrap-key'
+        )
         self.mock_user_context.get_authentication_identity = AsyncMock(
             return_value=AuthenticationIdentity(
                 provider='entra',
@@ -528,7 +531,7 @@ class TestLiveStatusAppConversationService:
 
         post = self.mock_httpx_client.post.await_args
         assert post.args[0] == 'http://agent-server/api/init'
-        assert post.kwargs['headers'] == {'X-Init-API-Key': 'session-key'}
+        assert post.kwargs['headers'] == {'X-Init-API-Key': 'bootstrap-key'}
         assert post.kwargs['json']['session_api_keys'] == ['session-key']
         assert post.kwargs['json']['secret_key'] == 'session-key'
         assert post.kwargs['json']['hindsight_memory'] == {
@@ -552,6 +555,36 @@ class TestLiveStatusAppConversationService:
             ],
             'timeout_seconds': 2.0,
         }
+
+    @pytest.mark.asyncio
+    async def test_initialize_agent_server_requires_dormant_bootstrap_key(self):
+        self.mock_sandbox_service.get_sandbox_init_api_key = AsyncMock(
+            return_value=None
+        )
+        self.mock_user_context.get_user_info = AsyncMock(return_value=self.mock_user)
+        dormant = Mock()
+        dormant.json.return_value = {'state': 'dormant', 'error': None}
+        dormant.raise_for_status.return_value = None
+        self.mock_httpx_client.get = AsyncMock(return_value=dormant)
+
+        config = Mock(hindsight_enabled=False)
+        with (
+            patch('openhands.app_server.config.get_global_config', return_value=config),
+            pytest.raises(
+                SandboxError, match='requires the dormant server bootstrap key'
+            ),
+        ):
+            await self.service._initialize_agent_server(
+                agent_server_url='http://agent-server',
+                sandbox=self.mock_sandbox,
+                organization_id=None,
+                working_dir='/workspace/project',
+                git_provider=None,
+                selected_repository=None,
+                agent_profile_id=None,
+            )
+
+        self.mock_httpx_client.post.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_setup_secrets_for_git_providers_no_provider_tokens(self):

@@ -59,6 +59,9 @@ from openhands.app_server.event_callback.sql_event_callback_service import (
     invoke_callback,
 )
 from openhands.app_server.integrations.provider import ProviderType
+from openhands.app_server.sandbox.sandbox_lifecycle import (
+    release_sandbox_if_inactive,
+)
 from openhands.app_server.sandbox.sandbox_models import SandboxRecord
 from openhands.app_server.services.injector import InjectorState
 from openhands.app_server.services.jwt_service import JwtService
@@ -550,6 +553,35 @@ async def _sync_live_conversation_stats(
         )
 
 
+async def _release_terminal_sandbox(
+    app_conversation_info: AppConversationInfo,
+) -> None:
+    try:
+        state = InjectorState()
+        setattr(
+            state,
+            USER_CONTEXT_ATTR,
+            SandboxUserContext(
+                user_id=app_conversation_info.created_by_user_id,
+                sandbox_id=app_conversation_info.sandbox_id,
+            ),
+        )
+        async with (
+            get_app_conversation_info_service(state) as app_conversation_info_service,
+            get_sandbox_service(state) as sandbox_service,
+        ):
+            await release_sandbox_if_inactive(
+                app_conversation_info_service,
+                sandbox_service,
+                app_conversation_info.sandbox_id,
+            )
+    except Exception:
+        _logger.exception(
+            'Terminal sandbox cleanup failed for %s; startup reconciliation will retry',
+            app_conversation_info.sandbox_id,
+        )
+
+
 @router.post('/events/{conversation_id}')
 async def on_event(
     background_tasks: BackgroundTasks,
@@ -615,6 +647,10 @@ async def on_event(
                 if exec_status.is_terminal():
                     await _track_conversation_terminal(
                         conversation_id, app_conversation_info, events, exec_status
+                    )
+                    background_tasks.add_task(
+                        _release_terminal_sandbox,
+                        app_conversation_info,
                     )
             except Exception:
                 _logger.exception(

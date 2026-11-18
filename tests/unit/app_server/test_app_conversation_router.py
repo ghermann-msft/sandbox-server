@@ -1177,13 +1177,13 @@ class TestGitProxyEndpoints:
 class TestFinalizeSandboxDelete:
     """The detached finalizer captures THIS conversation's workspace first
     (archive_conversation_workspace, while the runtime is still up), then tears the
-    sandbox down only when no other conversation still references it (count == 0).
+    sandbox down only when no active conversation still references it (count == 0).
     delete_sandbox is sandbox-scoped — no conversation_id. A REQUIRED archive
     failure (archive returns False) keeps the sandbox for the idle reap."""
 
     def _deps(self, conversation_count: int, archived: bool = True):
         info_service = MagicMock()
-        info_service.count_conversations_by_sandbox_id = AsyncMock(
+        info_service.count_active_conversations_by_sandbox_id = AsyncMock(
             return_value=conversation_count
         )
         sandbox_service = MagicMock()
@@ -1235,7 +1235,7 @@ class TestFinalizeSandboxDelete:
         )
         # Sandbox + runtime kept for the idle reap: no count check, no delete.
         sandbox_service.archive_conversation_workspace.assert_awaited_once()
-        info_service.count_conversations_by_sandbox_id.assert_not_called()
+        info_service.count_active_conversations_by_sandbox_id.assert_not_called()
         sandbox_service.delete_sandbox.assert_not_called()
 
     @pytest.mark.asyncio

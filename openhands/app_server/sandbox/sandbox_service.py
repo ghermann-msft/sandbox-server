@@ -170,6 +170,15 @@ class SandboxService(ABC):
     async def get_sandbox(self, sandbox_id: str) -> SandboxInfo | None:
         """Get a single sandbox. Return None if the sandbox was not found."""
 
+    async def get_sandbox_init_api_key(self, sandbox_id: str) -> str | None:
+        """Return the immutable bootstrap key for deferred initialization.
+
+        Backends that support deferred initialization must return the exact
+        secret configured on the dormant Agent Server. The key is intentionally
+        kept out of ``SandboxInfo`` so it cannot be exposed through sandbox APIs.
+        """
+        return None
+
     @abstractmethod
     async def get_sandbox_by_session_api_key(
         self, session_api_key: str

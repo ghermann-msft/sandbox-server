@@ -1,5 +1,5 @@
 from contextlib import nullcontext
-from unittest.mock import MagicMock, call, patch
+from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
 
@@ -12,11 +12,39 @@ from openhands.app_server.app_lifespan.oss_app_lifespan_service import (
 async def test_startup_runs_alembic_before_entering_lifespan():
     service = OssAppLifespanService()
 
-    with patch.object(OssAppLifespanService, 'run_alembic') as run_alembic:
+    with (
+        patch.object(OssAppLifespanService, 'run_alembic') as run_alembic,
+        patch.object(
+            OssAppLifespanService, 'reconcile_sandboxes', new_callable=AsyncMock
+        ) as reconcile,
+    ):
         result = await service.__aenter__()
 
     assert result is service
     run_alembic.assert_called_once_with()
+    reconcile.assert_awaited_once_with()
+
+
+@pytest.mark.asyncio
+async def test_startup_reconciliation_failure_does_not_crash_server():
+    service = OssAppLifespanService()
+    config = MagicMock()
+
+    with (
+        patch.object(OssAppLifespanService, 'run_alembic'),
+        patch.object(
+            OssAppLifespanService,
+            'reconcile_sandboxes',
+            new_callable=AsyncMock,
+            side_effect=RuntimeError('cluster unavailable'),
+        ),
+        patch(
+            'openhands.app_server.app_lifespan.oss_app_lifespan_service.'
+            'bootstrap_organization_from_env'
+        ),
+        patch('openhands.app_server.config.get_global_config', return_value=config),
+    ):
+        assert await service.__aenter__() is service
 
 
 def test_alembic_startup_upgrades_to_head():

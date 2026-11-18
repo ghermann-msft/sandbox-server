@@ -916,6 +916,12 @@ class KubernetesSandboxService(SandboxService):
                 return env.get('value')
         return None
 
+    def _init_api_key(self, claim: dict) -> str | None:
+        for env in (claim.get('spec') or {}).get('env') or []:
+            if env.get('name') == SECRET_KEY_VARIABLE:
+                return env.get('value')
+        return None
+
     async def _claim_to_sandbox_info(
         self,
         claim: dict,
@@ -1028,6 +1034,12 @@ class KubernetesSandboxService(SandboxService):
             return None
         return await self._claim_to_sandbox_info(claim)
 
+    async def get_sandbox_init_api_key(self, sandbox_id: str) -> str | None:
+        claim = await asyncio.to_thread(self._get_claim_sync, sandbox_id)
+        if claim is None:
+            return None
+        return self._init_api_key(claim)
+
     async def get_sandbox_startup_observation(
         self, sandbox_id: str
     ) -> SandboxStartupObservation:
@@ -1104,6 +1116,7 @@ class KubernetesSandboxService(SandboxService):
             _logger,
         )
 
+        await self._reconcile_orphaned_capacity()
         await self._enforce_profile_quota(sandbox_spec)
         await self.pause_old_sandboxes(self.max_num_sandboxes - 1)
 
@@ -1314,6 +1327,39 @@ class KubernetesSandboxService(SandboxService):
         if self.access_service is not None:
             await self.access_service.delete_sandbox(sandbox_id)
         return True
+
+    async def reconcile_orphaned_sandboxes(
+        self, active_sandbox_ids: set[str]
+    ) -> list[str]:
+        claims = await asyncio.to_thread(self._list_claims_sync)
+        deleted: list[str] = []
+        for claim in claims:
+            metadata = claim.get('metadata') or {}
+            labels = metadata.get('labels') or {}
+            sandbox_id = labels.get(SANDBOX_ID_LABEL)
+            if (
+                labels.get(MANAGED_BY_LABEL) != MANAGED_BY_VALUE
+                or not isinstance(sandbox_id, str)
+                or sandbox_id in active_sandbox_ids
+            ):
+                continue
+            name = metadata.get('name')
+            if not isinstance(name, str) or not name:
+                continue
+            await asyncio.to_thread(self._delete_claim_sync, name)
+            deleted.append(sandbox_id)
+        return deleted
+
+    async def _reconcile_orphaned_capacity(self) -> None:
+        if self.access_service is None:
+            return
+        from openhands.app_server.sandbox.sandbox_lifecycle import active_sandbox_ids
+
+        deleted_ids = await self.reconcile_orphaned_sandboxes(
+            await active_sandbox_ids(self.access_service.db_session)
+        )
+        for sandbox_id in deleted_ids:
+            await self.access_service.delete_sandbox(sandbox_id)
 
 
 def _sandbox_name(claim: dict) -> str | None:
