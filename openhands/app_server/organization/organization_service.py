@@ -4,6 +4,7 @@ import os
 from dataclasses import dataclass
 from uuid import UUID
 
+from fastapi import HTTPException, status
 from sqlalchemy import Engine, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import Session
@@ -13,6 +14,9 @@ from openhands.app_server.organization.organization_models import (
     AuthenticationIdentity,
     OrganizationKind,
     OrganizationListResponse,
+    OrganizationMember,
+    OrganizationMemberIdentity,
+    OrganizationMemberListResponse,
     OrganizationMembershipResponse,
     OrganizationPermission,
     OrganizationRole,
@@ -189,6 +193,100 @@ class OrganizationService:
     ) -> OrganizationMembershipResponse:
         return await self.require_permission(
             organization_id, OrganizationPermission.ORG_VIEW
+        )
+
+    async def list_members(
+        self, organization_id: UUID
+    ) -> OrganizationMemberListResponse:
+        await self.require_permission(organization_id, OrganizationPermission.ORG_VIEW)
+        rows = (
+            await self.db_session.execute(
+                select(StoredMembership, StoredUser, StoredRole)
+                .join(StoredUser, StoredUser.id == StoredMembership.user_id)
+                .join(StoredRole, StoredRole.id == StoredMembership.role_id)
+                .where(StoredMembership.organization_id == organization_id)
+                .order_by(StoredRole.name, StoredUser.subject_id)
+            )
+        ).all()
+        return OrganizationMemberListResponse(
+            items=[
+                self._member_response(membership, user, role)
+                for membership, user, role in rows
+            ]
+        )
+
+    async def update_member_role(
+        self,
+        organization_id: UUID,
+        user_id: UUID,
+        role: OrganizationRole,
+    ) -> OrganizationMember:
+        await self.require_permission(
+            organization_id, OrganizationPermission.ORG_MANAGE_MEMBERS
+        )
+        organization = await self.db_session.get(StoredOrganization, organization_id)
+        if organization is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail='Organization not found',
+            )
+        if organization.kind == OrganizationKind.PERSONAL.value:
+            raise PermissionsError('Personal organization roles cannot be changed')
+
+        rows = (
+            await self.db_session.execute(
+                select(StoredMembership, StoredUser, StoredRole)
+                .join(StoredUser, StoredUser.id == StoredMembership.user_id)
+                .join(StoredRole, StoredRole.id == StoredMembership.role_id)
+                .where(StoredMembership.organization_id == organization_id)
+                .order_by(StoredMembership.id)
+                .with_for_update(of=StoredMembership)
+            )
+        ).all()
+        target = next(
+            (row for row in rows if row[0].user_id == user_id),
+            None,
+        )
+        if target is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail='Organization member not found',
+            )
+
+        membership, user, current_role = target
+        if (
+            current_role.name == OrganizationRole.OWNER.value
+            and role != OrganizationRole.OWNER
+            and sum(
+                item_role.name == OrganizationRole.OWNER.value
+                for _, _, item_role in rows
+            )
+            == 1
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail='An organization must have at least one owner',
+            )
+
+        new_role = await self._role(role)
+        membership.role_id = new_role.id
+        await self.db_session.flush()
+        return self._member_response(membership, user, new_role)
+
+    @staticmethod
+    def _member_response(
+        membership: StoredMembership,
+        user: StoredUser,
+        role: StoredRole,
+    ) -> OrganizationMember:
+        return OrganizationMember(
+            user_id=membership.user_id,
+            identity=OrganizationMemberIdentity(
+                provider=user.identity_provider,
+                tenant_id=user.tenant_id or None,
+                subject_id=user.subject_id,
+            ),
+            role=OrganizationRole(role.name),
         )
 
 

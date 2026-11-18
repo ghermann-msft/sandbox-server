@@ -54,6 +54,20 @@ The configured `UserAuth` implementation must return the same immutable provider
 tenant, and subject identifiers from `get_authentication_identity()`. Organization
 membership and permissions are then read only from the sandbox-server database.
 
+Authenticated organization members can inspect membership through:
+
+- `GET /api/organizations/{organization_id}/members`
+- `PATCH /api/organizations/{organization_id}/members/{user_id}` with
+  `{"role": "owner" | "admin" | "member"}`
+
+Owners and admins can update shared-organization roles. Personal-organization
+roles are immutable, and the final owner of a shared organization cannot be
+demoted. Identity provider, tenant, and subject identifiers are response-only.
+
+Self-hosted deployments advertise Canvas integration settings through
+`feature_flags.enable_canvas_integrations` in `GET /api/v1/web-client/config`.
+Set `ENABLE_CANVAS_INTEGRATIONS=false` to hide them explicitly.
+
 ## Docker
 
 ```bash

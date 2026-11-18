@@ -2,6 +2,8 @@ from dataclasses import dataclass
 from uuid import UUID, uuid4
 
 import pytest
+from fastapi import HTTPException
+from pydantic import ValidationError
 from sqlalchemy import create_engine, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import Session
@@ -13,6 +15,7 @@ from openhands.app_server.organization.organization_models import (
     OrganizationKind,
     OrganizationPermission,
     OrganizationRole,
+    OrganizationRoleUpdate,
     StoredMembership,
     StoredOrganization,
     StoredPermission,
@@ -107,6 +110,43 @@ def _context(
         ),
         effective_org_id=effective_org_id,
     )
+
+
+async def _shared_organization(
+    db_session: AsyncSession,
+    members: list[tuple[str, OrganizationRole]],
+) -> tuple[StoredOrganization, dict[str, StoredUser]]:
+    users = {}
+    for subject_id, _ in members:
+        await OrganizationService(db_session, _context(subject_id)).list_organizations()
+        user = await db_session.scalar(
+            select(StoredUser).where(StoredUser.subject_id == subject_id)
+        )
+        assert user is not None
+        users[subject_id] = user
+
+    organization = StoredOrganization(
+        id=uuid4(),
+        name='Halo Studios',
+        kind=OrganizationKind.SHARED.value,
+        is_visible=True,
+    )
+    db_session.add(organization)
+    await db_session.flush()
+    for subject_id, role in members:
+        stored_role = await db_session.scalar(
+            select(StoredRole).where(StoredRole.name == role.value)
+        )
+        assert stored_role is not None
+        db_session.add(
+            StoredMembership(
+                organization_id=organization.id,
+                user_id=users[subject_id].id,
+                role_id=stored_role.id,
+            )
+        )
+    await db_session.flush()
+    return organization, users
 
 
 @pytest.mark.asyncio
@@ -238,6 +278,133 @@ async def test_member_hindsight_allow_and_org_manage_deny(db_session):
 
     with pytest.raises(PermissionsError, match='organization:manage'):
         await service.require_permission(halo.id, OrganizationPermission.ORG_MANAGE)
+
+
+@pytest.mark.asyncio
+async def test_member_can_list_members_with_immutable_identities(db_session):
+    organization, users = await _shared_organization(
+        db_session,
+        [
+            ('owner-object', OrganizationRole.OWNER),
+            ('member-object', OrganizationRole.MEMBER),
+        ],
+    )
+
+    response = await OrganizationService(
+        db_session, _context('member-object')
+    ).list_members(organization.id)
+
+    assert {item.user_id for item in response.items} == set(
+        user.id for user in users.values()
+    )
+    member = next(
+        item for item in response.items if item.identity.subject_id == 'member-object'
+    )
+    assert member.identity.model_dump() == {
+        'provider': 'entra',
+        'tenant_id': 'tenant-1',
+        'subject_id': 'member-object',
+    }
+    assert member.role == OrganizationRole.MEMBER
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ('actor', 'actor_role', 'new_role'),
+    [
+        ('owner-object', OrganizationRole.OWNER, OrganizationRole.ADMIN),
+        ('admin-object', OrganizationRole.ADMIN, OrganizationRole.OWNER),
+    ],
+)
+async def test_owner_and_admin_can_update_member_roles(
+    db_session,
+    actor,
+    actor_role,
+    new_role,
+):
+    organization, users = await _shared_organization(
+        db_session,
+        [
+            (actor, actor_role),
+            ('existing-owner', OrganizationRole.OWNER),
+            ('member-object', OrganizationRole.MEMBER),
+        ],
+    )
+
+    updated = await OrganizationService(db_session, _context(actor)).update_member_role(
+        organization.id,
+        users['member-object'].id,
+        new_role,
+    )
+
+    assert updated.user_id == users['member-object'].id
+    assert updated.role == new_role
+    assert updated.identity.subject_id == 'member-object'
+
+
+@pytest.mark.asyncio
+async def test_member_cannot_update_roles(db_session):
+    organization, users = await _shared_organization(
+        db_session,
+        [
+            ('owner-object', OrganizationRole.OWNER),
+            ('member-object', OrganizationRole.MEMBER),
+        ],
+    )
+
+    with pytest.raises(PermissionsError, match='organization:manage_members'):
+        await OrganizationService(
+            db_session, _context('member-object')
+        ).update_member_role(
+            organization.id,
+            users['owner-object'].id,
+            OrganizationRole.ADMIN,
+        )
+
+
+@pytest.mark.asyncio
+async def test_personal_organization_role_is_immutable(db_session):
+    service = OrganizationService(db_session, _context('owner-object'))
+    organizations = await service.list_organizations()
+    owner = await db_session.scalar(
+        select(StoredUser).where(StoredUser.subject_id == 'owner-object')
+    )
+    assert owner is not None
+
+    with pytest.raises(PermissionsError, match='Personal organization'):
+        await service.update_member_role(
+            organizations.current_org_id,
+            owner.id,
+            OrganizationRole.MEMBER,
+        )
+
+
+@pytest.mark.asyncio
+async def test_last_owner_cannot_be_demoted(db_session):
+    organization, users = await _shared_organization(
+        db_session,
+        [
+            ('owner-object', OrganizationRole.OWNER),
+            ('member-object', OrganizationRole.MEMBER),
+        ],
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        await OrganizationService(
+            db_session, _context('owner-object')
+        ).update_member_role(
+            organization.id,
+            users['owner-object'].id,
+            OrganizationRole.ADMIN,
+        )
+
+    assert exc_info.value.status_code == 409
+    assert exc_info.value.detail == 'An organization must have at least one owner'
+
+
+def test_role_update_rejects_unknown_role():
+    with pytest.raises(ValidationError):
+        OrganizationRoleUpdate.model_validate({'role': 'superuser'})
 
 
 def test_bootstrap_shared_organization_owner(tmp_path, monkeypatch):

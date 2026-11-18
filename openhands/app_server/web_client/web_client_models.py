@@ -40,6 +40,7 @@ class WebClientFeatureFlags(BaseModel):
     deployment_mode: DeploymentMode | None = None
     enable_onboarding: bool = False
     enable_automations: bool = True
+    enable_canvas_integrations: bool = False
 
     # This can be removed / replaced when a DeploymentMode (or similar) env var is created.
     @model_validator(mode='after')

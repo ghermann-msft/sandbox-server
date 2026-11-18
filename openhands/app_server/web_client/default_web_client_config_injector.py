@@ -12,6 +12,9 @@ from openhands.app_server.integrations.service_types import ProviderType
 from openhands.app_server.web_client.web_client_config_injector import (
     WebClientConfigInjector,
 )
+from openhands.app_server.web_client.web_client_deployment_mode import (
+    get_deployment_mode,
+)
 from openhands.app_server.web_client.web_client_models import (
     ACPModelOption,
     ACPProviderConfig,
@@ -177,6 +180,12 @@ def _get_feature_flags() -> WebClientFeatureFlags:
     (Settings > Agent) visible on SaaS and existing installs, matching Agent
     Canvas. Set ENABLE_ACP=false to hide it.
     """
+    canvas_integrations = os.getenv('ENABLE_CANVAS_INTEGRATIONS')
+    if canvas_integrations is None:
+        enable_canvas_integrations = get_deployment_mode() == 'self_hosted'
+    else:
+        enable_canvas_integrations = canvas_integrations == 'true'
+
     return WebClientFeatureFlags(
         enable_billing=os.getenv('ENABLE_BILLING', 'false') == 'true',
         hide_llm_settings=os.getenv('HIDE_LLM_SETTINGS', 'false') == 'true',
@@ -195,6 +204,7 @@ def _get_feature_flags() -> WebClientFeatureFlags:
         enable_acp=os.getenv('ENABLE_ACP', 'true') == 'true',
         enable_onboarding=os.getenv('OH_ENABLE_ONBOARDING', 'false') == 'true',
         enable_automations=os.getenv('ENABLE_AUTOMATIONS', 'true') == 'true',
+        enable_canvas_integrations=enable_canvas_integrations,
     )
 
 

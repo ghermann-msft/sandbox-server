@@ -6,7 +6,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from openhands.app_server.config import depends_user_context
 from openhands.app_server.organization.organization_models import (
     OrganizationListResponse,
+    OrganizationMember,
+    OrganizationMemberListResponse,
     OrganizationMembershipResponse,
+    OrganizationRoleUpdate,
 )
 from openhands.app_server.organization.organization_service import OrganizationService
 from openhands.app_server.services.db_session import depends_db_session
@@ -37,4 +40,28 @@ async def get_my_membership(
 ) -> OrganizationMembershipResponse:
     return await OrganizationService(db_session, user_context).get_membership(
         organization_id
+    )
+
+
+@router.get('/{organization_id}/members')
+async def list_organization_members(
+    organization_id: UUID,
+    db_session: AsyncSession = db_session_dependency,
+    user_context: UserContext = user_context_dependency,
+) -> OrganizationMemberListResponse:
+    return await OrganizationService(db_session, user_context).list_members(
+        organization_id
+    )
+
+
+@router.patch('/{organization_id}/members/{user_id}')
+async def update_organization_member_role(
+    organization_id: UUID,
+    user_id: UUID,
+    update: OrganizationRoleUpdate,
+    db_session: AsyncSession = db_session_dependency,
+    user_context: UserContext = user_context_dependency,
+) -> OrganizationMember:
+    return await OrganizationService(db_session, user_context).update_member_role(
+        organization_id, user_id, update.role
     )
