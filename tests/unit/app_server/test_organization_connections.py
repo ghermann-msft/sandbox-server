@@ -1,15 +1,27 @@
+import json
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from unittest.mock import AsyncMock, MagicMock, patch
 from uuid import UUID, uuid4, uuid5
 
 import pytest
+from fastapi import HTTPException
 from pydantic import SecretStr, ValidationError
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.pool import StaticPool
 
+from openhands.app_server.app_conversation.app_conversation_models import (
+    AppConversationStartRequest,
+)
+from openhands.app_server.app_conversation.sql_app_conversation_start_task_service import (
+    StoredAppConversationStartTask,
+)
 from openhands.app_server.errors import PermissionsError
+from openhands.app_server.event_callback.webhook_router import (
+    MCPOAuthStateWriteBack,
+    write_back_mcp_oauth_state,
+)
 from openhands.app_server.integrations.provider import ProviderToken
 from openhands.app_server.organization.agent_profile_models import (
     OrganizationAgentProfileSeeds,
@@ -49,6 +61,7 @@ from openhands.app_server.organization.profile_service import (
     OrganizationProfileService,
     ProfileNotFoundError,
 )
+from openhands.app_server.sandbox.sandbox_models import SandboxRecord
 from openhands.app_server.services.jwt_service import JwtService
 from openhands.app_server.settings.agent_profiles import AgentProfiles
 from openhands.app_server.settings.llm_profiles import LLMProfiles
@@ -58,7 +71,7 @@ from openhands.app_server.user.auth_user_context import AuthUserContext
 from openhands.app_server.user.specifiy_user_context import SpecifyUserContext
 from openhands.app_server.utils.encryption_key import EncryptionKey
 from openhands.app_server.utils.sql_utils import Base, UtcDateTime
-from openhands.sdk.mcp.config import MCPServer
+from openhands.sdk.mcp.config import MCPOAuthStateResponse, MCPServer
 from openhands.sdk.profiles import validate_agent_profile
 from openhands.sdk.settings import ACPAgentSettings
 
@@ -89,6 +102,47 @@ def _context(subject_id: str, organization_id: UUID | None = None):
 
 def _jwt_service() -> JwtService:
     return JwtService([EncryptionKey(id='test', key=SecretStr('connection-key'))])
+
+
+def _oauth_server(
+    access_token: str = 'old-access',
+    *,
+    url: str = 'https://api.atlassian.com/mcp/',
+) -> MCPServer:
+    return MCPServer.model_validate(
+        {
+            'url': url,
+            'transport': 'streamable-http',
+            'description': 'Atlassian MCP',
+            'auth': {
+                'strategy': 'oauth2',
+                'state': {
+                    'tokens': {
+                        'access_token': access_token,
+                        'refresh_token': 'old-refresh',
+                    },
+                    'token_expires_at': 100.0,
+                },
+            },
+        }
+    )
+
+
+def _oauth_write_back(
+    url: str = 'https://api.atlassian.com/mcp',
+) -> MCPOAuthStateWriteBack:
+    return MCPOAuthStateWriteBack(
+        server_url=url,
+        oauth_state=MCPOAuthStateResponse.model_validate(
+            {
+                'tokens': {
+                    'access_token': 'new-access',
+                    'refresh_token': 'new-refresh',
+                },
+                'token_expires_at': 200.0,
+            }
+        ),
+    )
 
 
 async def _seed_roles(db_session: AsyncSession) -> dict[OrganizationRole, StoredRole]:
@@ -179,6 +233,215 @@ async def _add_shared_membership(
     )
     await db_session.flush()
     return organization_id
+
+
+@pytest.mark.asyncio
+async def test_mcp_oauth_write_back_updates_encrypted_personal_settings(db_session):
+    owner_id = 'entra:tenant-1:owner'
+    jwt_service = _jwt_service()
+    settings = Settings()
+    original_server = _oauth_server()
+    settings.agent_settings = settings.agent_settings.model_copy(
+        update={'mcp_config': {'atlassian': original_server}}
+    )
+    row = StoredUserSettings(
+        user_id=owner_id,
+        encrypted_payload=jwt_service.encrypt_value(
+            settings.model_dump_json(
+                context={'expose_secrets': True, 'persist_settings': True}
+            )
+        ),
+    )
+    db_session.add(row)
+    await db_session.flush()
+
+    await write_back_mcp_oauth_state(
+        _oauth_write_back(),
+        SandboxRecord(id='sandbox-1', created_by_user_id=owner_id),
+        db_session,
+        jwt_service,
+    )
+
+    assert 'new-access' not in row.encrypted_payload
+    stored = Settings.model_validate_json(
+        jwt_service.decrypt_value(row.encrypted_payload)
+    )
+    server = stored.agent_settings.mcp_config['atlassian']
+    assert server.description == original_server.description
+    assert server.auth is not None and server.auth.state is not None
+    assert server.auth.state.tokens is not None
+    assert server.auth.state.tokens.access_token is not None
+    assert server.auth.state.tokens.access_token.get_secret_value() == 'new-access'
+    assert server.auth.state.tokens.refresh_token is not None
+    assert server.auth.state.tokens.refresh_token.get_secret_value() == 'new-refresh'
+    assert row.revision == 1
+
+
+@pytest.mark.asyncio
+async def test_mcp_oauth_write_back_updates_encrypted_organization_connection(
+    db_session,
+):
+    owner_id = 'entra:tenant-1:owner'
+    organization_id = await _add_shared_membership(
+        db_session, 'owner', OrganizationRole.OWNER
+    )
+    rbac_user = await db_session.scalar(
+        select(StoredUser).where(StoredUser.subject_id == 'owner')
+    )
+    assert rbac_user is not None
+    jwt_service = _jwt_service()
+    original_server = _oauth_server()
+    connection_payload = {
+        'server': original_server.model_dump(
+            mode='json',
+            context={'expose_secrets': True},
+            exclude_none=True,
+        ),
+        'unrelated': {'preserved': True},
+    }
+    connection = StoredOrganizationConnection(
+        organization_id=organization_id,
+        kind=OrganizationConnectionKind.ATLASSIAN.value,
+        encrypted_payload=jwt_service.encrypt_value(json.dumps(connection_payload)),
+        public_metadata={'display_name': 'Atlassian'},
+        created_by_user_id=rbac_user.id,
+        updated_by_user_id=rbac_user.id,
+    )
+    db_session.add_all(
+        [
+            connection,
+            StoredAppConversationStartTask(
+                id=uuid4(),
+                created_by_user_id=owner_id,
+                sandbox_id='sandbox-1',
+                request=AppConversationStartRequest(organization_id=organization_id),
+            ),
+        ]
+    )
+    await db_session.flush()
+
+    await write_back_mcp_oauth_state(
+        _oauth_write_back(),
+        SandboxRecord(id='sandbox-1', created_by_user_id=owner_id),
+        db_session,
+        jwt_service,
+    )
+
+    assert 'new-access' not in connection.encrypted_payload
+    stored_payload = json.loads(jwt_service.decrypt_value(connection.encrypted_payload))
+    assert stored_payload['unrelated'] == {'preserved': True}
+    stored_server = MCPServer.model_validate(stored_payload['server'])
+    assert stored_server.description == original_server.description
+    assert stored_server.auth is not None and stored_server.auth.state is not None
+    assert stored_server.auth.state.tokens is not None
+    assert stored_server.auth.state.tokens.refresh_token is not None
+    assert (
+        stored_server.auth.state.tokens.refresh_token.get_secret_value()
+        == 'new-refresh'
+    )
+    assert connection.public_metadata == {'display_name': 'Atlassian'}
+    assert connection.revision == 1
+
+
+@pytest.mark.asyncio
+async def test_mcp_oauth_write_back_rejects_owner_and_url_mismatch(db_session):
+    jwt_service = _jwt_service()
+    settings = Settings()
+    settings.agent_settings = settings.agent_settings.model_copy(
+        update={'mcp_config': {'atlassian': _oauth_server()}}
+    )
+    db_session.add(
+        StoredUserSettings(
+            user_id='different-owner',
+            encrypted_payload=jwt_service.encrypt_value(
+                settings.model_dump_json(
+                    context={'expose_secrets': True, 'persist_settings': True}
+                )
+            ),
+        )
+    )
+    await db_session.flush()
+
+    with pytest.raises(HTTPException) as owner_error:
+        await write_back_mcp_oauth_state(
+            _oauth_write_back(),
+            SandboxRecord(id='sandbox-1', created_by_user_id='owner'),
+            db_session,
+            jwt_service,
+        )
+    assert owner_error.value.status_code == 404
+
+    with pytest.raises(HTTPException) as url_error:
+        await write_back_mcp_oauth_state(
+            _oauth_write_back('https://api.atlassian.com/different'),
+            SandboxRecord(id='sandbox-1', created_by_user_id='different-owner'),
+            db_session,
+            jwt_service,
+        )
+    assert url_error.value.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_mcp_oauth_write_back_rejects_ambiguous_durable_owner(db_session):
+    owner_id = 'entra:tenant-1:owner'
+    organization_id = await _add_shared_membership(
+        db_session, 'owner', OrganizationRole.OWNER
+    )
+    rbac_user = await db_session.scalar(
+        select(StoredUser).where(StoredUser.subject_id == 'owner')
+    )
+    assert rbac_user is not None
+    jwt_service = _jwt_service()
+    settings = Settings()
+    settings.agent_settings = settings.agent_settings.model_copy(
+        update={'mcp_config': {'atlassian': _oauth_server()}}
+    )
+    server_payload = _oauth_server().model_dump(
+        mode='json',
+        context={'expose_secrets': True},
+        exclude_none=True,
+    )
+    db_session.add_all(
+        [
+            StoredUserSettings(
+                user_id=owner_id,
+                encrypted_payload=jwt_service.encrypt_value(
+                    settings.model_dump_json(
+                        context={
+                            'expose_secrets': True,
+                            'persist_settings': True,
+                        }
+                    )
+                ),
+            ),
+            StoredOrganizationConnection(
+                organization_id=organization_id,
+                kind=OrganizationConnectionKind.ATLASSIAN.value,
+                encrypted_payload=jwt_service.encrypt_value(
+                    json.dumps({'server': server_payload})
+                ),
+                public_metadata={},
+                created_by_user_id=rbac_user.id,
+                updated_by_user_id=rbac_user.id,
+            ),
+            StoredAppConversationStartTask(
+                id=uuid4(),
+                created_by_user_id=owner_id,
+                sandbox_id='sandbox-1',
+                request=AppConversationStartRequest(organization_id=organization_id),
+            ),
+        ]
+    )
+    await db_session.flush()
+
+    with pytest.raises(HTTPException) as error:
+        await write_back_mcp_oauth_state(
+            _oauth_write_back(),
+            SandboxRecord(id='sandbox-1', created_by_user_id=owner_id),
+            db_session,
+            jwt_service,
+        )
+    assert error.value.status_code == 409
 
 
 def _atlassian_server(secret: str) -> MCPServer:
