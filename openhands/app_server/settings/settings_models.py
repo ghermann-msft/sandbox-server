@@ -505,6 +505,36 @@ def _normalize_mcp_config(value: Any) -> dict[str, MCPServer]:
     return settings.mcp_config
 
 
+def _apply_mcp_config_tombstones(
+    value: Any,
+    existing: Mapping[str, MCPServer] | None,
+) -> Any:
+    incoming_servers = _mcp_server_map(value)
+    if incoming_servers is None or not any(
+        server is None for server in incoming_servers.values()
+    ):
+        return value
+
+    merged_servers: dict[str, Any] = deepcopy(
+        dump_mcp_config(
+            existing or {},
+            context={'expose_secrets': 'plaintext'},
+        )
+    )
+    for name, incoming_server in incoming_servers.items():
+        if incoming_server is None:
+            merged_servers.pop(name, None)
+        elif isinstance(incoming_server, dict):
+            existing_server = merged_servers.get(name)
+            merged_servers[name] = deep_merge(
+                existing_server if isinstance(existing_server, dict) else {},
+                incoming_server,
+            )
+        else:
+            merged_servers[name] = incoming_server
+    return merged_servers
+
+
 def _mcp_endpoint_identity(server: Mapping[str, Any]) -> tuple[Any, ...] | None:
     url = server.get('url')
     if isinstance(url, str) and url:
@@ -846,13 +876,17 @@ class Settings(BaseModel):
                     _coerce_value(value) if not isinstance(value, dict) else value
                 )
 
-            # ``mcp_config`` replaces wholesale rather than deep-merging, so
-            # hold it back from the variant-aware merge and apply it after.
+            # A catalog without tombstones replaces wholesale. A catalog with
+            # any tombstone is the cloud sparse-update contract: merge server
+            # patches and deletions onto the current catalog before validation.
             replace_mcp_config = 'mcp_config' in agent_update
             mcp_config = (
                 _normalize_mcp_config(
                     _preserve_redacted_mcp_secrets(
-                        coerced.pop('mcp_config', None),
+                        _apply_mcp_config_tombstones(
+                            coerced.pop('mcp_config', None),
+                            self.agent_settings.mcp_config,
+                        ),
                         self.agent_settings.mcp_config,
                     )
                 )
