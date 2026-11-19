@@ -1282,13 +1282,7 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
 
         config = get_global_config()
         hindsight_memory: AgentServerHindsightMemory | None = None
-        user = await self.user_context.get_user_info(
-            resolve_agent_profile=True,
-            override_agent_profile_id=agent_profile_id,
-        )
-        if config.hindsight_enabled and not isinstance(
-            user.agent_settings, ACPAgentSettings
-        ):
+        if config.hindsight_enabled:
             broker_url = config.hindsight_broker_url
             deployment_id = config.hindsight_deployment_id
             if not broker_url or not deployment_id:
