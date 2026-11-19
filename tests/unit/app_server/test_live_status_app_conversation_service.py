@@ -539,7 +539,7 @@ class TestLiveStatusAppConversationService:
         assert get.args[0] == 'http://sandbox.agents.svc.cluster.local:8000/api/init'
         assert post.kwargs['headers'] == {'X-Init-API-Key': 'bootstrap-key'}
         assert post.kwargs['json']['session_api_keys'] == ['session-key']
-        assert post.kwargs['json']['secret_key'] == 'session-key'
+        assert 'secret_key' not in post.kwargs['json']
         assert post.kwargs['json']['hindsight_memory'] == {
             'broker_url': 'https://control-plane/hindsight',
             'identity': 'signed-identity',

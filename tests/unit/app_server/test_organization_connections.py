@@ -74,6 +74,7 @@ from openhands.app_server.utils.sql_utils import Base, UtcDateTime
 from openhands.sdk.mcp.config import MCPOAuthStateResponse, MCPServer
 from openhands.sdk.profiles import validate_agent_profile
 from openhands.sdk.settings import ACPAgentSettings
+from openhands.sdk.utils.cipher import Cipher
 
 
 @dataclass(frozen=True)
@@ -107,6 +108,7 @@ def _jwt_service() -> JwtService:
 def _oauth_server(
     access_token: str = 'old-access',
     *,
+    refresh_token: str = 'old-refresh',
     url: str = 'https://api.atlassian.com/mcp/',
 ) -> MCPServer:
     return MCPServer.model_validate(
@@ -119,7 +121,7 @@ def _oauth_server(
                 'state': {
                     'tokens': {
                         'access_token': access_token,
-                        'refresh_token': 'old-refresh',
+                        'refresh_token': refresh_token,
                     },
                     'token_expires_at': 100.0,
                 },
@@ -130,19 +132,38 @@ def _oauth_server(
 
 def _oauth_write_back(
     url: str = 'https://api.atlassian.com/mcp',
+    *,
+    access_token: str = 'new-access',
+    refresh_token: str = 'new-refresh',
 ) -> MCPOAuthStateWriteBack:
     return MCPOAuthStateWriteBack(
         server_url=url,
         oauth_state=MCPOAuthStateResponse.model_validate(
             {
                 'tokens': {
-                    'access_token': 'new-access',
-                    'refresh_token': 'new-refresh',
+                    'access_token': access_token,
+                    'refresh_token': refresh_token,
                 },
                 'token_expires_at': 200.0,
             }
         ),
     )
+
+
+def _agent_server_oauth_state(server: MCPServer, cipher: Cipher):
+    payload = server.model_dump(
+        mode='json',
+        context={'expose_secrets': True},
+        exclude_none=True,
+    )
+    decrypted = MCPServer.model_validate(
+        payload,
+        context={'cipher': cipher, 'strict_decrypt': True},
+    )
+    assert decrypted.auth is not None
+    assert decrypted.auth.state is not None
+    assert decrypted.auth.state.tokens is not None
+    return decrypted.auth.state.tokens
 
 
 async def _seed_roles(db_session: AsyncSession) -> dict[OrganizationRole, StoredRole]:
@@ -239,6 +260,7 @@ async def _add_shared_membership(
 async def test_mcp_oauth_write_back_updates_encrypted_personal_settings(db_session):
     owner_id = 'entra:tenant-1:owner'
     jwt_service = _jwt_service()
+    agent_cipher = Cipher('shared-oh-secret-key')
     settings = Settings()
     original_server = _oauth_server()
     settings.agent_settings = settings.agent_settings.model_copy(
@@ -256,7 +278,10 @@ async def test_mcp_oauth_write_back_updates_encrypted_personal_settings(db_sessi
     await db_session.flush()
 
     await write_back_mcp_oauth_state(
-        _oauth_write_back(),
+        _oauth_write_back(
+            access_token=agent_cipher.encrypt(SecretStr('new-access')),
+            refresh_token=agent_cipher.encrypt(SecretStr('new-refresh')),
+        ),
         SandboxRecord(id='sandbox-1', created_by_user_id=owner_id),
         db_session,
         jwt_service,
@@ -268,12 +293,11 @@ async def test_mcp_oauth_write_back_updates_encrypted_personal_settings(db_sessi
     )
     server = stored.agent_settings.mcp_config['atlassian']
     assert server.description == original_server.description
-    assert server.auth is not None and server.auth.state is not None
-    assert server.auth.state.tokens is not None
-    assert server.auth.state.tokens.access_token is not None
-    assert server.auth.state.tokens.access_token.get_secret_value() == 'new-access'
-    assert server.auth.state.tokens.refresh_token is not None
-    assert server.auth.state.tokens.refresh_token.get_secret_value() == 'new-refresh'
+    tokens = _agent_server_oauth_state(server, agent_cipher)
+    assert tokens.access_token is not None
+    assert tokens.access_token.get_secret_value() == 'new-access'
+    assert tokens.refresh_token is not None
+    assert tokens.refresh_token.get_secret_value() == 'new-refresh'
     assert row.revision == 1
 
 
@@ -290,6 +314,7 @@ async def test_mcp_oauth_write_back_updates_encrypted_organization_connection(
     )
     assert rbac_user is not None
     jwt_service = _jwt_service()
+    agent_cipher = Cipher('shared-oh-secret-key')
     original_server = _oauth_server()
     connection_payload = {
         'server': original_server.model_dump(
@@ -321,7 +346,10 @@ async def test_mcp_oauth_write_back_updates_encrypted_organization_connection(
     await db_session.flush()
 
     await write_back_mcp_oauth_state(
-        _oauth_write_back(),
+        _oauth_write_back(
+            access_token=agent_cipher.encrypt(SecretStr('new-access')),
+            refresh_token=agent_cipher.encrypt(SecretStr('new-refresh')),
+        ),
         SandboxRecord(id='sandbox-1', created_by_user_id=owner_id),
         db_session,
         jwt_service,
@@ -332,15 +360,94 @@ async def test_mcp_oauth_write_back_updates_encrypted_organization_connection(
     assert stored_payload['unrelated'] == {'preserved': True}
     stored_server = MCPServer.model_validate(stored_payload['server'])
     assert stored_server.description == original_server.description
-    assert stored_server.auth is not None and stored_server.auth.state is not None
-    assert stored_server.auth.state.tokens is not None
-    assert stored_server.auth.state.tokens.refresh_token is not None
-    assert (
-        stored_server.auth.state.tokens.refresh_token.get_secret_value()
-        == 'new-refresh'
-    )
+    tokens = _agent_server_oauth_state(stored_server, agent_cipher)
+    assert tokens.access_token is not None
+    assert tokens.access_token.get_secret_value() == 'new-access'
+    assert tokens.refresh_token is not None
+    assert tokens.refresh_token.get_secret_value() == 'new-refresh'
     assert connection.public_metadata == {'display_name': 'Atlassian'}
     assert connection.revision == 1
+
+
+@pytest.mark.asyncio
+async def test_personal_oauth_save_reaches_agent_server_with_shared_cipher(db_session):
+    owner_id = 'entra:tenant-1:owner'
+    jwt_service = _jwt_service()
+    agent_cipher = Cipher('shared-oh-secret-key')
+    settings = Settings()
+    settings.agent_settings = settings.agent_settings.model_copy(
+        update={
+            'mcp_config': {
+                'atlassian': _oauth_server(
+                    agent_cipher.encrypt(SecretStr('fresh-access')),
+                    refresh_token=agent_cipher.encrypt(SecretStr('fresh-refresh')),
+                )
+            }
+        }
+    )
+    row = StoredUserSettings(
+        user_id=owner_id,
+        encrypted_payload=jwt_service.encrypt_value(
+            settings.model_dump_json(
+                context={'expose_secrets': True, 'persist_settings': True}
+            )
+        ),
+    )
+    db_session.add(row)
+    await db_session.flush()
+
+    stored = Settings.model_validate_json(
+        jwt_service.decrypt_value(row.encrypted_payload)
+    )
+    tokens = _agent_server_oauth_state(
+        stored.agent_settings.mcp_config['atlassian'],
+        agent_cipher,
+    )
+    assert tokens.access_token is not None
+    assert tokens.access_token.get_secret_value() == 'fresh-access'
+    assert tokens.refresh_token is not None
+    assert tokens.refresh_token.get_secret_value() == 'fresh-refresh'
+
+
+@pytest.mark.asyncio
+async def test_organization_oauth_save_reaches_agent_server_with_shared_cipher(
+    db_session,
+):
+    organization_id = await _add_shared_membership(
+        db_session, 'owner', OrganizationRole.OWNER
+    )
+    jwt_service = _jwt_service()
+    agent_cipher = Cipher('shared-oh-secret-key')
+    service = OrganizationConnectionService(
+        db_session,
+        _context('owner', organization_id),
+        jwt_service,
+    )
+    await service.store_mcp(
+        organization_id,
+        OrganizationConnectionKind.ATLASSIAN,
+        MCPConnectionUpsert(
+            server=_oauth_server(
+                agent_cipher.encrypt(SecretStr('fresh-access')),
+                refresh_token=agent_cipher.encrypt(SecretStr('fresh-refresh')),
+            )
+        ),
+    )
+
+    row = await db_session.get(
+        StoredOrganizationConnection,
+        (organization_id, OrganizationConnectionKind.ATLASSIAN.value),
+    )
+    assert row is not None
+    payload = json.loads(jwt_service.decrypt_value(row.encrypted_payload))
+    tokens = _agent_server_oauth_state(
+        MCPServer.model_validate(payload['server']),
+        agent_cipher,
+    )
+    assert tokens.access_token is not None
+    assert tokens.access_token.get_secret_value() == 'fresh-access'
+    assert tokens.refresh_token is not None
+    assert tokens.refresh_token.get_secret_value() == 'fresh-refresh'
 
 
 @pytest.mark.asyncio

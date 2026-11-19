@@ -1286,9 +1286,11 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
                 scope=scopes,
             )
 
+        # Keep the Agent Server's configured OH_SECRET_KEY. Passing the
+        # per-sandbox session key here would override it and make persisted
+        # OAuth ciphertext unreadable by the next sandbox.
         init_request = AgentServerInitRequest(
             session_api_keys=[session_api_key],
-            secret_key=session_api_key,
             hindsight_memory=hindsight_memory,
         )
         internal_url = await self.sandbox_service.get_sandbox_internal_url(
