@@ -10,6 +10,7 @@ from typing import AsyncGenerator
 from uuid import uuid4
 
 import pytest
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.pool import StaticPool
 
@@ -20,8 +21,10 @@ from openhands.app_server.app_conversation.app_conversation_models import (
 )
 from openhands.app_server.app_conversation.sql_app_conversation_info_service import (
     SQLAppConversationInfoService,
+    StoredConversationMetadata,
 )
 from openhands.app_server.integrations.service_types import ProviderType
+from openhands.app_server.sandbox.sandbox_lifecycle import active_sandbox_ids
 from openhands.app_server.user.specifiy_user_context import SpecifyUserContext
 from openhands.app_server.utils.sql_utils import Base
 from openhands.sdk.llm import MetricsSnapshot, TokenUsage
@@ -86,6 +89,7 @@ def sample_conversation_info() -> AppConversationInfo:
         id=uuid4(),
         created_by_user_id='test_user_123',
         sandbox_id='sandbox_123',
+        sandbox_spec_id='windows-standard',
         selected_repository='https://github.com/test/repo',
         selected_branch='main',
         git_provider=ProviderType.GITHUB,
@@ -152,7 +156,14 @@ class TestSQLAppConversationInfoService:
         # Verify the retrieved info matches the original
         assert retrieved_info is not None
         assert retrieved_info.id == sample_conversation_info.id
+        assert (
+            retrieved_info.created_by_user_id
+            == sample_conversation_info.created_by_user_id
+        )
         assert retrieved_info.sandbox_id == sample_conversation_info.sandbox_id
+        assert (
+            retrieved_info.sandbox_spec_id == sample_conversation_info.sandbox_spec_id
+        )
         assert (
             retrieved_info.selected_repository
             == sample_conversation_info.selected_repository
@@ -176,6 +187,21 @@ class TestSQLAppConversationInfoService:
         assert result is None
 
     @pytest.mark.asyncio
+    async def test_get_conversation_info_accepts_compact_uuid(
+        self,
+        service: SQLAppConversationInfoService,
+        sample_conversation_info: AppConversationInfo,
+    ):
+        await service.save_app_conversation_info(sample_conversation_info)
+
+        result = await service.get_app_conversation_info(
+            sample_conversation_info.id.hex
+        )
+
+        assert result is not None
+        assert result.id == sample_conversation_info.id
+
+    @pytest.mark.asyncio
     async def test_round_trip_with_all_fields(
         self, service: SQLAppConversationInfoService
     ):
@@ -183,6 +209,7 @@ class TestSQLAppConversationInfoService:
         original_info = AppConversationInfo(
             id=uuid4(),
             created_by_user_id='test_user_456',
+            organization_id=uuid4(),
             sandbox_id='sandbox_full_test',
             selected_repository='https://github.com/full/test',
             selected_branch='feature/test',
@@ -203,6 +230,7 @@ class TestSQLAppConversationInfoService:
         # Verify all fields
         assert retrieved_info is not None
         assert retrieved_info.id == original_info.id
+        assert retrieved_info.organization_id == original_info.organization_id
         assert retrieved_info.sandbox_id == original_info.sandbox_id
         assert retrieved_info.selected_repository == original_info.selected_repository
         assert retrieved_info.selected_branch == original_info.selected_branch
@@ -232,6 +260,7 @@ class TestSQLAppConversationInfoService:
         assert retrieved_info is not None
         assert retrieved_info.id == minimal_info.id
         assert retrieved_info.sandbox_id == minimal_info.sandbox_id
+        assert retrieved_info.sandbox_spec_id is None
 
         # Verify optional fields are None or default values
         assert retrieved_info.selected_repository is None
@@ -286,6 +315,22 @@ class TestSQLAppConversationInfoService:
         assert results == []
 
     @pytest.mark.asyncio
+    async def test_batch_get_accepts_compact_ready_ids(
+        self,
+        service: SQLAppConversationInfoService,
+        multiple_conversation_infos: list[AppConversationInfo],
+    ):
+        for info in multiple_conversation_infos:
+            await service.save_app_conversation_info(info)
+        compact_ids = [info.id.hex for info in multiple_conversation_infos]
+
+        results = await service.batch_get_app_conversation_info(compact_ids)
+
+        assert [result.id if result else None for result in results] == [
+            info.id for info in multiple_conversation_infos
+        ]
+
+    @pytest.mark.asyncio
     async def test_count_conversations_by_sandbox_id(
         self,
         service: SQLAppConversationInfoService,
@@ -332,6 +377,27 @@ class TestSQLAppConversationInfoService:
         assert await service.count_conversations_by_sandbox_id(shared_sandbox) == 3
         assert await service.count_conversations_by_sandbox_id(other_sandbox) == 2
         assert await service.count_conversations_by_sandbox_id('no_such_sandbox') == 0
+
+    @pytest.mark.asyncio
+    async def test_active_sandbox_ids_include_completed_conversations(
+        self,
+        service: SQLAppConversationInfoService,
+        async_session: AsyncSession,
+    ):
+        sandbox_id = 'shared-sandbox'
+        conversation_ids = [uuid4(), uuid4(), uuid4()]
+        for conversation_id in conversation_ids:
+            await service.save_app_conversation_info(
+                AppConversationInfo(
+                    id=conversation_id,
+                    created_by_user_id=None,
+                    sandbox_id=sandbox_id,
+                )
+            )
+        await service.update_execution_status(conversation_ids[1], 'finished')
+        await service.update_execution_status(conversation_ids[2], 'running')
+
+        assert await active_sandbox_ids(async_session) == {sandbox_id}
 
     @pytest.mark.asyncio
     async def test_search_conversation_info_no_filters(
@@ -1377,3 +1443,144 @@ class TestCreatedAtPreservation:
         stored = await service.get_app_conversation_info(conversation_id)
         assert stored is not None
         assert stored.created_at == created_at
+
+
+class TestConversationOwnershipPreservation:
+    @pytest.mark.asyncio
+    async def test_owner_is_persisted_and_hydrated(
+        self,
+        service: SQLAppConversationInfoService,
+        async_session: AsyncSession,
+    ):
+        conversation_id = uuid4()
+        await service.save_app_conversation_info(
+            AppConversationInfo(
+                id=conversation_id,
+                created_by_user_id='owner-123',
+                sandbox_id='sandbox-123',
+            )
+        )
+
+        stored_user_id = await async_session.scalar(
+            select(StoredConversationMetadata.user_id).where(
+                StoredConversationMetadata.conversation_id == str(conversation_id)
+            )
+        )
+        assert stored_user_id == 'owner-123'
+
+        info = await service.get_app_conversation_info(conversation_id)
+        assert info is not None
+        assert info.created_by_user_id == 'owner-123'
+
+    @pytest.mark.asyncio
+    async def test_lifecycle_upsert_preserves_owner_and_organization(
+        self,
+        service: SQLAppConversationInfoService,
+    ):
+        conversation_id = uuid4()
+        organization_id = uuid4()
+        await service.save_app_conversation_info(
+            AppConversationInfo(
+                id=conversation_id,
+                created_by_user_id='owner-123',
+                organization_id=organization_id,
+                sandbox_id='sandbox-123',
+                sandbox_spec_id='windows-build',
+                title='Original',
+            )
+        )
+
+        await service.save_app_conversation_info(
+            AppConversationInfo(
+                id=conversation_id,
+                created_by_user_id=None,
+                organization_id=None,
+                sandbox_id='sandbox-123',
+                title='Updated by lifecycle webhook',
+            )
+        )
+
+        info = await service.get_app_conversation_info(conversation_id)
+        assert info is not None
+        assert info.created_by_user_id == 'owner-123'
+        assert info.organization_id == organization_id
+        assert info.sandbox_spec_id == 'windows-build'
+        assert info.title == 'Updated by lifecycle webhook'
+
+    @pytest.mark.asyncio
+    async def test_stale_lifecycle_upsert_cannot_clear_lineage(
+        self,
+        async_engine,
+    ):
+        conversation_id = uuid4()
+        organization_id = uuid4()
+        session_factory = async_sessionmaker(
+            async_engine, class_=AsyncSession, expire_on_commit=False
+        )
+
+        async with session_factory() as canonical_session:
+            canonical_service = SQLAppConversationInfoService(
+                db_session=canonical_session,
+                user_context=SpecifyUserContext(user_id=None),
+            )
+
+            class StaleReadResult:
+                @staticmethod
+                def one_or_none():
+                    return None
+
+            class InterleavingSession:
+                def __init__(self, db_session):
+                    self.db_session = db_session
+                    self.interleaved = False
+
+                def get_bind(self):
+                    return self.db_session.get_bind()
+
+                async def execute(self, statement):
+                    if not self.interleaved:
+                        self.interleaved = True
+                        await canonical_service.save_app_conversation_info(
+                            AppConversationInfo(
+                                id=conversation_id,
+                                created_by_user_id='owner-123',
+                                organization_id=organization_id,
+                                sandbox_id='sandbox-123',
+                                sandbox_spec_id='windows-build',
+                                title='Canonical',
+                            )
+                        )
+                        if statement.is_select:
+                            return StaleReadResult()
+                    return await self.db_session.execute(statement)
+
+                async def merge(self, instance):
+                    return await self.db_session.merge(instance)
+
+                async def commit(self):
+                    await self.db_session.commit()
+
+            async with session_factory() as lifecycle_session:
+                lifecycle_service = SQLAppConversationInfoService(
+                    db_session=InterleavingSession(lifecycle_session),
+                    user_context=SpecifyUserContext(user_id=None),
+                )
+                await lifecycle_service.save_app_conversation_info(
+                    AppConversationInfo(
+                        id=conversation_id,
+                        created_by_user_id=None,
+                        organization_id=None,
+                        sandbox_id='sandbox-123',
+                        sandbox_spec_id=None,
+                        title='Updated by stale lifecycle webhook',
+                    )
+                )
+
+            info = await canonical_service.get_app_conversation_info(conversation_id)
+
+        assert info is not None
+        assert info.created_by_user_id == 'owner-123'
+        assert info.organization_id == organization_id
+        assert info.sandbox_id == 'sandbox-123'
+        assert info.sandbox_spec_id == 'windows-build'
+        assert info.title == 'Updated by stale lifecycle webhook'

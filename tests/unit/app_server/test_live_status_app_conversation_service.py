@@ -6,7 +6,7 @@ import os
 import sys
 import types
 import zipfile
-from datetime import datetime
+from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 from uuid import uuid4
@@ -20,9 +20,13 @@ from openhands.agent_server.models import (
     TextContent,
 )
 from openhands.app_server.app_conversation.app_conversation_models import (
+    AGENT_PROFILE_ID_TAG_KEY,
+    ARCHIVE_WORKSPACE_PATH_TAG_KEY,
     AgentType,
     AppConversationInfo,
     AppConversationStartRequest,
+    AppConversationStartTask,
+    AppConversationStartTaskStatus,
     ConversationTrigger,
 )
 from openhands.app_server.app_conversation.app_conversation_service import (
@@ -34,19 +38,29 @@ from openhands.app_server.app_conversation.live_status_app_conversation_service 
     LiveStatusAppConversationService,
     _exception_detail,
     _resolve_title_llm_profile,
+    add_acp_provider_token_secrets,
+    bridge_perforce_mcp_secrets,
     effective_disabled_skills,
 )
-from openhands.app_server.errors import SandboxError
+from openhands.app_server.errors import SandboxError, SandboxStartupTimeoutError
 from openhands.app_server.integrations.provider import ProviderToken, ProviderType
 from openhands.app_server.integrations.service_types import SuggestedTask, TaskType
+from openhands.app_server.organization.organization_models import AuthenticationIdentity
 from openhands.app_server.sandbox.sandbox_models import (
     AGENT_SERVER,
     ExposedUrl,
     SandboxInfo,
     SandboxPage,
+    SandboxStartupPhase,
+    SandboxStartupProgress,
+    SandboxStartupProgressStatus,
     SandboxStatus,
 )
-from openhands.app_server.sandbox.sandbox_spec_models import SandboxSpecInfo
+from openhands.app_server.sandbox.sandbox_service import SandboxService
+from openhands.app_server.sandbox.sandbox_spec_models import (
+    SandboxOperatingSystem,
+    SandboxSpecInfo,
+)
 from openhands.app_server.settings.llm_profiles import LLMProfiles
 from openhands.app_server.settings.settings_models import (
     SandboxGroupingStrategy,
@@ -58,6 +72,7 @@ from openhands.sdk import Agent, AgentContext, Event
 from openhands.sdk.llm import LLM
 from openhands.sdk.secret import LookupSecret, StaticSecret
 from openhands.sdk.settings import ConversationSettings, OpenHandsAgentSettings
+from openhands.sdk.tool import SUB_AGENT_TOOL_NAME, Tool
 from openhands.sdk.workspace.remote.async_remote_workspace import AsyncRemoteWorkspace
 
 
@@ -257,10 +272,19 @@ class TestLiveStatusAppConversationService:
         self.mock_user_auth = Mock()
         self.mock_user_context.user_auth = self.mock_user_auth
         self.mock_user_context.get_user_email = AsyncMock(return_value=None)
+        self.mock_user_context.get_default_sandbox_spec_id = AsyncMock(
+            return_value=None
+        )
         self.mock_jwt_service = Mock()
-        self.mock_sandbox_service = Mock()
-        self.mock_sandbox_spec_service = Mock()
+        self.mock_sandbox_service = Mock(spec=SandboxService)
+        self.mock_sandbox_service.get_control_plane_base_url.return_value = (
+            'http://control-plane'
+        )
+        self.mock_sandbox_spec_service = AsyncMock()
         self.mock_app_conversation_info_service = Mock()
+        self.mock_app_conversation_info_service.resolve_organization_id = AsyncMock(
+            return_value=None
+        )
         self.mock_app_conversation_start_task_service = Mock()
         self.mock_event_callback_service = Mock()
         self.mock_event_service = Mock()
@@ -280,6 +304,7 @@ class TestLiveStatusAppConversationService:
             jwt_service=self.mock_jwt_service,
             pending_message_service=self.mock_pending_message_service,
             sandbox_startup_timeout=30,
+            sandbox_startup_inactivity_timeout=10,
             sandbox_startup_poll_frequency=1,
             max_num_conversations_per_sandbox=20,
             httpx_client=self.mock_httpx_client,
@@ -306,8 +331,9 @@ class TestLiveStatusAppConversationService:
 
         # Mock sandbox
         self.mock_sandbox = Mock(spec=SandboxInfo)
-        self.mock_sandbox.id = uuid4()
+        self.mock_sandbox.id = 'sandbox-123'
         self.mock_sandbox.status = SandboxStatus.RUNNING
+        self.mock_sandbox.session_api_key = 'session-key'
 
         # Stable conversation ID for tests that call _configure_llm_and_mcp directly
         self.conversation_id = uuid4()
@@ -315,6 +341,42 @@ class TestLiveStatusAppConversationService:
         # Default mock for hooks loading - returns None (no hooks found)
         # Tests that specifically test hooks loading can override this mock
         self.service._load_hooks_from_workspace = AsyncMock(return_value=None)
+
+    @pytest.mark.asyncio
+    async def test_initial_unschedulable_error_is_delegated_to_startup_wait(self):
+        sandbox = SandboxInfo(
+            id='sb-autoscale',
+            created_by_user_id=None,
+            sandbox_spec_id='windows-build',
+            status=SandboxStatus.ERROR,
+            session_api_key=None,
+            created_at=datetime.now(),
+            status_detail=(
+                "0/1 nodes are available: 1 node(s) didn't match Pod's "
+                'node affinity/selector.'
+            ),
+        )
+        task = AppConversationStartTask(
+            created_by_user_id=None,
+            request=AppConversationStartRequest(),
+        )
+        self.mock_sandbox_service.start_sandbox = AsyncMock(return_value=sandbox)
+        self.mock_sandbox_service.wait_for_sandbox_running = AsyncMock(
+            return_value=sandbox
+        )
+
+        updates = [
+            update async for update in self.service._wait_for_sandbox_start(task)
+        ]
+
+        assert updates == [task]
+        assert task.status == AppConversationStartTaskStatus.WAITING_FOR_SANDBOX
+        self.mock_sandbox_service.wait_for_sandbox_running.assert_awaited_once_with(
+            'sb-autoscale',
+            timeout=30,
+            poll_interval=1,
+            httpx_client=self.mock_httpx_client,
+        )
 
     @pytest.mark.asyncio
     async def test_seed_sandbox_profiles_upserts_resolved_keys_and_prunes(self):
@@ -428,6 +490,200 @@ class TestLiveStatusAppConversationService:
                 self.service._apply_suggested_task(request)
 
     @pytest.mark.asyncio
+    async def test_initialize_agent_server_sends_trusted_hindsight_scope(self):
+        organization_id = uuid4()
+        self.mock_sandbox_service.get_sandbox_internal_url = AsyncMock(
+            return_value='http://sandbox.agents.svc.cluster.local:8000'
+        )
+        self.mock_sandbox_service.get_sandbox_init_api_key = AsyncMock(
+            return_value='bootstrap-key'
+        )
+        self.mock_user_context.get_authentication_identity = AsyncMock(
+            return_value=AuthenticationIdentity(
+                provider='entra',
+                tenant_id='11111111-1111-1111-1111-111111111111',
+                subject_id='22222222-2222-2222-2222-222222222222',
+            )
+        )
+        self.mock_user_context.get_user_id = AsyncMock(return_value='user-1')
+        self.mock_user_context.get_user_info = AsyncMock(return_value=self.mock_user)
+        self.mock_jwt_service.create_jws_token.return_value = 'signed-identity'
+        dormant = Mock()
+        dormant.json.return_value = {'state': 'dormant', 'error': None}
+        dormant.raise_for_status.return_value = None
+        ready = Mock()
+        ready.json.return_value = {'state': 'ready', 'error': None}
+        ready.raise_for_status.return_value = None
+        self.mock_httpx_client.get = AsyncMock(return_value=dormant)
+        self.mock_httpx_client.post = AsyncMock(return_value=ready)
+
+        config = Mock(
+            hindsight_enabled=True,
+            hindsight_broker_url='https://control-plane/hindsight',
+            hindsight_deployment_id='halo-ppe',
+        )
+        with patch(
+            'openhands.app_server.config.get_global_config', return_value=config
+        ):
+            await self.service._initialize_agent_server(
+                agent_server_url='http://agent-server',
+                sandbox=self.mock_sandbox,
+                organization_id=organization_id,
+                working_dir='/workspace/project',
+                git_provider=ProviderType.GITHUB,
+                selected_repository='OpenHands/sandbox-server',
+                agent_profile_id=None,
+            )
+
+        post = self.mock_httpx_client.post.await_args
+        assert post.args[0] == 'http://sandbox.agents.svc.cluster.local:8000/api/init'
+        get = self.mock_httpx_client.get.await_args
+        assert get.args[0] == 'http://sandbox.agents.svc.cluster.local:8000/api/init'
+        assert post.kwargs['headers'] == {'X-Init-API-Key': 'bootstrap-key'}
+        assert post.kwargs['json']['session_api_keys'] == ['session-key']
+        assert 'secret_key' not in post.kwargs['json']
+        assert post.kwargs['json']['hindsight_memory'] == {
+            'broker_url': 'https://control-plane/hindsight',
+            'identity': 'signed-identity',
+            'scope': [
+                {'type': 'server', 'id': 'halo-ppe'},
+                {'type': 'organization', 'id': str(organization_id)},
+                {
+                    'type': 'repository',
+                    'id': 'github:openhands/sandbox-server',
+                },
+                {'type': 'workspace', 'id': 'sandbox-123'},
+                {
+                    'type': 'private_user',
+                    'id': (
+                        '11111111-1111-1111-1111-111111111111:'
+                        '22222222-2222-2222-2222-222222222222'
+                    ),
+                },
+            ],
+            'timeout_seconds': 2.0,
+        }
+
+    @pytest.mark.asyncio
+    async def test_initialize_agent_server_requires_dormant_bootstrap_key(self):
+        self.mock_sandbox_service.get_sandbox_internal_url = AsyncMock(
+            return_value='http://sandbox.agents.svc.cluster.local:8000'
+        )
+        self.mock_sandbox_service.get_sandbox_init_api_key = AsyncMock(
+            return_value=None
+        )
+        self.mock_user_context.get_user_info = AsyncMock(return_value=self.mock_user)
+        dormant = Mock()
+        dormant.json.return_value = {'state': 'dormant', 'error': None}
+        dormant.raise_for_status.return_value = None
+        self.mock_httpx_client.get = AsyncMock(return_value=dormant)
+
+        config = Mock(hindsight_enabled=False)
+        with (
+            patch('openhands.app_server.config.get_global_config', return_value=config),
+            pytest.raises(
+                SandboxError, match='requires the dormant server bootstrap key'
+            ),
+        ):
+            await self.service._initialize_agent_server(
+                agent_server_url='http://agent-server',
+                sandbox=self.mock_sandbox,
+                organization_id=None,
+                working_dir='/workspace/project',
+                git_provider=None,
+                selected_repository=None,
+                agent_profile_id=None,
+            )
+
+        self.mock_httpx_client.post.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_resume_sandbox_initializes_recreated_deferred_agent_server(self):
+        organization_id = uuid4()
+        conversation_id = uuid4()
+        sandbox = SandboxInfo(
+            id='sandbox-123',
+            created_by_user_id='test_user_123',
+            sandbox_spec_id='linux-standard',
+            status=SandboxStatus.RUNNING,
+            session_api_key='resumed-session-key',
+            exposed_urls=[
+                ExposedUrl(
+                    name=AGENT_SERVER,
+                    url='http://resumed-agent-server:8000',
+                    port=8000,
+                )
+            ],
+        )
+        conversation = AppConversationInfo(
+            id=conversation_id,
+            created_by_user_id='test_user_123',
+            organization_id=organization_id,
+            sandbox_id=sandbox.id,
+            sandbox_spec_id=sandbox.sandbox_spec_id,
+            selected_repository='OpenHands/sandbox-server',
+            git_provider=ProviderType.GITHUB,
+            tags={
+                ARCHIVE_WORKSPACE_PATH_TAG_KEY: '/workspace/project',
+                AGENT_PROFILE_ID_TAG_KEY: str(uuid4()),
+            },
+        )
+        self.mock_sandbox_service.resume_sandbox = AsyncMock(return_value=True)
+        self.mock_sandbox_service.watch_sandbox_startup = Mock(
+            return_value=_async_iter([Mock()])
+        )
+        self.mock_sandbox_service.get_sandbox = AsyncMock(return_value=sandbox)
+        self.mock_sandbox_service.get_sandbox_internal_url = AsyncMock(
+            return_value='http://sandbox.agents.svc.cluster.local:8000'
+        )
+        self.mock_sandbox_service.get_sandbox_init_api_key = AsyncMock(
+            return_value='shared-bootstrap-key'
+        )
+        self.mock_app_conversation_info_service.search_app_conversation_info = (
+            AsyncMock(return_value=SimpleNamespace(items=[conversation]))
+        )
+        self.mock_sandbox_spec_service.get_sandbox_spec = AsyncMock(
+            return_value=SimpleNamespace(
+                working_dir='/workspace',
+                initial_env={'OH_DEFERRED_INIT': 'true'},
+            )
+        )
+        self.mock_user_context.get_user_info = AsyncMock(return_value=self.mock_user)
+        self.service._seed_sandbox_profiles = AsyncMock()
+
+        dormant = Mock()
+        dormant.json.return_value = {'state': 'dormant', 'error': None}
+        dormant.raise_for_status.return_value = None
+        ready = Mock()
+        ready.json.return_value = {'state': 'ready', 'error': None}
+        ready.raise_for_status.return_value = None
+        self.mock_httpx_client.get = AsyncMock(return_value=dormant)
+        self.mock_httpx_client.post = AsyncMock(return_value=ready)
+
+        with patch(
+            'openhands.app_server.config.get_global_config',
+            return_value=Mock(hindsight_enabled=False),
+        ):
+            assert await self.service.resume_sandbox(sandbox.id) is True
+
+        self.mock_sandbox_service.resume_sandbox.assert_awaited_once_with(sandbox.id)
+        self.mock_sandbox_service.watch_sandbox_startup.assert_called_once_with(
+            sandbox.id,
+            timeout=30,
+            inactivity_timeout=10,
+            poll_interval=1,
+        )
+        post = self.mock_httpx_client.post.await_args
+        assert post.args[0] == 'http://sandbox.agents.svc.cluster.local:8000/api/init'
+        assert post.kwargs['headers'] == {'X-Init-API-Key': 'shared-bootstrap-key'}
+        assert post.kwargs['json']['session_api_keys'] == ['resumed-session-key']
+        assert 'secret_key' not in post.kwargs['json']
+        self.service._seed_sandbox_profiles.assert_awaited_once_with(
+            'http://resumed-agent-server:8000',
+            'resumed-session-key',
+        )
+
+    @pytest.mark.asyncio
     async def test_setup_secrets_for_git_providers_no_provider_tokens(self):
         """Test _setup_secrets_for_git_providers with no provider tokens."""
         # Arrange
@@ -440,7 +696,9 @@ class TestLiveStatusAppConversationService:
         self.mock_jwt_service.create_jws_token.return_value = 'test_access_token'
 
         # Act
-        result = await self.service._setup_secrets_for_git_providers(self.mock_user)
+        result = await self.service._setup_secrets_for_git_providers(
+            self.mock_user, self.mock_sandbox
+        )
 
         # Assert — custom secrets are passed through as-is (no LookupSecret wrapping)
         assert 'existing' in result
@@ -467,7 +725,9 @@ class TestLiveStatusAppConversationService:
         )
 
         # Act
-        result = await self.service._setup_secrets_for_git_providers(self.mock_user)
+        result = await self.service._setup_secrets_for_git_providers(
+            self.mock_user, self.mock_sandbox
+        )
 
         # Assert
         assert 'GITHUB_TOKEN' in result
@@ -476,15 +736,16 @@ class TestLiveStatusAppConversationService:
         assert isinstance(result['GITLAB_TOKEN'], LookupSecret)
         assert (
             result['GITHUB_TOKEN'].url
-            == 'https://test.example.com/api/v1/webhooks/secrets'
+            == 'http://control-plane/api/v1/sandboxes/sandbox-123/settings/secrets/GITHUB_TOKEN'
         )
-        assert result['GITHUB_TOKEN'].headers['X-Access-Token'] == 'test_access_token'
+        assert result['GITHUB_TOKEN'].headers == {'X-Session-API-Key': 'session-key'}
+        assert 'test.example.com' not in result['GITHUB_TOKEN'].url
         # Verify descriptions are included
         assert result['GITHUB_TOKEN'].description == 'GITHUB authentication token'
         assert result['GITLAB_TOKEN'].description == 'GITLAB authentication token'
 
         # Should be called twice, once for each provider
-        assert self.mock_jwt_service.create_jws_token.call_count == 2
+        self.mock_jwt_service.create_jws_token.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_setup_secrets_for_git_providers_with_saas_mode(self):
@@ -504,16 +765,15 @@ class TestLiveStatusAppConversationService:
         )
 
         # Act
-        result = await self.service._setup_secrets_for_git_providers(self.mock_user)
+        result = await self.service._setup_secrets_for_git_providers(
+            self.mock_user, self.mock_sandbox
+        )
 
         # Assert
         assert 'GITLAB_TOKEN' in result
         lookup_secret = result['GITLAB_TOKEN']
         assert isinstance(lookup_secret, LookupSecret)
-        assert 'X-Access-Token' in lookup_secret.headers
-        assert lookup_secret.headers['X-Access-Token'] == 'test_access_token'
-        # Verify no cookie is included (authentication is via X-Access-Token only)
-        assert 'Cookie' not in lookup_secret.headers
+        assert lookup_secret.headers == {'X-Session-API-Key': 'session-key'}
         # Verify description is included
         assert lookup_secret.description == 'GITLAB authentication token'
 
@@ -522,6 +782,7 @@ class TestLiveStatusAppConversationService:
         """Test _setup_secrets_for_git_providers without web URL (uses static token)."""
         # Arrange
         self.service.web_url = None
+        self.mock_sandbox_service.get_control_plane_base_url.return_value = None
         base_secrets = {}
         self.mock_user_context.get_secrets.return_value = base_secrets
         self.mock_user_context.get_latest_token.return_value = 'static_token_value'
@@ -535,7 +796,9 @@ class TestLiveStatusAppConversationService:
         )
 
         # Act
-        result = await self.service._setup_secrets_for_git_providers(self.mock_user)
+        result = await self.service._setup_secrets_for_git_providers(
+            self.mock_user, self.mock_sandbox
+        )
 
         # Assert
         assert 'GITHUB_TOKEN' in result
@@ -552,6 +815,7 @@ class TestLiveStatusAppConversationService:
         """Test _setup_secrets_for_git_providers when no static token is available."""
         # Arrange
         self.service.web_url = None
+        self.mock_sandbox_service.get_control_plane_base_url.return_value = None
         base_secrets = {}
         self.mock_user_context.get_secrets.return_value = base_secrets
         self.mock_user_context.get_latest_token.return_value = None
@@ -565,7 +829,9 @@ class TestLiveStatusAppConversationService:
         )
 
         # Act
-        result = await self.service._setup_secrets_for_git_providers(self.mock_user)
+        result = await self.service._setup_secrets_for_git_providers(
+            self.mock_user, self.mock_sandbox
+        )
 
         # Assert
         assert 'GITHUB_TOKEN' not in result
@@ -590,7 +856,9 @@ class TestLiveStatusAppConversationService:
         )
 
         # Act
-        result = await self.service._setup_secrets_for_git_providers(self.mock_user)
+        result = await self.service._setup_secrets_for_git_providers(
+            self.mock_user, self.mock_sandbox
+        )
 
         # Assert - verify all secrets have correct descriptions
         assert 'GITHUB_TOKEN' in result
@@ -610,6 +878,7 @@ class TestLiveStatusAppConversationService:
         """Test _setup_secrets_for_git_providers includes description for StaticSecret."""
         # Arrange
         self.service.web_url = None
+        self.mock_sandbox_service.get_control_plane_base_url.return_value = None
         base_secrets = {}
         self.mock_user_context.get_secrets.return_value = base_secrets
         self.mock_user_context.get_latest_token.return_value = 'static_token_value'
@@ -624,7 +893,9 @@ class TestLiveStatusAppConversationService:
         )
 
         # Act
-        result = await self.service._setup_secrets_for_git_providers(self.mock_user)
+        result = await self.service._setup_secrets_for_git_providers(
+            self.mock_user, self.mock_sandbox
+        )
 
         # Assert - verify StaticSecret objects have descriptions
         assert 'GITHUB_TOKEN' in result
@@ -666,7 +937,9 @@ class TestLiveStatusAppConversationService:
         )
 
         # Act
-        result = await self.service._setup_secrets_for_git_providers(self.mock_user)
+        result = await self.service._setup_secrets_for_git_providers(
+            self.mock_user, self.mock_sandbox
+        )
 
         # Assert — custom secrets are passed through as-is; descriptions preserved.
         assert 'CUSTOM_API_KEY' in result
@@ -706,7 +979,9 @@ class TestLiveStatusAppConversationService:
         self.mock_jwt_service.create_jws_token.return_value = 'test_access_token'
 
         # Act
-        result = await self.service._setup_secrets_for_git_providers(self.mock_user)
+        result = await self.service._setup_secrets_for_git_providers(
+            self.mock_user, self.mock_sandbox
+        )
 
         # Assert — custom secrets are passed through as-is; empty description preserved
         assert 'MY_SECRET' in result
@@ -1193,7 +1468,7 @@ class TestLiveStatusAppConversationService:
         assert 'git_provider:github' in metadata['tags']
 
     @patch(
-        'openhands.app_server.app_conversation.live_status_app_conversation_service.get_default_tools',
+        'openhands.app_server.app_conversation.live_status_app_conversation_service.launch_tool_specs',
         return_value=[],
     )
     @pytest.mark.asyncio
@@ -1229,7 +1504,7 @@ class TestLiveStatusAppConversationService:
         self.service._load_skills_and_update_agent.assert_called_once()
 
     @patch(
-        'openhands.app_server.app_conversation.live_status_app_conversation_service.get_default_tools',
+        'openhands.app_server.app_conversation.live_status_app_conversation_service.launch_tool_specs',
         return_value=[],
     )
     @pytest.mark.asyncio
@@ -1262,7 +1537,7 @@ class TestLiveStatusAppConversationService:
         assert request.title_llm_profile == 'Titles'
 
     @patch(
-        'openhands.app_server.app_conversation.live_status_app_conversation_service.get_default_tools',
+        'openhands.app_server.app_conversation.live_status_app_conversation_service.launch_tool_specs',
         return_value=[],
     )
     @pytest.mark.asyncio
@@ -1303,7 +1578,7 @@ class TestLiveStatusAppConversationService:
         assert set(kwargs['disabled_skills']) == {'member-skill', 'profile-skill'}
 
     @patch(
-        'openhands.app_server.app_conversation.live_status_app_conversation_service.get_default_tools',
+        'openhands.app_server.app_conversation.live_status_app_conversation_service.launch_tool_specs',
         return_value=[],
     )
     @pytest.mark.asyncio
@@ -1332,7 +1607,7 @@ class TestLiveStatusAppConversationService:
         assert result.conversation_id == conversation_id
 
     @patch(
-        'openhands.app_server.app_conversation.live_status_app_conversation_service.get_default_tools',
+        'openhands.app_server.app_conversation.live_status_app_conversation_service.launch_tool_specs',
         return_value=[],
     )
     @pytest.mark.asyncio
@@ -1399,7 +1674,7 @@ class TestLiveStatusAppConversationService:
         assert updated.condenser.llm.usage_id == 'condenser'
 
     @patch(
-        'openhands.app_server.app_conversation.live_status_app_conversation_service.get_default_tools',
+        'openhands.app_server.app_conversation.live_status_app_conversation_service.launch_tool_specs',
         return_value=[],
     )
     @pytest.mark.asyncio
@@ -1450,14 +1725,14 @@ class TestLiveStatusAppConversationService:
         assert result.workspace.working_dir == '/test/dir/repo'
 
         self.service._setup_secrets_for_git_providers.assert_called_once_with(
-            self.mock_user
+            self.mock_user, self.mock_sandbox
         )
         self.service._configure_llm_and_mcp.assert_called_once_with(
             self.mock_user, 'gpt-4', test_conversation_id
         )
 
     @patch(
-        'openhands.app_server.app_conversation.live_status_app_conversation_service.get_default_tools',
+        'openhands.app_server.app_conversation.live_status_app_conversation_service.launch_tool_specs',
         return_value=[],
     )
     @pytest.mark.asyncio
@@ -1495,7 +1770,7 @@ class TestLiveStatusAppConversationService:
         }
 
     @patch(
-        'openhands.app_server.app_conversation.live_status_app_conversation_service.get_default_tools',
+        'openhands.app_server.app_conversation.live_status_app_conversation_service.launch_tool_specs',
         return_value=[],
     )
     @pytest.mark.asyncio
@@ -1545,7 +1820,7 @@ class TestLiveStatusAppConversationService:
         )
 
     @patch(
-        'openhands.app_server.app_conversation.live_status_app_conversation_service.get_default_tools',
+        'openhands.app_server.app_conversation.live_status_app_conversation_service.launch_tool_specs',
         return_value=[],
     )
     @pytest.mark.asyncio
@@ -1583,7 +1858,7 @@ class TestLiveStatusAppConversationService:
         }
 
     @patch(
-        'openhands.app_server.app_conversation.live_status_app_conversation_service.get_default_tools',
+        'openhands.app_server.app_conversation.live_status_app_conversation_service.launch_tool_specs',
         return_value=[],
     )
     @pytest.mark.asyncio
@@ -1615,7 +1890,7 @@ class TestLiveStatusAppConversationService:
         }
 
     @patch(
-        'openhands.app_server.app_conversation.live_status_app_conversation_service.get_default_tools',
+        'openhands.app_server.app_conversation.live_status_app_conversation_service.launch_tool_specs',
         return_value=[],
     )
     @pytest.mark.asyncio
@@ -1668,18 +1943,16 @@ class TestLiveStatusAppConversationService:
         }
 
     @pytest.mark.asyncio
-    async def test_build_request_routes_acp_user_to_observability_metadata(self):
-        """End-to-end through the *routing* entrypoint (not the ACP builder
-        directly): an ACP user hits the ``isinstance(..., ACPAgentSettings)``
-        branch in ``_build_start_conversation_request_for_user``, which must
-        forward git_provider/selected_branch/remote_workspace into
-        ``_build_acp_start_conversation_request`` for this to populate.
+    async def test_build_request_routes_copilot_acp_without_llm(self):
+        """A canonical Copilot ACP profile routes without OpenHands LLM settings.
+
+        This exercises the routing entrypoint rather than calling the ACP builder
+        directly, matching organization Agent Profile resolution at chat start.
         """
         from openhands.sdk.settings import ACPAgentSettings
 
         self.mock_user.agent_settings = ACPAgentSettings(
-            acp_server='claude-code',
-            llm=LLM(model='claude-sonnet-4-5', api_key=SecretStr('k')),
+            acp_server='copilot-cli',
         )
         self.mock_user_context.get_user_info.return_value = self.mock_user
         self.mock_user_context.get_secrets = AsyncMock(return_value={})
@@ -1716,7 +1989,7 @@ class TestLiveStatusAppConversationService:
         }
 
     @patch(
-        'openhands.app_server.app_conversation.live_status_app_conversation_service.get_default_tools',
+        'openhands.app_server.app_conversation.live_status_app_conversation_service.launch_tool_specs',
         return_value=[],
     )
     @pytest.mark.asyncio
@@ -1743,7 +2016,7 @@ class TestLiveStatusAppConversationService:
         assert 'git fetch --unshallow' in suffix
 
     @patch(
-        'openhands.app_server.app_conversation.live_status_app_conversation_service.get_default_tools',
+        'openhands.app_server.app_conversation.live_status_app_conversation_service.launch_tool_specs',
         return_value=[],
     )
     @pytest.mark.asyncio
@@ -1776,16 +2049,11 @@ class TestLiveStatusAppConversationService:
     @patch(
         'openhands.app_server.app_conversation.live_status_app_conversation_service.register_builtins_agents'
     )
-    @patch(
-        'openhands.app_server.app_conversation.live_status_app_conversation_service.get_default_tools',
-        return_value=[],
-    )
     @pytest.mark.asyncio
-    async def test_build_request_passes_enable_sub_agents_true(
-        self, mock_tools, mock_register_builtins, mock_get_agent_definitions
+    async def test_build_request_forwards_explicit_subagent_definitions(
+        self, mock_register_builtins, mock_get_agent_definitions
     ):
-        """Built-in sub-agents are registered when the user setting is on."""
-        from openhands.sdk.settings import OpenHandsAgentSettings
+        """Built-in sub-agents are registered when the canonical tool is present."""
         from openhands.sdk.subagent.schema import AgentDefinition
 
         agent_definition = AgentDefinition(
@@ -1797,7 +2065,7 @@ class TestLiveStatusAppConversationService:
 
         agent_settings = OpenHandsAgentSettings(
             llm={'model': 'gpt-4', 'api_key': 'test-key'},
-            enable_sub_agents=True,
+            tools=[Tool(name=SUB_AGENT_TOOL_NAME)],
         )
         self.mock_user.agent_settings = agent_settings
         self.mock_user_context.get_user_info.return_value = self.mock_user
@@ -1818,8 +2086,8 @@ class TestLiveStatusAppConversationService:
 
         mock_register_builtins.assert_called_once_with(enable_browser=True)
         mock_get_agent_definitions.assert_called_once_with()
-        mock_tools.assert_called_once_with(enable_browser=True, enable_sub_agents=True)
         assert result.agent_definitions == [agent_definition]
+        assert result.agent.tools == [Tool(name=SUB_AGENT_TOOL_NAME)]
 
     @patch(
         'openhands.app_server.app_conversation.live_status_app_conversation_service.get_registered_agent_definitions'
@@ -1827,20 +2095,13 @@ class TestLiveStatusAppConversationService:
     @patch(
         'openhands.app_server.app_conversation.live_status_app_conversation_service.register_builtins_agents'
     )
-    @patch(
-        'openhands.app_server.app_conversation.live_status_app_conversation_service.get_default_tools',
-        return_value=[],
-    )
     @pytest.mark.asyncio
-    async def test_build_request_passes_enable_sub_agents_false(
-        self, mock_tools, mock_register_builtins, mock_get_agent_definitions
+    async def test_build_request_materializes_default_tools_without_retired_switch(
+        self, mock_register_builtins, mock_get_agent_definitions
     ):
-        """Built-in sub-agents are registered but not forwarded when disabled."""
-        from openhands.sdk.settings import OpenHandsAgentSettings
-
+        """Current SDK settings start conversations without retired switches."""
         agent_settings = OpenHandsAgentSettings(
             llm={'model': 'gpt-4', 'api_key': 'test-key'},
-            enable_sub_agents=False,
         )
         self.mock_user.agent_settings = agent_settings
         self.mock_user_context.get_user_info.return_value = self.mock_user
@@ -1861,11 +2122,52 @@ class TestLiveStatusAppConversationService:
 
         mock_register_builtins.assert_called_once_with(enable_browser=True)
         mock_get_agent_definitions.assert_not_called()
-        mock_tools.assert_called_once_with(enable_browser=True, enable_sub_agents=False)
         assert result.agent_definitions == []
+        assert [tool.name for tool in result.agent.tools] == [
+            'terminal',
+            'file_editor',
+            'task_tracker',
+            'browser_tool_set',
+        ]
 
     @patch(
-        'openhands.app_server.app_conversation.live_status_app_conversation_service.get_default_tools',
+        'openhands.app_server.app_conversation.live_status_app_conversation_service.get_registered_agent_definitions'
+    )
+    @patch(
+        'openhands.app_server.app_conversation.live_status_app_conversation_service.register_builtins_agents'
+    )
+    @pytest.mark.asyncio
+    async def test_build_request_preserves_explicit_tools_without_delegation(
+        self, mock_register_builtins, mock_get_agent_definitions
+    ):
+        agent_settings = OpenHandsAgentSettings(
+            llm={'model': 'gpt-4', 'api_key': 'test-key'},
+            tools=[Tool(name='terminal')],
+        )
+        self.mock_user.agent_settings = agent_settings
+        self.mock_user_context.get_user_info.return_value = self.mock_user
+
+        real_llm = LLM(model='gpt-4', api_key=SecretStr('test-key'))
+        self.service._setup_secrets_for_git_providers = AsyncMock(return_value={})
+        self.service._configure_llm_and_mcp = AsyncMock(return_value=(real_llm, {}))
+
+        result = await self.service._build_start_conversation_request_for_user(
+            sandbox=self.mock_sandbox,
+            conversation_id=uuid4(),
+            initial_message=None,
+            system_message_suffix=None,
+            git_provider=None,
+            working_dir='/test/dir',
+            remote_workspace=None,
+        )
+
+        mock_register_builtins.assert_called_once_with(enable_browser=True)
+        mock_get_agent_definitions.assert_not_called()
+        assert result.agent_definitions == []
+        assert result.agent.tools == [Tool(name='terminal')]
+
+    @patch(
+        'openhands.app_server.app_conversation.live_status_app_conversation_service.launch_tool_specs',
         return_value=[],
     )
     @pytest.mark.asyncio
@@ -1916,11 +2218,67 @@ class TestLiveStatusAppConversationService:
         assert 'EXISTING_SECRET' in secrets
         assert 'MY_API_KEY' in secrets
         assert 'ANOTHER_SECRET' in secrets
+        assert result.secrets == secrets
 
         # API-provided secrets should be StaticSecret instances
         assert isinstance(secrets['MY_API_KEY'], StaticSecret)
         assert secrets['MY_API_KEY'].value.get_secret_value() == 'my_api_key_value'
         assert secrets['ANOTHER_SECRET'].value.get_secret_value() == 'another_value'
+
+    @patch(
+        'openhands.app_server.app_conversation.live_status_app_conversation_service.launch_tool_specs',
+        return_value=[],
+    )
+    @pytest.mark.asyncio
+    async def test_perforce_mcp_values_use_request_secret_registry(self, _mock_tools):
+        from openhands.sdk.mcp.config import MCPServer
+
+        self.mock_user_context.get_user_info.return_value = self.mock_user
+        self.service._setup_secrets_for_git_providers = AsyncMock(return_value={})
+        self.service._configure_llm_and_mcp = AsyncMock(
+            return_value=(
+                LLM(model='gpt-4', api_key=SecretStr('test-key')),
+                {
+                    'perforce': MCPServer(
+                        command='p4-mcp-server',
+                        env={
+                            'P4PORT': 'ssl:p4.example.com:1666',
+                            'P4USER': 'builder',
+                            'P4PASSWD': 'ticket-value',
+                            'P4CLIENT': 'workspace-name',
+                        },
+                    )
+                },
+            )
+        )
+
+        result = await self.service._build_start_conversation_request_for_user(
+            sandbox=self.mock_sandbox,
+            conversation_id=uuid4(),
+            initial_message=None,
+            system_message_suffix=None,
+            git_provider=None,
+            working_dir='/test/dir',
+            remote_workspace=None,
+        )
+
+        env = result.agent.mcp_config['perforce'].env or {}
+        assert env['P4CLIENT'].get_secret_value() == 'workspace-name'
+        refs = {
+            env_name: env[env_name].get_secret_value()
+            for env_name in ('P4PORT', 'P4USER', 'P4PASSWD')
+        }
+        registry_values = {
+            f'${{{name}}}': source.value.get_secret_value()
+            for name, source in result.secrets.items()
+        }
+        assert registry_values[refs['P4PORT']] == 'ssl:p4.example.com:1666'
+        assert registry_values[refs['P4USER']] == 'builder'
+        assert registry_values[refs['P4PASSWD']] == 'ticket-value'
+        assert not any(
+            value in result.model_dump_json()
+            for value in ('ssl:p4.example.com:1666', 'builder', 'ticket-value')
+        )
 
     @patch(
         'openhands.app_server.app_conversation.live_status_app_conversation_service.get_default_tools',
@@ -1972,7 +2330,7 @@ class TestLiveStatusAppConversationService:
         assert secrets['SHARED_SECRET'].value.get_secret_value() == 'overridden_value'
 
     @patch(
-        'openhands.app_server.app_conversation.live_status_app_conversation_service.get_default_tools',
+        'openhands.app_server.app_conversation.live_status_app_conversation_service.launch_tool_specs',
         return_value=[],
     )
     @pytest.mark.asyncio
@@ -2025,16 +2383,19 @@ class TestLiveStatusAppConversationService:
         running_sandbox.id = 'sandbox_1'
         running_sandbox.status = SandboxStatus.RUNNING
         running_sandbox.created_by_user_id = user_id
+        running_sandbox.sandbox_spec_id = 'linux-standard'
 
         other_user_sandbox = Mock(spec=SandboxInfo)
         other_user_sandbox.id = 'sandbox_2'
         other_user_sandbox.status = SandboxStatus.RUNNING
         other_user_sandbox.created_by_user_id = 'other_user'
+        other_user_sandbox.sandbox_spec_id = 'linux-standard'
 
         paused_sandbox = Mock(spec=SandboxInfo)
         paused_sandbox.id = 'sandbox_3'
         paused_sandbox.status = SandboxStatus.PAUSED
         paused_sandbox.created_by_user_id = user_id
+        paused_sandbox.sandbox_spec_id = 'linux-standard'
 
         # Mock sandbox service search
         mock_page = Mock(spec=SandboxPage)
@@ -2043,7 +2404,7 @@ class TestLiveStatusAppConversationService:
         self.mock_sandbox_service.search_sandboxes = AsyncMock(return_value=mock_page)
 
         # Act
-        result = await self.service._find_running_sandbox_for_user()
+        result = await self.service._find_running_sandbox_for_user('linux-standard')
 
         # Assert
         assert result == running_sandbox
@@ -2064,11 +2425,13 @@ class TestLiveStatusAppConversationService:
         other_user_sandbox.id = 'sandbox_1'
         other_user_sandbox.status = SandboxStatus.RUNNING
         other_user_sandbox.created_by_user_id = 'other_user'
+        other_user_sandbox.sandbox_spec_id = 'windows-standard'
 
         paused_sandbox = Mock(spec=SandboxInfo)
         paused_sandbox.id = 'sandbox_2'
         paused_sandbox.status = SandboxStatus.PAUSED
         paused_sandbox.created_by_user_id = user_id
+        paused_sandbox.sandbox_spec_id = 'windows-standard'
 
         # Mock sandbox service search
         mock_page = Mock(spec=SandboxPage)
@@ -2077,7 +2440,7 @@ class TestLiveStatusAppConversationService:
         self.mock_sandbox_service.search_sandboxes = AsyncMock(return_value=mock_page)
 
         # Act
-        result = await self.service._find_running_sandbox_for_user()
+        result = await self.service._find_running_sandbox_for_user('windows-standard')
 
         # Assert
         assert result is None
@@ -2096,7 +2459,7 @@ class TestLiveStatusAppConversationService:
         with patch(
             'openhands.app_server.app_conversation.live_status_app_conversation_service._logger'
         ) as mock_logger:
-            result = await self.service._find_running_sandbox_for_user()
+            result = await self.service._find_running_sandbox_for_user('linux-standard')
 
         # Assert
         assert result is None
@@ -2105,6 +2468,257 @@ class TestLiveStatusAppConversationService:
             'Error finding running sandbox for user'
             in mock_logger.warning.call_args[0][0]
         )
+
+    @pytest.mark.asyncio
+    async def test_wait_for_sandbox_start_creates_exact_requested_profile(self):
+        requested_spec = SandboxSpecInfo(
+            id='windows-server-2025-amd64',
+            command=None,
+            startup_timeout_seconds=300,
+        )
+        self.mock_user_context.get_default_sandbox_spec_id = AsyncMock(
+            return_value='linux-standard'
+        )
+        self.mock_sandbox_spec_service.get_sandbox_spec = AsyncMock(
+            return_value=requested_spec
+        )
+        self.service._find_running_sandbox_for_user = AsyncMock(return_value=None)
+        sandbox = SandboxInfo(
+            id='new-windows',
+            created_by_user_id='test_user_123',
+            sandbox_spec_id=requested_spec.id,
+            status=SandboxStatus.RUNNING,
+            session_api_key='key',
+        )
+        self.mock_sandbox_service.start_sandbox = AsyncMock(return_value=sandbox)
+        ready_progress = self._startup_progress(
+            SandboxStartupPhase.READY,
+            SandboxStartupProgressStatus.READY,
+        )
+        autoscaler_progress = self._startup_progress(
+            SandboxStartupPhase.PROVISIONING_NODE,
+            SandboxStartupProgressStatus.PROGRESSING,
+        )
+
+        async def watch(*args, **kwargs):
+            yield autoscaler_progress
+            yield ready_progress
+
+        self.mock_sandbox_service.watch_sandbox_startup = watch
+        task = AppConversationStartTask(
+            created_by_user_id='test_user_123',
+            request=AppConversationStartRequest(sandbox_spec_id=requested_spec.id),
+        )
+
+        updates = [
+            item.model_copy(deep=True)
+            async for item in self.service._wait_for_sandbox_start(task)
+        ]
+
+        assert updates[-1].request.sandbox_spec_id == requested_spec.id
+        self.mock_sandbox_service.start_sandbox.assert_awaited_once_with(
+            sandbox_spec_id=requested_spec.id,
+            sandbox_id=None,
+        )
+        assert updates[-1].sandbox_startup_progress == ready_progress
+        assert [
+            update.sandbox_startup_progress.phase
+            for update in updates
+            if update.sandbox_startup_progress is not None
+        ] == [
+            SandboxStartupPhase.PROVISIONING_NODE,
+            SandboxStartupPhase.READY,
+        ]
+
+    @pytest.mark.asyncio
+    async def test_wait_for_sandbox_start_uses_global_timeout_for_legacy_profile(
+        self,
+    ):
+        requested_spec = SandboxSpecInfo(
+            id='legacy-profile',
+            command=None,
+            startup_timeout_seconds=None,
+        )
+        self.mock_sandbox_spec_service.get_sandbox_spec = AsyncMock(
+            return_value=requested_spec
+        )
+        self.service._find_running_sandbox_for_user = AsyncMock(return_value=None)
+        sandbox = SandboxInfo(
+            id='new-legacy',
+            created_by_user_id='test_user_123',
+            sandbox_spec_id=requested_spec.id,
+            status=SandboxStatus.RUNNING,
+            session_api_key='key',
+        )
+        self.mock_sandbox_service.start_sandbox = AsyncMock(return_value=sandbox)
+        ready_progress = self._startup_progress(
+            SandboxStartupPhase.READY,
+            SandboxStartupProgressStatus.READY,
+        )
+        captured = {}
+
+        async def watch(*args, **kwargs):
+            captured.update(kwargs)
+            yield ready_progress
+
+        self.mock_sandbox_service.watch_sandbox_startup = watch
+        task = AppConversationStartTask(
+            created_by_user_id='test_user_123',
+            request=AppConversationStartRequest(sandbox_spec_id=requested_spec.id),
+        )
+
+        [item async for item in self.service._wait_for_sandbox_start(task)]
+
+        assert captured['timeout'] == self.service.sandbox_startup_timeout
+        assert captured['inactivity_timeout'] == 10
+
+    @pytest.mark.asyncio
+    async def test_wait_for_sandbox_start_cleans_up_new_claim_on_timeout(self):
+        requested_spec = SandboxSpecInfo(
+            id='windows-server-2025-amd64',
+            command=None,
+            startup_timeout_seconds=300,
+        )
+        self.mock_sandbox_spec_service.get_sandbox_spec = AsyncMock(
+            return_value=requested_spec
+        )
+        self.mock_sandbox_service.search_sandboxes.return_value = SandboxPage(items=[])
+        sandbox = SandboxInfo(
+            id='new-windows',
+            created_by_user_id='test_user_123',
+            sandbox_spec_id=requested_spec.id,
+            status=SandboxStatus.STARTING,
+            session_api_key=None,
+        )
+        self.mock_sandbox_service.start_sandbox = AsyncMock(return_value=sandbox)
+
+        async def watch(*args, **kwargs):
+            yield self._startup_progress(
+                SandboxStartupPhase.WAITING_FOR_CAPACITY,
+                SandboxStartupProgressStatus.PROGRESSING,
+            )
+            raise SandboxStartupTimeoutError('timed out')
+
+        self.mock_sandbox_service.watch_sandbox_startup = watch
+        self.mock_sandbox_service.delete_sandbox = AsyncMock(return_value=True)
+        task = AppConversationStartTask(
+            created_by_user_id='test_user_123',
+            request=AppConversationStartRequest(sandbox_spec_id=requested_spec.id),
+        )
+
+        with pytest.raises(SandboxStartupTimeoutError, match='timed out'):
+            [item async for item in self.service._wait_for_sandbox_start(task)]
+
+        self.mock_sandbox_service.delete_sandbox.assert_awaited_once_with(sandbox.id)
+
+    @pytest.mark.asyncio
+    async def test_wait_for_sandbox_start_preserves_reused_claim_on_timeout(self):
+        requested_spec = SandboxSpecInfo(
+            id='windows-server-2025-amd64',
+            command=None,
+            startup_timeout_seconds=300,
+        )
+        sandbox = SandboxInfo(
+            id='existing-windows',
+            created_by_user_id='test_user_123',
+            sandbox_spec_id=requested_spec.id,
+            status=SandboxStatus.STARTING,
+            session_api_key=None,
+        )
+        self.mock_sandbox_service.get_sandbox = AsyncMock(return_value=sandbox)
+        self.mock_sandbox_spec_service.get_sandbox_spec = AsyncMock(
+            return_value=requested_spec
+        )
+
+        async def watch(*args, **kwargs):
+            yield self._startup_progress(
+                SandboxStartupPhase.PROVISIONING_NODE,
+                SandboxStartupProgressStatus.PROGRESSING,
+            )
+            raise SandboxStartupTimeoutError('timed out')
+
+        self.mock_sandbox_service.watch_sandbox_startup = watch
+        self.mock_sandbox_service.delete_sandbox = AsyncMock(return_value=True)
+        task = AppConversationStartTask(
+            created_by_user_id='test_user_123',
+            request=AppConversationStartRequest(
+                sandbox_id=sandbox.id,
+                sandbox_spec_id=requested_spec.id,
+            ),
+        )
+
+        with pytest.raises(SandboxStartupTimeoutError, match='timed out'):
+            [item async for item in self.service._wait_for_sandbox_start(task)]
+
+        self.mock_sandbox_service.delete_sandbox.assert_not_awaited()
+
+    @staticmethod
+    def _startup_progress(
+        phase: SandboxStartupPhase,
+        status: SandboxStartupProgressStatus,
+    ) -> SandboxStartupProgress:
+        now = datetime.now(timezone.utc)
+        return SandboxStartupProgress(
+            phase=phase,
+            status=status,
+            message=phase.value,
+            reason=phase.value,
+            started_at=now,
+            updated_at=now,
+            phase_started_at=now,
+            elapsed_seconds=0,
+            phase_elapsed_seconds=0,
+            inactivity_seconds=0,
+        )
+
+    @pytest.mark.asyncio
+    async def test_wait_for_sandbox_start_rejects_profile_mismatch(self):
+        sandbox = SandboxInfo(
+            id='existing-linux',
+            created_by_user_id='test_user_123',
+            sandbox_spec_id='linux-standard',
+            status=SandboxStatus.RUNNING,
+            session_api_key='key',
+        )
+        self.mock_sandbox_service.get_sandbox = AsyncMock(return_value=sandbox)
+        task = AppConversationStartTask(
+            created_by_user_id='test_user_123',
+            request=AppConversationStartRequest(
+                sandbox_id=sandbox.id,
+                sandbox_spec_id='windows-server-2025-amd64',
+            ),
+        )
+
+        with pytest.raises(SandboxError, match='not requested profile'):
+            [item async for item in self.service._wait_for_sandbox_start(task)]
+
+    def test_parent_inheritance_pins_execution_profile(self):
+        request = AppConversationStartRequest()
+        parent = AppConversationInfo(
+            created_by_user_id='test_user_123',
+            sandbox_id='parent-sandbox',
+            sandbox_spec_id='windows-server-2025-amd64',
+        )
+
+        self.service._inherit_configuration_from_parent(request, parent)
+
+        assert request.sandbox_id == parent.sandbox_id
+        assert request.sandbox_spec_id == parent.sandbox_spec_id
+
+    def test_parent_with_different_explicit_profile_gets_distinct_sandbox(self):
+        request = AppConversationStartRequest(
+            sandbox_spec_id='windows-server-2025-amd64'
+        )
+        parent = AppConversationInfo(
+            created_by_user_id='test_user_123',
+            sandbox_id='parent-linux',
+            sandbox_spec_id='linux-standard',
+        )
+
+        self.service._inherit_configuration_from_parent(request, parent)
+
+        assert request.sandbox_id is None
+        assert request.sandbox_spec_id == 'windows-server-2025-amd64'
 
     async def test_export_conversation_success(self):
         """Test successful download of conversation trajectory."""
@@ -2615,7 +3229,6 @@ class TestLiveStatusAppConversationService:
         conversation_id = uuid4()
         self.mock_user.agent_settings = ACPAgentSettings(
             acp_server='claude-code',
-            llm=LLM(model='claude-sonnet-4-5', api_key=SecretStr('sk-ui-key')),
         )
         self.mock_user_context.get_user_id = AsyncMock(return_value='test_user_123')
         self.mock_user_context.get_user_info = AsyncMock(return_value=self.mock_user)
@@ -2702,6 +3315,10 @@ class TestLiveStatusAppConversationService:
         from openhands.sdk.settings import ACPAgentSettings
 
         conversation_id = uuid4()
+        organization_id = uuid4()
+        self.mock_app_conversation_info_service.resolve_organization_id = AsyncMock(
+            return_value=organization_id
+        )
 
         self.mock_user_context.get_user_id = AsyncMock(return_value='test_user_123')
         acp_user = _TestUserInfo(
@@ -2768,7 +3385,7 @@ class TestLiveStatusAppConversationService:
         self.mock_app_conversation_info_service.save_app_conversation_info = AsyncMock()
 
         async for _ in self.service._start_app_conversation(
-            AppConversationStartRequest()
+            AppConversationStartRequest(organization_id=organization_id)
         ):
             pass
 
@@ -2778,7 +3395,11 @@ class TestLiveStatusAppConversationService:
         ][0]
         assert saved_info.llm_model == 'gpt-5.5/high'
         assert saved_info.agent_kind == 'acp'
+        assert saved_info.organization_id == organization_id
         assert saved_info.tags.get('acpserver') == 'codex'
+        assert self.mock_httpx_client.post.await_args.kwargs['json'][
+            'organization_id'
+        ] == str(organization_id)
 
     @pytest.mark.asyncio
     async def test_configure_llm_and_mcp_with_custom_remote_servers(self):
@@ -3102,6 +3723,102 @@ class TestLiveStatusAppConversationService:
             k: v.get_secret_value() for k, v in (stdio_server.env or {}).items()
         } == {'TOKEN': 'value'}
 
+    def test_perforce_mcp_secrets_are_namespaced_per_server(self):
+        from openhands.sdk.mcp.config import MCPServer
+
+        servers = {
+            'main-perforce': MCPServer(
+                command='p4-mcp-server',
+                env={
+                    'P4PORT': 'ssl:main.example.com:1666',
+                    'P4USER': 'main-user',
+                    'P4PASSWD': 'main-ticket',
+                    'P4CLIENT': 'main-workspace',
+                },
+            ),
+            'main_perforce': MCPServer(
+                command='p4-mcp-server',
+                env={
+                    'P4PORT': 'ssl:backup.example.com:1666',
+                    'P4USER': 'backup-user',
+                    'P4PASSWD': 'backup-ticket',
+                    'P4CHARSET': 'utf8',
+                },
+            ),
+        }
+
+        rewritten, secrets = bridge_perforce_mcp_secrets(servers)
+
+        first_env = rewritten['main-perforce'].env or {}
+        second_env = rewritten['main_perforce'].env or {}
+        assert first_env['P4CLIENT'].get_secret_value() == 'main-workspace'
+        assert second_env['P4CHARSET'].get_secret_value() == 'utf8'
+
+        first_refs = {
+            name: first_env[name].get_secret_value()
+            for name in ('P4PORT', 'P4USER', 'P4PASSWD')
+        }
+        second_refs = {
+            name: second_env[name].get_secret_value()
+            for name in ('P4PORT', 'P4USER', 'P4PASSWD')
+        }
+        assert set(first_refs.values()).isdisjoint(second_refs.values())
+        assert all(value.startswith('${OH_MCP_') for value in first_refs.values())
+        assert all(value.startswith('${OH_MCP_') for value in second_refs.values())
+
+        resolved = {
+            f'${{{name}}}': source.value.get_secret_value()
+            for name, source in secrets.items()
+        }
+        assert resolved[first_refs['P4PORT']] == 'ssl:main.example.com:1666'
+        assert resolved[first_refs['P4USER']] == 'main-user'
+        assert resolved[first_refs['P4PASSWD']] == 'main-ticket'
+        assert resolved[second_refs['P4PORT']] == 'ssl:backup.example.com:1666'
+        assert resolved[second_refs['P4USER']] == 'backup-user'
+        assert resolved[second_refs['P4PASSWD']] == 'backup-ticket'
+
+    def test_perforce_secret_bridge_preserves_oauth_headers_and_hides_values(self):
+        from openhands.sdk.mcp.config import MCPServer
+
+        servers = {
+            'perforce': MCPServer(
+                command='p4-mcp-server',
+                env={
+                    'P4PORT': 'ssl:perforce.example.com:1666',
+                    'P4USER': 'build-user',
+                    'P4PASSWD': 'super-secret-ticket',
+                },
+            ),
+            'remote': MCPServer(
+                url='https://mcp.example.com',
+                transport='http',
+                headers={'Authorization': 'Bearer oauth-secret'},
+            ),
+        }
+
+        rewritten, secrets = bridge_perforce_mcp_secrets(servers)
+
+        assert rewritten['remote'] == servers['remote']
+        assert (
+            rewritten['remote'].headers['Authorization'].get_secret_value()
+            == 'Bearer oauth-secret'
+        )
+        serialized = json.dumps(
+            {
+                'mcp': {
+                    name: server.model_dump(mode='json')
+                    for name, server in rewritten.items()
+                },
+                'secrets': {
+                    name: source.model_dump(mode='json')
+                    for name, source in secrets.items()
+                },
+            }
+        )
+        assert 'ssl:perforce.example.com:1666' not in serialized
+        assert 'build-user' not in serialized
+        assert 'super-secret-ticket' not in serialized
+
     # ------------------------------------------------------------------ #
     #  Regression tests: workspace.working_dir == project_dir             #
     # ------------------------------------------------------------------ #
@@ -3127,8 +3844,22 @@ class TestLiveStatusAppConversationService:
         assert get_project_dir('/workspace/project', None) == '/workspace/project'
         assert get_project_dir('/workspace/project', '') == '/workspace/project'
 
+    def test_get_project_dir_uses_windows_path_semantics(self):
+        from openhands.app_server.app_conversation.app_conversation_service_base import (
+            get_project_dir,
+        )
+
+        assert (
+            get_project_dir(
+                r'C:\workspace\project',
+                'OpenHands/software-agent-sdk',
+                SandboxOperatingSystem.WINDOWS,
+            )
+            == r'C:\workspace\project\software-agent-sdk'
+        )
+
     @patch(
-        'openhands.app_server.app_conversation.live_status_app_conversation_service.get_default_tools',
+        'openhands.app_server.app_conversation.live_status_app_conversation_service.launch_tool_specs',
         return_value=[],
     )
     @pytest.mark.asyncio
@@ -3162,7 +3893,7 @@ class TestLiveStatusAppConversationService:
         ), 'workspace.working_dir must point to the repo root, not the sandbox mount'
 
     @patch(
-        'openhands.app_server.app_conversation.live_status_app_conversation_service.get_default_tools',
+        'openhands.app_server.app_conversation.live_status_app_conversation_service.launch_tool_specs',
         return_value=[],
     )
     @pytest.mark.asyncio
@@ -3335,6 +4066,7 @@ class TestPluginHandling:
             jwt_service=self.mock_jwt_service,
             pending_message_service=self.mock_pending_message_service,
             sandbox_startup_timeout=30,
+            sandbox_startup_inactivity_timeout=10,
             sandbox_startup_poll_frequency=1,
             max_num_conversations_per_sandbox=20,
             httpx_client=self.mock_httpx_client,
@@ -3535,7 +4267,7 @@ class TestPluginHandling:
 
     @pytest.mark.asyncio
     @patch(
-        'openhands.app_server.app_conversation.live_status_app_conversation_service.get_default_tools',
+        'openhands.app_server.app_conversation.live_status_app_conversation_service.launch_tool_specs',
         return_value=[],
     )
     async def test_build_request_with_plugins(self, _mock_tools):
@@ -3582,7 +4314,7 @@ class TestPluginHandling:
         assert '- api_key: test123' in result.initial_message.content[0].text
 
     @patch(
-        'openhands.app_server.app_conversation.live_status_app_conversation_service.get_default_tools',
+        'openhands.app_server.app_conversation.live_status_app_conversation_service.launch_tool_specs',
         return_value=[],
     )
     @pytest.mark.asyncio
@@ -3608,7 +4340,7 @@ class TestPluginHandling:
         assert result.plugins is None
 
     @patch(
-        'openhands.app_server.app_conversation.live_status_app_conversation_service.get_default_tools',
+        'openhands.app_server.app_conversation.live_status_app_conversation_service.launch_tool_specs',
         return_value=[],
     )
     @pytest.mark.asyncio
@@ -3650,7 +4382,7 @@ class TestPluginHandling:
         assert result.plugins[0].repo_path == 'plugins/city-weather'
 
     @patch(
-        'openhands.app_server.app_conversation.live_status_app_conversation_service.get_default_tools',
+        'openhands.app_server.app_conversation.live_status_app_conversation_service.launch_tool_specs',
         return_value=[],
     )
     @pytest.mark.asyncio
@@ -3997,6 +4729,7 @@ class TestLoadHooksFromWorkspace:
             jwt_service=self.mock_jwt_service,
             pending_message_service=self.mock_pending_message_service,
             sandbox_startup_timeout=30,
+            sandbox_startup_inactivity_timeout=10,
             sandbox_startup_poll_frequency=1,
             max_num_conversations_per_sandbox=20,
             httpx_client=self.mock_httpx_client,
@@ -4294,6 +5027,70 @@ class TestAgentKindConversationUrl:
         )
 
 
+@pytest.mark.asyncio
+async def test_batch_conversation_returns_session_key_to_sandbox_owner():
+    service = LiveStatusAppConversationService.__new__(LiveStatusAppConversationService)
+    service.user_context = AsyncMock()
+    service.user_context.get_user_id.return_value = 'user-1'
+    service.sandbox_service = AsyncMock()
+    service.sandbox_service.batch_get_sandboxes.return_value = [
+        SandboxInfo(
+            id='sandbox-a',
+            created_by_user_id='user-1',
+            sandbox_spec_id='spec',
+            status=SandboxStatus.RUNNING,
+            session_api_key='session-key',
+            exposed_urls=[
+                ExposedUrl(name=AGENT_SERVER, url='http://localhost:8000', port=8000)
+            ],
+        )
+    ]
+    service._get_live_conversation_info = AsyncMock(return_value=[])
+    info = AppConversationInfo(
+        id=uuid4(),
+        created_by_user_id=None,
+        sandbox_id='sandbox-a',
+    )
+
+    result = await service._build_app_conversations([info])
+
+    assert result[0] is not None
+    assert result[0].session_api_key == 'session-key'
+    service._get_live_conversation_info.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_batch_conversation_hides_session_key_from_other_org_user():
+    service = LiveStatusAppConversationService.__new__(LiveStatusAppConversationService)
+    service.user_context = AsyncMock()
+    service.user_context.get_user_id.return_value = 'user-2'
+    service.sandbox_service = AsyncMock()
+    service.sandbox_service.batch_get_sandboxes.return_value = [
+        SandboxInfo(
+            id='sandbox-a',
+            created_by_user_id='user-1',
+            sandbox_spec_id='spec',
+            status=SandboxStatus.RUNNING,
+            session_api_key='session-key',
+            exposed_urls=[
+                ExposedUrl(name=AGENT_SERVER, url='http://localhost:8000', port=8000)
+            ],
+        )
+    ]
+    service._get_live_conversation_info = AsyncMock(return_value=[])
+    info = AppConversationInfo(
+        id=uuid4(),
+        created_by_user_id=None,
+        sandbox_id='sandbox-a',
+    )
+
+    result = await service._build_app_conversations([info])
+
+    assert result[0] is not None
+    assert result[0].session_api_key is None
+    service._get_live_conversation_info.assert_not_awaited()
+
+
 class TestBuildAcpStartConversationRequestSecrets:
     """Tests for secret injection in ``_build_acp_start_conversation_request``.
 
@@ -4317,6 +5114,7 @@ class TestBuildAcpStartConversationRequestSecrets:
             jwt_service=Mock(),
             pending_message_service=Mock(),
             sandbox_startup_timeout=30,
+            sandbox_startup_inactivity_timeout=10,
             sandbox_startup_poll_frequency=1,
             max_num_conversations_per_sandbox=20,
             httpx_client=Mock(),
@@ -4327,7 +5125,10 @@ class TestBuildAcpStartConversationRequestSecrets:
         )
 
     def _make_acp_user(
-        self, acp_server='claude-code', context_secrets=None, api_key=None
+        self,
+        acp_server='claude-code',
+        context_secrets=None,
+        mcp_config=None,
     ):
         try:
             from openhands.sdk.settings import (
@@ -4353,11 +5154,8 @@ class TestBuildAcpStartConversationRequestSecrets:
         )
         user.agent_settings = ACPAgentSettings(
             acp_server=acp_server,  # type: ignore[arg-type]
-            llm=LLM(
-                model='claude-sonnet-4-5',
-                api_key=SecretStr(api_key) if api_key else None,
-            ),
             agent_context=agent_context,
+            mcp_config=mcp_config or {},
         )
         return user
 
@@ -4417,6 +5215,42 @@ class TestBuildAcpStartConversationRequestSecrets:
         assert request.agent.acp_isolate_data_dir is True
 
     @pytest.mark.asyncio
+    async def test_perforce_mcp_values_use_acp_request_secret_registry(
+        self, service, tmp_path
+    ):
+        from openhands.sdk.mcp.config import MCPServer
+
+        user = self._make_acp_user(
+            mcp_config={
+                'perforce': MCPServer(
+                    command='p4-mcp-server',
+                    env={
+                        'P4PORT': 'ssl:acp-p4.example.com:1666',
+                        'P4USER': 'acp-builder',
+                        'P4PASSWD': 'acp-ticket',
+                        'P4CLIENT': 'acp-workspace',
+                    },
+                )
+            }
+        )
+
+        request = await self._call_build(service, user, tmp_path)
+
+        env = request.agent.mcp_config['perforce'].env or {}
+        assert env['P4CLIENT'].get_secret_value() == 'acp-workspace'
+        refs = {
+            env_name: env[env_name].get_secret_value()
+            for env_name in ('P4PORT', 'P4USER', 'P4PASSWD')
+        }
+        registry_values = {
+            f'${{{name}}}': source.value.get_secret_value()
+            for name, source in request.secrets.items()
+        }
+        assert registry_values[refs['P4PORT']] == 'ssl:acp-p4.example.com:1666'
+        assert registry_values[refs['P4USER']] == 'acp-builder'
+        assert registry_values[refs['P4PASSWD']] == 'acp-ticket'
+
+    @pytest.mark.asyncio
     async def test_acp_request_passes_title_llm_profile(self, service, tmp_path):
         user = self._make_acp_user()
         profiles = LLMProfiles()
@@ -4463,16 +5297,9 @@ class TestBuildAcpStartConversationRequestSecrets:
         assert request.secrets.get('OTHER') is other_secret
 
     @pytest.mark.asyncio
-    async def test_llm_api_key_not_forwarded_to_request_secrets(
-        self, service, tmp_path
-    ):
-        """llm.api_key must not bleed into request.secrets for ACP.
-
-        ACP does not use the SDK's LLM layer — the CLI subprocess handles its
-        own model calls.  Credentials must be supplied via the Secrets panel
-        (request.secrets channel), not via llm.api_key.
-        """
-        user = self._make_acp_user(acp_server='claude-code', api_key='sk-ui-key')
+    async def test_acp_credentials_require_request_secrets(self, service, tmp_path):
+        """ACP credentials are not synthesized without request secrets."""
+        user = self._make_acp_user(acp_server='claude-code')
 
         request = await self._call_build(service, user, tmp_path)
 
@@ -4490,6 +5317,59 @@ class TestBuildAcpStartConversationRequestSecrets:
         request = await self._call_build(service, user, tmp_path)
 
         assert request.secrets == {}
+
+    @pytest.mark.asyncio
+    async def test_explicit_copilot_pat_passes_through(self):
+        from openhands.sdk.settings import ACPAgentSettings
+
+        copilot_pat = StaticSecret(value=SecretStr('configured-pat'))
+        secrets = {'COPILOT_GITHUB_TOKEN': copilot_pat}
+        get_latest_token = AsyncMock(return_value='oauth-token')
+        await add_acp_provider_token_secrets(
+            ACPAgentSettings.model_construct(acp_server='copilot-cli'),
+            secrets,
+            {ProviderType.GITHUB: ProviderToken(token=SecretStr('oauth-token'))},
+            get_latest_token,
+        )
+
+        assert secrets['COPILOT_GITHUB_TOKEN'] is copilot_pat
+        assert 'GITHUB_TOKEN' not in secrets
+        assert 'configured-pat' not in repr(secrets)
+        assert 'oauth-token' not in repr(secrets)
+        get_latest_token.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_missing_copilot_pat_stays_missing(self):
+        from openhands.sdk.settings import ACPAgentSettings
+
+        secrets = {}
+        get_latest_token = AsyncMock(return_value='oauth-token')
+        await add_acp_provider_token_secrets(
+            ACPAgentSettings.model_construct(acp_server='copilot-cli'),
+            secrets,
+            {ProviderType.GITHUB: ProviderToken(token=SecretStr('oauth-token'))},
+            get_latest_token,
+        )
+
+        assert 'COPILOT_GITHUB_TOKEN' not in secrets
+        assert 'GITHUB_TOKEN' not in secrets
+        get_latest_token.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_no_token_does_not_create_copilot_pat(self):
+        from openhands.sdk.settings import ACPAgentSettings
+
+        secrets = {}
+        get_latest_token = AsyncMock()
+        await add_acp_provider_token_secrets(
+            ACPAgentSettings.model_construct(acp_server='copilot-cli'),
+            secrets,
+            None,
+            get_latest_token,
+        )
+
+        assert secrets == {}
+        get_latest_token.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_isolate_data_dir_enabled(self, service, tmp_path):
@@ -4540,12 +5420,8 @@ class TestBuildAcpStartConversationRequestSecrets:
 
     @pytest.mark.asyncio
     async def test_panel_secret_is_sole_credentials_channel(self, service, tmp_path):
-        """Panel secret is the only credentials channel; llm.api_key is ignored.
-
-        When a panel secret and llm.api_key both target the same env var, only
-        the panel secret appears in request.secrets — llm.api_key is not read.
-        """
-        user = self._make_acp_user(acp_server='claude-code', api_key='sk-ui-key')
+        """Panel secrets are the ACP credentials channel."""
+        user = self._make_acp_user(acp_server='claude-code')
         panel_secret = StaticSecret(value=SecretStr('sk-from-secrets-panel'))
 
         request = await self._call_build(

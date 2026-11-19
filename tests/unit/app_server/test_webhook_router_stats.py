@@ -777,6 +777,7 @@ class TestProcessStatsEvent:
     ):
         """Test that errors from service are caught and logged."""
         conversation_id = uuid4()
+        rollback = AsyncMock()
 
         # Should not raise an exception
         with (
@@ -788,6 +789,7 @@ class TestProcessStatsEvent:
             patch(
                 'openhands.app_server.app_conversation.sql_app_conversation_info_service.logger'
             ) as mock_logger,
+            patch.object(service.db_session, 'rollback', rollback),
         ):
             await service.process_stats_event(
                 stats_event_with_dict_value, conversation_id
@@ -795,6 +797,7 @@ class TestProcessStatsEvent:
 
             # Verify error was logged
             mock_logger.exception.assert_called_once()
+            rollback.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_process_stats_event_empty_usage_to_metrics(
@@ -960,6 +963,44 @@ class TestRunEndLiveStatsPull:
     """Run-end statuses trigger a pull of combined stats from the agent-server."""
 
     @pytest.mark.asyncio
+    async def test_terminal_status_does_not_schedule_sandbox_release(self):
+        from openhands.app_server.event_callback import webhook_router
+        from openhands.app_server.event_callback.webhook_router import on_event
+
+        conversation_id = uuid4()
+        info = AppConversationInfo(
+            id=conversation_id,
+            sandbox_id='sb-terminal',
+            created_by_user_id='user-123',
+        )
+        background_tasks = BackgroundTasks()
+        with (
+            patch.object(
+                webhook_router, '_track_conversation_terminal', new_callable=AsyncMock
+            ),
+            patch.object(
+                webhook_router, '_sync_live_conversation_stats', new_callable=AsyncMock
+            ),
+            patch.object(
+                webhook_router, '_run_callbacks_in_bg_and_close'
+            ) as run_callbacks,
+        ):
+            await on_event(
+                background_tasks=background_tasks,
+                events=[
+                    ConversationStateUpdateEvent(
+                        key='execution_status', value='finished'
+                    )
+                ],
+                conversation_id=conversation_id,
+                app_conversation_info=info,
+                app_conversation_info_service=AsyncMock(),
+                event_service=AsyncMock(),
+            )
+
+        assert [task.func for task in background_tasks.tasks] == [run_callbacks]
+
+    @pytest.mark.asyncio
     async def test_on_event_pulls_live_stats_at_run_end(self):
         from types import SimpleNamespace
 
@@ -971,9 +1012,13 @@ class TestRunEndLiveStatsPull:
             ConversationStateUpdateEvent(key='execution_status', value='finished')
         ]
         mock_info = AppConversationInfo(
-            id=conversation_id, sandbox_id='sb1', created_by_user_id='user_123'
+            id=conversation_id,
+            sandbox_id='sb1',
+            created_by_user_id=None,
+            title=f'Conversation {conversation_id.hex[:5]}',
         )
         mock_info_service = AsyncMock()
+        mock_info_service.get_app_conversation_info.return_value = mock_info
         mock_event_service = AsyncMock()
 
         conversation = SimpleNamespace(
@@ -1018,7 +1063,10 @@ class TestRunEndLiveStatsPull:
                 'openhands.app_server.event_callback.webhook_router._run_callbacks_in_bg_and_close'
             ),
         ):
-            mock_ci.model_validate.return_value = SimpleNamespace(stats=pulled_stats)
+            mock_ci.model_validate.return_value = SimpleNamespace(
+                stats=pulled_stats,
+                title='Generated first-turn title',
+            )
             await on_event(
                 background_tasks=BackgroundTasks(),
                 events=events,
@@ -1049,6 +1097,59 @@ class TestRunEndLiveStatsPull:
         mock_info_service.update_conversation_statistics.assert_awaited_once_with(
             conversation_id, pulled_stats
         )
+        assert mock_info.title == 'Generated first-turn title'
+        mock_info_service.save_app_conversation_info.assert_awaited_once_with(mock_info)
+
+    @pytest.mark.asyncio
+    async def test_run_end_title_pull_preserves_user_title(self):
+        from types import SimpleNamespace
+
+        from openhands.app_server.event_callback import webhook_router
+
+        conversation_id = uuid4()
+        stored_info = AppConversationInfo(
+            id=conversation_id,
+            sandbox_id='sb1',
+            created_by_user_id='user_123',
+            title='My custom title',
+        )
+        info_service = AsyncMock()
+        info_service.get_app_conversation_info.return_value = stored_info
+        conversation = SimpleNamespace(
+            conversation_url='http://agent/api/conversations/abc',
+            session_api_key=None,
+        )
+        app_conv_service = AsyncMock()
+        app_conv_service.get_app_conversation.return_value = conversation
+        service_ctx = MagicMock()
+        service_ctx.__aenter__ = AsyncMock(return_value=app_conv_service)
+        service_ctx.__aexit__ = AsyncMock(return_value=False)
+        response = MagicMock()
+        response.raise_for_status = MagicMock()
+        response.json.return_value = {}
+        client = AsyncMock()
+        client.get.return_value = response
+        client_ctx = MagicMock()
+        client_ctx.__aenter__ = AsyncMock(return_value=client)
+        client_ctx.__aexit__ = AsyncMock(return_value=False)
+
+        with (
+            patch.object(
+                webhook_router, 'get_app_conversation_service', return_value=service_ctx
+            ),
+            patch.object(webhook_router.httpx, 'AsyncClient', return_value=client_ctx),
+            patch.object(webhook_router, 'ConversationInfo') as mock_ci,
+        ):
+            mock_ci.model_validate.return_value = SimpleNamespace(
+                stats=None,
+                title='Generated first-turn title',
+            )
+            await webhook_router._sync_live_conversation_stats(
+                conversation_id, stored_info, info_service
+            )
+
+        assert stored_info.title == 'My custom title'
+        info_service.save_app_conversation_info.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_on_event_no_pull_while_running(self):

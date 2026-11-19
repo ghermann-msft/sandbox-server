@@ -47,12 +47,12 @@ class AppConversationInfoService(ABC):
 
     @abstractmethod
     async def get_app_conversation_info(
-        self, conversation_id: UUID
+        self, conversation_id: UUID | str
     ) -> AppConversationInfo | None:
         """Get a single conversation info, returning None if missing."""
 
     async def batch_get_app_conversation_info(
-        self, conversation_ids: list[UUID]
+        self, conversation_ids: list[UUID | str]
     ) -> list[AppConversationInfo | None]:
         """Get a batch of conversation info, return None for any missing."""
         return await asyncio.gather(
@@ -61,6 +61,11 @@ class AppConversationInfoService(ABC):
                 for conversation_id in conversation_ids
             ]
         )
+
+    async def resolve_organization_id(
+        self, requested_organization_id: UUID | None
+    ) -> UUID | None:
+        return requested_organization_id
 
     @abstractmethod
     async def delete_app_conversation_info(self, conversation_id: UUID) -> bool:
@@ -74,7 +79,7 @@ class AppConversationInfoService(ABC):
 
     @abstractmethod
     async def get_sub_conversation_ids(
-        self, parent_conversation_id: UUID
+        self, parent_conversation_id: UUID | str
     ) -> list[UUID]:
         """Get all sub-conversation IDs for a given parent conversation.
 

@@ -8,8 +8,10 @@ from functools import cache
 from openhands.agent_server import env_parser
 from openhands.app_server.errors import SandboxError
 from openhands.app_server.sandbox.sandbox_spec_models import (
+    SandboxSpecCreate,
     SandboxSpecInfo,
     SandboxSpecInfoPage,
+    SandboxSpecUpdate,
 )
 from openhands.app_server.services.injector import Injector
 from openhands.sdk.utils.models import DiscriminatedUnionMixin
@@ -51,8 +53,26 @@ class SandboxSpecService(ABC):
         """Search for sandbox specs."""
 
     @abstractmethod
-    async def get_sandbox_spec(self, sandbox_spec_id: str) -> SandboxSpecInfo | None:
+    async def get_sandbox_spec(
+        self, sandbox_spec_id: str, include_unavailable: bool = False
+    ) -> SandboxSpecInfo | None:
         """Get a single sandbox spec, returning None if not found."""
+
+    async def search_all_sandbox_specs(
+        self, page_id: str | None = None, limit: int = 100
+    ) -> SandboxSpecInfoPage:
+        return await self.search_sandbox_specs(page_id=page_id, limit=limit)
+
+    async def create_sandbox_spec(self, request: SandboxSpecCreate) -> SandboxSpecInfo:
+        raise NotImplementedError
+
+    async def update_sandbox_spec(
+        self, sandbox_spec_id: str, request: SandboxSpecUpdate
+    ) -> SandboxSpecInfo | None:
+        raise NotImplementedError
+
+    async def delete_sandbox_spec(self, sandbox_spec_id: str) -> bool:
+        raise NotImplementedError
 
     async def get_default_sandbox_spec(self) -> SandboxSpecInfo:
         """Get the default sandbox spec."""
@@ -113,11 +133,22 @@ async def resolve_sandbox_spec(
         )
         return await sandbox_spec_service.get_default_sandbox_spec()
 
+    unavailable = await sandbox_spec_service.get_sandbox_spec(
+        effective_id, include_unavailable=True
+    )
+    if unavailable is not None:
+        detail = unavailable.availability_reason or unavailable.availability.value
+        raise SandboxError(f'Sandbox Spec {effective_id!r} is unavailable: {detail}')
+
     raise ValueError(f'Sandbox Spec {effective_id!r} not found')
 
 
 @cache  # memoize so the auto-correct warning fires once per process
 def get_agent_server_image() -> str:
+    image = os.getenv('AGENT_SERVER_IMAGE')
+    if image:
+        return image
+
     repository = os.getenv('AGENT_SERVER_IMAGE_REPOSITORY') or _DEFAULT_REPOSITORY
     bundled_version = _bundled_agent_server_version()
     tag = os.getenv('AGENT_SERVER_IMAGE_TAG') or f'{bundled_version}-python'
@@ -195,7 +226,7 @@ def get_agent_server_env() -> dict[str, str]:
     Raises:
         JSONDecodeError: If OH_AGENT_SERVER_ENV contains invalid JSON.
     """
-    result: dict[str, str] = {}
+    result: dict[str, str] = {'OH_DEFERRED_INIT': 'true'}
 
     # Step 1: Auto-forward environment variables with recognized prefixes
     for key, value in os.environ.items():

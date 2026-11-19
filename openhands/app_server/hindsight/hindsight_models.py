@@ -3,21 +3,15 @@ from enum import Enum
 from typing import Annotated, Literal
 from uuid import UUID
 
-from pydantic import AliasChoices, BaseModel, Field, model_validator
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, model_validator
 
 
 class HindsightScopeKind(str, Enum):
-    PRIVATE = 'private'
+    PRIVATE = 'private_user'
     WORKSPACE = 'workspace'
     REPOSITORY = 'repository'
     ORGANIZATION = 'organization'
     SERVER = 'server'
-
-
-class HindsightReadDepth(str, Enum):
-    DEFAULT = 'default'
-    ADAPTIVE = 'adaptive'
-    DEEP = 'deep'
 
 
 class HindsightPrincipal(BaseModel):
@@ -92,23 +86,35 @@ class HindsightScopeBindings(BaseModel):
 
 
 class HindsightReadRequest(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+
+    identity: Annotated[str, Field(min_length=1)]
     conversation_id: UUID
+    source_event_id: str | None = None
     query: Annotated[str, Field(min_length=1, max_length=4000)]
     scope: Annotated[list[HindsightScopeRequest], Field(min_length=1, max_length=6)] = (
         Field(validation_alias=AliasChoices('scope', 'scopes'))
     )
-    max_results: Annotated[int, Field(ge=1, le=20)] = 10
-    depth: HindsightReadDepth = HindsightReadDepth.DEFAULT
+    max_tokens: Annotated[int, Field(ge=1, le=4096)]
 
 
-class HindsightSource(BaseModel):
-    untrusted: Literal[True] = True
+class HindsightRecallRequest(HindsightReadRequest):
+    reason: Literal['new_task', 'material_change', 'explicit']
+
+
+class HindsightProvenance(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+
     source_memory_id: str
-    source_event_id: str
-    source_conversation_id: str
+    source_event_id: str | None = None
+    source_conversation_id: str | None = None
     date: datetime
-    scope: ResolvedHindsightScope
-    uncertainty: Annotated[float, Field(ge=0, le=1)] = 1.0
+    scope: tuple[ResolvedHindsightScope, ...] = ()
+    relevance: Annotated[float, Field(ge=0, le=1)]
+    uncertainty: Annotated[float, Field(ge=0, le=1)] | str = 1.0
+
+
+class HindsightSource(HindsightProvenance):
     content: str
 
 
@@ -119,8 +125,8 @@ class HindsightRecallResponse(BaseModel):
 
 class HindsightReflectResponse(BaseModel):
     available: bool
-    text: str | None = None
-    sources: list[HindsightSource] = Field(default_factory=list)
+    content: str | None = None
+    memories: list[HindsightProvenance] = Field(default_factory=list)
 
 
 class HindsightRetainApprovalRequest(BaseModel):

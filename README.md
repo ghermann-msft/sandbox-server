@@ -37,7 +37,54 @@ make lint
 make test
 ```
 
-### Private Hindsight broker
+## Linux Perforce runtime
+
+The Linux sandbox runtime image extends the pinned OpenHands agent-server image
+with the official Perforce `p4` r25.2 Linux client and `p4-mcp-server`
+v2026.4.3126709. Both downloads are pinned by URL and SHA256. The executable
+paths are `/usr/local/bin/p4` and `/usr/local/bin/p4-mcp-server`.
+
+Build the runtime and control-plane images with:
+
+```bash
+make docker-build
+```
+
+Set `AGENT_SERVER_IMAGE` on the sandbox-server container to the published
+immutable runtime reference, preferably
+`<registry>/<repository>@sha256:<digest>`. It takes precedence over the legacy
+`AGENT_SERVER_IMAGE_REPOSITORY` and `AGENT_SERVER_IMAGE_TAG` variables.
+
+For stdio MCP servers, `P4PORT`, `P4USER`, and `P4PASSWD` are moved into
+deterministic per-server conversation secret names and each process-local MCP
+environment is rewritten to `${...}` references. Multiple Perforce servers
+therefore retain distinct credentials. Other MCP environment fields and remote
+server headers are preserved. Do not put plaintext Perforce credentials in
+images, manifests, or logs.
+
+The required Perforce Software redistribution attribution and upstream license
+links are retained in
+[`containers/sandbox/PERFORCE-NOTICE.txt`](containers/sandbox/PERFORCE-NOTICE.txt)
+and copied into the runtime image.
+
+## Organization RBAC bootstrap
+
+Authenticated deployments can seed a shared organization and its initial owner at
+startup without using identity-provider groups as an authorization source:
+
+```text
+OH_RBAC_BOOTSTRAP_ORGANIZATION_ID=<stable UUID>
+OH_RBAC_BOOTSTRAP_ORGANIZATION_NAME=Halo Studios
+OH_RBAC_BOOTSTRAP_OWNER_PROVIDER=entra
+OH_RBAC_BOOTSTRAP_OWNER_TENANT_ID=<immutable tenant ID>
+OH_RBAC_BOOTSTRAP_OWNER_OBJECT_ID=<immutable object ID>
+```
+
+The configured `UserAuth` implementation must return the same immutable provider,
+tenant, and subject identifiers from `get_authentication_identity()`. Organization
+membership and permissions are then read only from the sandbox-server database.
+
+## Private Hindsight broker
 
 The Linux-only Hindsight proof of concept is disabled by default. Enable it on
 the trusted app-server control plane with:
@@ -83,31 +130,144 @@ objects. Supported types are `private`, `workspace`, `repository`,
 `organization`, and `server`; the broker validates every supplied ID against
 trusted identity, conversation, deployment, and binding records.
 
-OpenHands RBAC is authoritative for identity, organization selection,
-membership, roles, and permissions. The configured `UserAuth` implementation
-must expose
-`get_hindsight_authorization(conversation_id)` returning trusted
-`tenant_id`, `object_id`, `organization_id`, `role`, and `permissions`.
-Organization memory requires `hindsight:recall` or `hindsight:retain`.
-The broker fails closed when this conversation-bound RBAC context is absent;
-scope-binding files contain metadata and repository allowlists only.
+OpenHands database RBAC is authoritative for identity, organization selection,
+membership, roles, and permissions. Organization memory requires
+`hindsight:recall` or `hindsight:retain`; scope-binding files contain metadata
+and repository allowlists only.
 
-The same `UserAuth` implementation supplies the existing Canvas organization
-contract through `get_organizations()` and
-`get_organization_membership(organization_id)`. The app server exposes these as
-`GET /api/organizations` and `GET /api/organizations/{org_id}/me`.
-Conversation creation accepts the trusted selector in `X-Org-Id`, verifies the
-current user's membership, and persists the stable organization ID with the
-conversation. A body-supplied organization cannot bypass that check.
+Conversation creation accepts the requested tenant in
+`X-OpenHands-Organization-ID`, verifies the authenticated user's durable
+membership, and persists the stable organization ID with the conversation. A
+body-supplied organization cannot bypass that check.
+
+Authenticated organization members can inspect membership through:
+
+- `GET /api/organizations/{organization_id}/members`
+- `PATCH /api/organizations/{organization_id}/members/{user_id}` with
+  `{"role": "owner" | "admin" | "member"}`
+
+Owners and admins can update shared-organization roles. Personal-organization
+roles are immutable, and the final owner of a shared organization cannot be
+demoted. Identity provider, tenant, and subject identifiers are response-only.
+
+Deployments can initialize organization Agent Profiles by setting
+`OH_ORGANIZATION_AGENT_PROFILE_SEEDS_JSON` to one JSON object with a
+name-keyed `profiles` map and an `active_profile` name:
+
+```json
+{
+  "profiles": {
+    "default": {
+      "agent_kind": "openhands",
+      "llm_profile_ref": "default"
+    }
+  },
+  "active_profile": "default"
+}
+```
+
+Each map value is the same profile body accepted by
+`POST /api/v1/agent-profiles/{name}`; names, stable IDs, and revisions remain
+server-managed. The configuration is validated once at startup and seeds an
+organization only when no durable Agent Profile row exists. An existing row,
+including an explicitly empty one, is never replaced.
+
+Self-hosted deployments advertise Canvas integration settings through
+`feature_flags.enable_canvas_integrations` in `GET /api/v1/web-client/config`.
+Set `ENABLE_CANVAS_INTEGRATIONS=false` to hide them explicitly.
 
 ## Docker
 
 ```bash
-docker compose up --build
+make docker-build
+docker compose up
 ```
 
 The Compose setup mounts the Docker socket and a local workspace so the server
-can manage sandbox containers.
+can manage sandbox containers. The sandbox runtime image extends the pinned
+OpenHands agent-server image with the official Perforce MCP server
+v2026.4.3126709. MCP configuration can invoke the prebundled stdio executable at
+`/usr/local/bin/p4-mcp-server`; no package download is needed when a conversation
+starts.
+
+Production deployments can build and publish the runtime image independently:
+
+```bash
+docker build -f containers/sandbox/Dockerfile \
+  --build-arg AGENT_SERVER_IMAGE=ghcr.io/openhands/agent-server:1.37.1-python \
+  -t <runtime-image> .
+docker push <runtime-image>
+```
+
+Set `AGENT_SERVER_IMAGE` on the sandbox-server control-plane container to the
+published immutable reference, preferably `<registry>/<repository>@sha256:<digest>`.
+This full-reference override takes precedence over the legacy
+`AGENT_SERVER_IMAGE_REPOSITORY` and `AGENT_SERVER_IMAGE_TAG` variables.
+
+Azure Database for PostgreSQL can use federated workload identity instead of a
+static password. Set `DB_AZURE_IDENTITY=true`, `DB_HOST`, `DB_PORT`, `DB_NAME`,
+`DB_USER`, and `DB_SSL_MODE=require`, together with the standard
+`AZURE_CLIENT_ID`, `AZURE_TENANT_ID`, and `AZURE_FEDERATED_TOKEN_FILE`
+variables. `AZURE_AUTHORITY_HOST` is honored by Azure Identity when needed.
+`DB_PASS` is not used in this mode. Each new pooled database connection obtains
+a token for `https://ossrdbms-aad.database.windows.net/.default`, allowing
+Azure Identity to refresh credentials without restarting the server.
+
+## Hosted identity and GitHub
+
+Standalone behavior remains the default. Setting
+`OH_TRUSTED_IDENTITY_ASSERTION_SECRET` enables the hosted, per-user storage
+path and requires:
+
+- `OH_TRUSTED_IDENTITY_ASSERTION_ISSUER`
+- `OH_TRUSTED_IDENTITY_ASSERTION_AUDIENCE`
+- `JWT_SECRET` (shared by every server replica)
+- the existing `DB_HOST`, `DB_PORT`, `DB_NAME`, `DB_USER`, and `DB_PASS`
+  variables for PostgreSQL
+
+The assertion header defaults to `X-OpenHands-Identity-Assertion` and can be
+changed with `OH_TRUSTED_IDENTITY_ASSERTION_HEADER`. Lifetime and clock-skew
+limits default to 300 and 30 seconds and can be changed with
+`OH_TRUSTED_IDENTITY_ASSERTION_MAX_LIFETIME_SECONDS` and
+`OH_TRUSTED_IDENTITY_ASSERTION_CLOCK_SKEW_SECONDS`.
+
+Azure Database for PostgreSQL can use federated workload identity instead of a
+static password. Set `DB_AZURE_IDENTITY=true`, `DB_HOST`, `DB_PORT`, `DB_NAME`,
+`DB_USER`, and `DB_SSL_MODE=require`, together with the standard
+`AZURE_CLIENT_ID`, `AZURE_TENANT_ID`, and `AZURE_FEDERATED_TOKEN_FILE`
+variables. `AZURE_AUTHORITY_HOST` is honored by Azure Identity when needed.
+`DB_PASS` is not used in this mode. Each new pooled database connection obtains
+a token for `https://ossrdbms-aad.database.windows.net/.default`, allowing
+Azure Identity to refresh credentials without restarting the server.
+
+When `LLM_MODEL` is set, the first settings load for each hosted user creates
+and activates a `default` LLM profile from `LLM_MODEL` and the optional
+`LLM_BASE_URL`, `LLM_API_VERSION`, and `LLM_AUTH_TYPE` variables. The same
+profile is used for conversation titles. Existing user settings are not
+overwritten.
+
+GitHub App linking additionally requires:
+
+- `GITHUB_APP_CLIENT_ID`
+- `GITHUB_APP_CLIENT_SECRET`
+- `GITHUB_APP_SLUG`
+- `OH_GITHUB_OAUTH_CALLBACK_URL`
+- `OH_GITHUB_OAUTH_SUCCESS_URL`
+
+The Canvas-compatible endpoints are `GET /oauth/git-providers` and
+`POST /oauth/{provider_id}/link`. GitHub redirects to
+`GET /oauth/github/callback`; the server persists the resulting user token for
+the existing `/api/v1/git/installations/search` and
+`/api/v1/git/repositories/search` APIs.
+
+Azure Database for PostgreSQL can use federated workload identity instead of a
+static password. Set `DB_AZURE_IDENTITY=true`, `DB_HOST`, `DB_PORT`, `DB_NAME`,
+`DB_USER`, and `DB_SSL_MODE=require`, together with the standard
+`AZURE_CLIENT_ID`, `AZURE_TENANT_ID`, and `AZURE_FEDERATED_TOKEN_FILE`
+variables. `AZURE_AUTHORITY_HOST` is honored by Azure Identity when needed.
+`DB_PASS` is not used in this mode. Each new pooled database connection obtains
+a token for `https://ossrdbms-aad.database.windows.net/.default`, allowing
+Azure Identity to refresh credentials without restarting the server.
 
 ## Extraction provenance
 

@@ -10,7 +10,6 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from enum import Enum
-from uuid import UUID
 
 from fastapi import Request
 from pydantic import SecretStr
@@ -20,15 +19,12 @@ from openhands.app_server.integrations.provider import (
     ProviderHandler,
 )
 from openhands.app_server.integrations.service_types import UserGitInfo
+from openhands.app_server.organization.organization_models import AuthenticationIdentity
 from openhands.app_server.secrets.secrets_models import Secrets
 from openhands.app_server.secrets.secrets_store import SecretsStore
 from openhands.app_server.settings.settings_models import Settings
 from openhands.app_server.settings.settings_store import SettingsStore
 from openhands.app_server.shared import server_config
-from openhands.app_server.user_auth.organization_models import (
-    OrganizationList,
-    OrganizationMembership,
-)
 from openhands.app_server.utils.import_utils import get_impl
 
 
@@ -142,19 +138,16 @@ class UserAuth(ABC):
         user: UserGitInfo = await client.get_user()
         return user
 
-    async def get_organizations(self) -> OrganizationList:
-        """Return organizations visible to the authenticated user."""
-        raise NotImplementedError
+    async def get_authentication_identity(self) -> AuthenticationIdentity | None:
+        """Return the immutable identity asserted by the authentication provider.
 
-    async def get_organization_membership(
-        self, organization_id: str
-    ) -> OrganizationMembership | None:
-        """Return trusted RBAC membership for an organization."""
-        raise NotImplementedError
-
-    async def get_hindsight_authorization(self, conversation_id: UUID) -> object | None:
-        """Return trusted conversation-bound Hindsight RBAC context."""
-        return None
+        Enterprise identity implementations should override this and provide the
+        provider tenant and subject/object identifiers from their trusted assertion.
+        """
+        user_id = await self.get_user_id()
+        if user_id is None:
+            return None
+        return AuthenticationIdentity(provider='user_auth', subject_id=user_id)
 
     @classmethod
     @abstractmethod

@@ -25,6 +25,7 @@ from openhands.app_server.hindsight.hindsight_config import (
 from openhands.app_server.hindsight.hindsight_models import (
     HindsightAuthorizationContext,
     HindsightPrincipal,
+    HindsightProvenance,
     HindsightScopeBindings,
     HindsightScopeKind,
     HindsightScopeRequest,
@@ -152,12 +153,15 @@ def resolve_scope(
                     status.HTTP_403_FORBIDDEN,
                     detail='Repository scope ID is required',
                 )
-            try:
-                requested = normalize_repository(requested_repository)
-            except ValueError as exc:
-                raise HTTPException(
-                    status.HTTP_403_FORBIDDEN, detail='Invalid repository scope'
-                ) from exc
+            if requested_repository == repository_id:
+                requested = authorized
+            else:
+                try:
+                    requested = normalize_repository(requested_repository)
+                except ValueError as exc:
+                    raise HTTPException(
+                        status.HTTP_403_FORBIDDEN, detail='Invalid repository scope'
+                    ) from exc
             if requested != authorized:
                 raise HTTPException(
                     status.HTTP_403_FORBIDDEN,
@@ -165,11 +169,6 @@ def resolve_scope(
                 )
             scope_id = repository_id
         else:
-            repository_binding = (
-                scope_bindings.repositories.get(repository_id)
-                if scope_bindings
-                else None
-            )
             requested_scope_id = request.id
             if requested_scope_id is None:
                 raise HTTPException(
@@ -177,22 +176,28 @@ def resolve_scope(
                     detail='Organization scope ID is required',
                 )
             scope_id = requested_scope_id
-            organization = (
-                scope_bindings.organizations.get(scope_id) if scope_bindings else None
-            )
-            if (
-                repository_binding is None
-                or organization is None
-                or scope_id not in repository_binding.organization_ids
-            ):
-                raise HTTPException(
-                    status.HTTP_403_FORBIDDEN,
-                    detail=f'{request.type.value} scope is not authorized',
-                )
             if request.type != HindsightScopeKind.ORGANIZATION:
                 raise HTTPException(
                     status.HTTP_422_UNPROCESSABLE_ENTITY,
                     detail='Unsupported memory scope',
+                )
+            repository_binding = (
+                scope_bindings.repositories.get(repository_id)
+                if scope_bindings is not None
+                else None
+            )
+            if (
+                scope_bindings is None
+                or scope_id not in scope_bindings.organizations
+                or repository_binding is None
+                or scope_id not in repository_binding.organization_ids
+            ):
+                raise HTTPException(
+                    status.HTTP_403_FORBIDDEN,
+                    detail=(
+                        'Repository is not authorized for the requested '
+                        'organization memory scope'
+                    ),
                 )
     if request.id is not None and request.id != scope_id:
         raise HTTPException(
@@ -391,11 +396,13 @@ class HindsightBroker:
                             source_event_id=source_event_id,
                             source_conversation_id=source_conversation_id,
                             date=date,
-                            scope=scope,
+                            scope=(scope,),
+                            relevance=max(0.0, min(1.0, float(score))),
                             uncertainty=max(0.0, min(1.0, 1.0 - float(score))),
                             content=item['text'],
                         )
                     )
+            sources.sort(key=lambda source: source.relevance, reverse=True)
             return available, sources[:max_results]
         finally:
             if close:
@@ -406,7 +413,7 @@ class HindsightBroker:
         query: str,
         scopes: list[tuple[str, ResolvedHindsightScope]],
         token_budget: int,
-    ) -> tuple[bool, str | None, list[HindsightSource]]:
+    ) -> tuple[bool, str | None, list[HindsightProvenance]]:
         client, close = await self._client()
         try:
             calls = [
@@ -424,7 +431,7 @@ class HindsightBroker:
             ]
             responses = await asyncio.gather(*calls, return_exceptions=True)
             texts = []
-            sources: list[HindsightSource] = []
+            sources: list[HindsightProvenance] = []
             available = False
             for response, (_, scope) in zip(responses, scopes, strict=True):
                 if isinstance(response, BaseException):
@@ -450,15 +457,19 @@ class HindsightBroker:
                     source_conversation_id = metadata.get('source_conversation_id')
                     if not date or not source_event_id or not source_conversation_id:
                         continue
+                    score = (item.get('scores') or {}).get('final')
+                    relevance = (
+                        max(0.0, min(1.0, float(score))) if score is not None else 0.0
+                    )
                     sources.append(
-                        HindsightSource(
+                        HindsightProvenance(
                             source_memory_id=str(item['id']),
                             source_event_id=source_event_id,
                             source_conversation_id=source_conversation_id,
                             date=date,
-                            scope=scope,
-                            uncertainty=1.0,
-                            content=item.get('text', ''),
+                            scope=(scope,),
+                            relevance=relevance,
+                            uncertainty=max(0.0, min(1.0, 1.0 - relevance)),
                         )
                     )
             return available, '\n\n'.join(texts) or None, sources

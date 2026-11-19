@@ -13,6 +13,9 @@ is tracked as a follow-up.
 
 from __future__ import annotations
 
+import pytest
+from pydantic import ValidationError
+
 from openhands.app_server.settings.settings_models import (
     Settings,
     _load_persisted_agent_settings,
@@ -103,6 +106,153 @@ def test_replace_mcp_config_in_kind_switch():
     s.update(_set_openhands(mcp_config={'mcpServers': {'foo': {'command': 'foo-bin'}}}))
     assert s.agent_settings.mcp_config is not None
     assert 'foo' in s.agent_settings.mcp_config
+
+
+def test_mcp_config_tombstone_deletes_one_server_and_preserves_siblings():
+    settings = Settings()
+    settings.update(
+        {
+            'agent_settings_diff': {
+                'mcp_config': {
+                    'Miramonte': {'command': 'miramonte'},
+                    'Atlassian': {'url': 'https://mcp.atlassian.example/mcp'},
+                }
+            }
+        }
+    )
+
+    settings.update({'agent_settings_diff': {'mcp_config': {'Miramonte': None}}})
+
+    assert set(settings.agent_settings.mcp_config) == {'Atlassian'}
+
+
+def test_mcp_config_tombstone_supports_rename_with_secret_preservation():
+    settings = Settings()
+    settings.update(
+        {
+            'agent_settings_diff': {
+                'mcp_config': {
+                    'Miramonte': {
+                        'url': 'https://mcp.miramonte.example/mcp',
+                        'auth': {'strategy': 'bearer', 'value': 'miramonte-secret'},
+                    },
+                    'Sibling': {'command': 'sibling'},
+                }
+            }
+        }
+    )
+
+    settings.update(
+        {
+            'agent_settings_diff': {
+                'mcp_config': {
+                    'Miramonte': None,
+                    'Miramonte Cloud': {
+                        'url': 'https://mcp.miramonte.example/mcp',
+                        'auth': {'strategy': 'bearer'},
+                    },
+                }
+            }
+        }
+    )
+
+    assert set(settings.agent_settings.mcp_config) == {
+        'Miramonte Cloud',
+        'Sibling',
+    }
+    renamed = settings.agent_settings.mcp_config['Miramonte Cloud']
+    assert renamed.auth is not None
+    assert renamed.auth.value is not None
+    assert renamed.auth.value.get_secret_value() == 'miramonte-secret'
+
+
+def test_mcp_config_tombstone_sparse_update_preserves_fields_and_secrets():
+    settings = Settings()
+    settings.update(
+        {
+            'agent_settings_diff': {
+                'mcp_config': {
+                    'Miramonte': {
+                        'command': 'miramonte',
+                        'args': ['serve'],
+                        'env': {'MIRAMONTE_TOKEN': 'miramonte-secret'},
+                        'description': 'Old description',
+                    },
+                    'Remove Me': {'command': 'remove-me'},
+                    'Sibling': {'command': 'sibling'},
+                }
+            }
+        }
+    )
+
+    settings.update(
+        {
+            'agent_settings_diff': {
+                'mcp_config': {
+                    'Miramonte': {'description': 'New description'},
+                    'Remove Me': None,
+                }
+            }
+        }
+    )
+
+    assert set(settings.agent_settings.mcp_config) == {'Miramonte', 'Sibling'}
+    miramonte = settings.agent_settings.mcp_config['Miramonte']
+    assert miramonte.command == 'miramonte'
+    assert miramonte.args == ['serve']
+    assert miramonte.description == 'New description'
+    assert miramonte.env is not None
+    assert miramonte.env['MIRAMONTE_TOKEN'].get_secret_value() == 'miramonte-secret'
+
+
+def test_mcp_config_tombstone_rejects_malformed_non_null_server():
+    settings = Settings()
+    settings.update(
+        {
+            'agent_settings_diff': {
+                'mcp_config': {
+                    'Miramonte': {'command': 'miramonte'},
+                    'Remove Me': {'command': 'remove-me'},
+                }
+            }
+        }
+    )
+
+    with pytest.raises(ValidationError):
+        settings.update(
+            {
+                'agent_settings_diff': {
+                    'mcp_config': {
+                        'Miramonte': 'not-a-server',
+                        'Remove Me': None,
+                    }
+                }
+            }
+        )
+
+
+def test_mcp_config_without_tombstone_still_replaces_wholesale():
+    settings = Settings()
+    settings.update(
+        {
+            'agent_settings_diff': {
+                'mcp_config': {
+                    'Miramonte': {'command': 'miramonte'},
+                    'Sibling': {'command': 'sibling'},
+                }
+            }
+        }
+    )
+
+    settings.update(
+        {
+            'agent_settings_diff': {
+                'mcp_config': {'Replacement': {'command': 'replacement'}}
+            }
+        }
+    )
+
+    assert set(settings.agent_settings.mcp_config) == {'Replacement'}
 
 
 def test_loader_normalizes_legacy_llm_tag_at_current_schema_version():

@@ -2,6 +2,7 @@
 
 import asyncio
 import importlib
+import json
 import logging
 import pkgutil
 from typing import Any
@@ -19,7 +20,9 @@ from fastapi import (
 )
 from fastapi.security import APIKeyHeader
 from jwt import InvalidTokenError
-from pydantic import SecretStr
+from pydantic import BaseModel, Field, SecretStr
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from openhands import tools  # type: ignore[attr-defined]
 from openhands.agent_server.models import ConversationInfo, Success
@@ -31,14 +34,20 @@ from openhands.app_server.app_conversation.app_conversation_info_service import 
 from openhands.app_server.app_conversation.app_conversation_models import (
     ACP_SERVER_TAG_KEY,
     AppConversationInfo,
+    AppConversationStartRequest,
     ConversationTrigger,
+)
+from openhands.app_server.app_conversation.sql_app_conversation_start_task_service import (
+    StoredAppConversationStartTask,
 )
 from openhands.app_server.config import (
     depends_app_conversation_info_service,
+    depends_db_session,
     depends_event_service,
     depends_jwt_service,
     get_app_conversation_info_service,
     get_app_conversation_service,
+    get_app_conversation_start_task_service,
     get_event_callback_service,
     get_global_config,
     get_sandbox_service,
@@ -58,9 +67,15 @@ from openhands.app_server.event_callback.sql_event_callback_service import (
     invoke_callback,
 )
 from openhands.app_server.integrations.provider import ProviderType
+from openhands.app_server.organization.connection_models import (
+    OrganizationConnectionKind,
+    StoredOrganizationConnection,
+)
 from openhands.app_server.sandbox.sandbox_models import SandboxRecord
 from openhands.app_server.services.injector import InjectorState
 from openhands.app_server.services.jwt_service import JwtService
+from openhands.app_server.settings.settings_models import Settings
+from openhands.app_server.settings.sql_settings_store import StoredUserSettings
 from openhands.app_server.user.auth_user_context import AuthUserContext
 from openhands.app_server.user.specifiy_user_context import (
     ADMIN,
@@ -77,6 +92,12 @@ from openhands.app_server.utils.docker_utils import (
 )
 from openhands.sdk import ConversationExecutionStatus, Event
 from openhands.sdk.event import ConversationStateUpdateEvent, ObservationEvent
+from openhands.sdk.mcp.config import (
+    MCPOAuthAuthCredential,
+    MCPOAuthState,
+    MCPOAuthStateResponse,
+    MCPServer,
+)
 from openhands.sdk.settings import ACPAgentSettings
 from openhands.sdk.settings.acp_providers import detect_acp_provider_by_command
 from openhands.sdk.tool.builtins import SwitchLLMObservation
@@ -87,8 +108,14 @@ app_conversation_info_service_dependency = depends_app_conversation_info_service
     scope='function'
 )
 jwt_dependency = depends_jwt_service()
+db_session_dependency = depends_db_session()
 app_mode = get_global_config().app_mode
 _logger = logging.getLogger(__name__)
+
+
+class MCPOAuthStateWriteBack(BaseModel):
+    server_url: str = Field(min_length=1)
+    oauth_state: MCPOAuthStateResponse
 
 
 def _classify_error_type(error_message: str | None) -> str:
@@ -315,11 +342,45 @@ async def valid_conversation(
         app_conversation_info = await service.get_app_conversation_info(conversation_id)
     if not app_conversation_info:
         # Conversation does not yet exist - create a stub
-        return AppConversationInfo(
+        app_conversation_info = AppConversationInfo(
             id=conversation_id,
             sandbox_id=sandbox_record.id,
             created_by_user_id=sandbox_record.created_by_user_id,
         )
+
+    if (
+        app_conversation_info.created_by_user_id is None
+        or app_conversation_info.organization_id is None
+    ):
+        async with get_app_conversation_start_task_service(state) as service:
+            start_tasks = await service.search_app_conversation_start_tasks(
+                conversation_id__eq=conversation_id,
+                limit=100,
+            )
+        sandbox_tasks = [
+            task for task in start_tasks.items if task.sandbox_id == sandbox_record.id
+        ]
+        updates: dict[str, Any] = {}
+        matching_owners = {
+            task.created_by_user_id for task in sandbox_tasks if task.created_by_user_id
+        }
+        if app_conversation_info.created_by_user_id is None:
+            if matching_owners != {sandbox_record.created_by_user_id}:
+                raise AuthError()
+            updates['created_by_user_id'] = sandbox_record.created_by_user_id
+        if app_conversation_info.organization_id is None:
+            matching_organization_ids = {
+                task.request.organization_id
+                for task in sandbox_tasks
+                if task.created_by_user_id == sandbox_record.created_by_user_id
+                and task.request.organization_id is not None
+            }
+            if len(matching_organization_ids) > 1:
+                raise AuthError()
+            if matching_organization_ids:
+                updates['organization_id'] = matching_organization_ids.pop()
+        if updates:
+            app_conversation_info = app_conversation_info.model_copy(update=updates)
 
     if (
         app_conversation_info.created_by_user_id != sandbox_record.created_by_user_id
@@ -328,6 +389,164 @@ async def valid_conversation(
         raise AuthError()
 
     return app_conversation_info
+
+
+def _normalized_mcp_server_url(server_url: str) -> str:
+    return server_url.rstrip('/')
+
+
+def _updated_oauth_server(
+    server: MCPServer,
+    normalized_server_url: str,
+    oauth_state: MCPOAuthState,
+) -> MCPServer | None:
+    if (
+        server.url is None
+        or _normalized_mcp_server_url(server.url) != normalized_server_url
+        or not isinstance(server.auth, MCPOAuthAuthCredential)
+    ):
+        return None
+    return server.model_copy(
+        update={
+            'auth': server.auth.model_copy(
+                update={'state': oauth_state if oauth_state.has_values else None}
+            )
+        }
+    )
+
+
+@router.post('/mcp-oauth-state')
+async def write_back_mcp_oauth_state(
+    incoming: MCPOAuthStateWriteBack,
+    sandbox_record: SandboxRecord = Depends(valid_sandbox),
+    db_session: AsyncSession = db_session_dependency,
+    jwt_service: JwtService = jwt_dependency,
+) -> Success:
+    """Persist refreshed OAuth state for an inline MCP server."""
+    owner_id = sandbox_record.created_by_user_id
+    if not owner_id:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail='Sandbox had no user specified',
+        )
+
+    normalized_server_url = _normalized_mcp_server_url(incoming.server_url)
+    oauth_state = MCPOAuthState.model_validate(incoming.oauth_state.model_dump())
+    if not normalized_server_url or not oauth_state.has_values:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail='MCP OAuth state is empty',
+        )
+
+    start_tasks = (
+        await db_session.scalars(
+            select(StoredAppConversationStartTask).where(
+                StoredAppConversationStartTask.sandbox_id == sandbox_record.id,
+                StoredAppConversationStartTask.created_by_user_id == owner_id,
+            )
+        )
+    ).all()
+    organization_ids = set()
+    for task in start_tasks:
+        start_request = (
+            task.request
+            if isinstance(task.request, AppConversationStartRequest)
+            else AppConversationStartRequest.model_validate(task.request)
+        )
+        if start_request.organization_id is not None:
+            organization_ids.add(start_request.organization_id)
+    if len(organization_ids) > 1:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail='Sandbox has ambiguous organization context',
+        )
+
+    personal_matches: list[tuple[StoredUserSettings, Settings, str, MCPServer]] = []
+    personal_row = await db_session.scalar(
+        select(StoredUserSettings)
+        .where(StoredUserSettings.user_id == owner_id)
+        .with_for_update()
+    )
+    if personal_row is not None:
+        personal_settings = Settings.model_validate_json(
+            jwt_service.decrypt_value(personal_row.encrypted_payload)
+        )
+        for server_name, server in personal_settings.agent_settings.mcp_config.items():
+            updated = _updated_oauth_server(server, normalized_server_url, oauth_state)
+            if updated is not None:
+                personal_matches.append(
+                    (personal_row, personal_settings, server_name, updated)
+                )
+
+    organization_matches: list[
+        tuple[StoredOrganizationConnection, dict[str, Any], MCPServer]
+    ] = []
+    if organization_ids:
+        organization_id = next(iter(organization_ids))
+        organization_row = await db_session.scalar(
+            select(StoredOrganizationConnection)
+            .where(
+                StoredOrganizationConnection.organization_id == organization_id,
+                StoredOrganizationConnection.kind
+                == OrganizationConnectionKind.ATLASSIAN.value,
+            )
+            .with_for_update()
+        )
+        if organization_row is not None:
+            organization_payload = jwt_service.decrypt_value(
+                organization_row.encrypted_payload
+            )
+            connection_payload = json.loads(organization_payload)
+            server_payload = connection_payload.get('server')
+            if isinstance(server_payload, dict):
+                server = MCPServer.model_validate(server_payload)
+                updated = _updated_oauth_server(
+                    server, normalized_server_url, oauth_state
+                )
+                if updated is not None:
+                    organization_matches.append(
+                        (organization_row, connection_payload, updated)
+                    )
+
+    match_count = len(personal_matches) + len(organization_matches)
+    if match_count == 0:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail='No matching MCP OAuth server was found',
+        )
+    if match_count > 1:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail='Multiple matching MCP OAuth servers were found',
+        )
+
+    if personal_matches:
+        row, settings, server_name, updated_server = personal_matches[0]
+        updated_servers = dict(settings.agent_settings.mcp_config)
+        updated_servers[server_name] = updated_server
+        settings.agent_settings = settings.agent_settings.model_copy(
+            update={'mcp_config': updated_servers}
+        )
+        row.encrypted_payload = jwt_service.encrypt_value(
+            settings.model_dump_json(
+                context={'expose_secrets': True, 'persist_settings': True}
+            )
+        )
+        row.revision += 1
+    else:
+        row, connection_payload, updated_server = organization_matches[0]
+        connection_payload['server'] = updated_server.model_dump(
+            mode='json',
+            context={'expose_secrets': True},
+            exclude_none=True,
+        )
+        row.encrypted_payload = jwt_service.encrypt_value(
+            json.dumps(connection_payload, sort_keys=True, separators=(',', ':'))
+        )
+        row.revision += 1
+
+    await db_session.flush()
+    return Success()
 
 
 async def _resolve_acp_server_key(agent: Any, user_id: str | None) -> str | None:
@@ -424,7 +643,11 @@ async def on_conversation_update(
 
     app_conversation_info = AppConversationInfo(
         id=conversation_info.id,
-        title=existing.title or f'Conversation {conversation_info.id.hex}',
+        title=_merge_agent_server_title(
+            conversation_info.id, existing.title, conversation_info.title
+        )
+        or f'Conversation {conversation_info.id.hex}',
+        organization_id=existing.organization_id,
         sandbox_id=sandbox_record.id,
         created_by_user_id=sandbox_record.created_by_user_id,
         llm_model=llm_model,
@@ -488,6 +711,22 @@ _LIVE_STATS_PULL_STATUSES = {
 }
 
 
+def _merge_agent_server_title(
+    conversation_id: UUID,
+    current_title: str | None,
+    agent_server_title: str | None,
+) -> str | None:
+    """Accept an agent-generated title only while the cloud title is a placeholder."""
+    placeholder_titles = {
+        None,
+        f'Conversation {conversation_id.hex[:5]}',
+        f'Conversation {conversation_id.hex}',
+    }
+    if agent_server_title and current_title in placeholder_titles:
+        return agent_server_title
+    return current_title
+
+
 async def _sync_live_conversation_stats(
     conversation_id: UUID,
     app_conversation_info: AppConversationInfo,
@@ -526,6 +765,16 @@ async def _sync_live_conversation_stats(
         response = await client.get(conversation_url, headers=headers)
         response.raise_for_status()
         info = ConversationInfo.model_validate(response.json())
+    stored_info = await app_conversation_info_service.get_app_conversation_info(
+        conversation_id
+    )
+    if stored_info is not None:
+        title = _merge_agent_server_title(
+            conversation_id, stored_info.title, info.title
+        )
+        if title != stored_info.title:
+            stored_info.title = title
+            await app_conversation_info_service.save_app_conversation_info(stored_info)
     if info.stats and info.stats.usage_to_metrics:
         await app_conversation_info_service.update_conversation_statistics(
             conversation_id, info.stats

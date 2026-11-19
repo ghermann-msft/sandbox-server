@@ -23,8 +23,8 @@ from openhands.app_server.hindsight.hindsight_config import (
 )
 from openhands.app_server.hindsight.hindsight_models import (
     HindsightAuthorizationContext,
-    HindsightReadDepth,
     HindsightReadRequest,
+    HindsightRecallRequest,
     HindsightRecallResponse,
     HindsightReflectResponse,
     HindsightRetainApprovalRequest,
@@ -46,11 +46,16 @@ from openhands.app_server.hindsight.hindsight_service import (
     retain_requires_approval,
     validate_retain_approval,
 )
+from openhands.app_server.organization.organization_models import (
+    OrganizationPermission,
+)
+from openhands.app_server.organization.organization_service import OrganizationService
 from openhands.app_server.sandbox.sandbox_models import SandboxInfo
 from openhands.app_server.sandbox.sandbox_service import SandboxService
 from openhands.app_server.sandbox.session_auth import validate_session_key
 from openhands.app_server.services.injector import InjectorState
 from openhands.app_server.services.jwt_service import JwtService
+from openhands.app_server.user.auth_user_context import AuthUserContext
 from openhands.app_server.user.specifiy_user_context import ADMIN, USER_CONTEXT_ATTR
 from openhands.app_server.user.user_context import UserContext
 from openhands.app_server.user_auth.user_auth import get_for_user
@@ -95,23 +100,15 @@ async def _broker(http_client: httpx.AsyncClient | None = None) -> HindsightBrok
     )
 
 
-def _token_budget(depth: HindsightReadDepth) -> int:
-    config = get_global_config()
-    if depth == HindsightReadDepth.DEEP:
-        return config.hindsight_deep_token_ceiling
-    if depth == HindsightReadDepth.ADAPTIVE:
-        return config.hindsight_adaptive_token_ceiling
-    return config.hindsight_default_token_ceiling
-
-
 async def _authorization_for_user(
     user_id: str | None,
-    conversation_id: UUID,
+    conversation,
 ) -> HindsightAuthorizationContext:
-    if not user_id:
+    organization_id = conversation.organization_id
+    if not user_id or organization_id is None:
         raise HTTPException(
             status.HTTP_403_FORBIDDEN,
-            detail='Sandbox has no trusted user authority',
+            detail='Conversation has no trusted RBAC authority',
         )
     try:
         user_auth = await get_for_user(user_id)
@@ -120,27 +117,74 @@ async def _authorization_for_user(
             status.HTTP_503_SERVICE_UNAVAILABLE,
             detail='OpenHands RBAC authority is unavailable',
         ) from exc
-    resolver = getattr(user_auth, 'get_hindsight_authorization', None)
-    if resolver is None:
+    user_context = AuthUserContext(user_auth=user_auth)
+    identity = await user_context.get_authentication_identity()
+    if identity is None or identity.tenant_id is None:
         raise HTTPException(
-            status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail='OpenHands RBAC does not provide Hindsight authorization',
+            status.HTTP_403_FORBIDDEN,
+            detail='Authenticated immutable identity is required',
         )
     try:
-        value = await resolver(conversation_id)
-        if value is None:
-            raise HTTPException(
-                status.HTTP_403_FORBIDDEN,
-                detail='OpenHands RBAC denied Hindsight authorization',
+        session_maker = await get_global_config().db_session.get_async_session_maker()
+        async with session_maker() as db_session:
+            membership = await OrganizationService(
+                db_session, user_context
+            ).require_permission(
+                organization_id,
+                OrganizationPermission.ORG_VIEW,
             )
-        authorization = HindsightAuthorizationContext.model_validate(value)
+        authorization = HindsightAuthorizationContext(
+            tenant_id=UUID(identity.tenant_id),
+            object_id=UUID(identity.subject_id),
+            organization_id=str(organization_id),
+            role=membership.role.value,
+            permissions={permission.value for permission in membership.permissions},
+        )
     except HTTPException:
         raise
-    except Exception as exc:
+    except (ValueError, TypeError) as exc:
         raise HTTPException(
             status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail='OpenHands RBAC returned invalid Hindsight authorization',
+            detail='OpenHands RBAC returned invalid immutable identity',
         ) from exc
+    return authorization
+
+
+async def _authorization_for_identity(
+    identity_token: str,
+    conversation,
+    jwt_service: JwtService,
+) -> HindsightAuthorizationContext:
+    try:
+        claims = jwt_service.verify_jws_token(identity_token)
+    except Exception as exc:
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            detail='Invalid Hindsight identity',
+        ) from exc
+    if claims.get('purpose') != 'hindsight_memory':
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            detail='Invalid Hindsight identity purpose',
+        )
+    user_id = claims.get('user_id')
+    if (
+        not isinstance(user_id, str)
+        or claims.get('sandbox_id') != conversation.sandbox_id
+        or claims.get('organization_id') != str(conversation.organization_id)
+    ):
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            detail='Hindsight identity does not match conversation authority',
+        )
+    authorization = await _authorization_for_user(user_id, conversation)
+    if claims.get('tenant_id') != str(authorization.tenant_id) or claims.get(
+        'object_id'
+    ) != str(authorization.object_id):
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            detail='Hindsight identity no longer matches authenticated identity',
+        )
     return authorization
 
 
@@ -157,13 +201,18 @@ def _scope_bindings() -> HindsightScopeBindings:
         ) from exc
 
 
-async def _conversation_for_sandbox(conversation_id, sandbox: SandboxInfo):
+async def _conversation(conversation_id):
     state = InjectorState()
     setattr(state, USER_CONTEXT_ATTR, ADMIN)
     async with get_app_conversation_info_service(state) as service:
         conversation = await service.get_app_conversation_info(conversation_id)
     if conversation is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail='Conversation not found')
+    return conversation
+
+
+async def _conversation_for_sandbox(conversation_id, sandbox: SandboxInfo):
+    conversation = await _conversation(conversation_id)
     if conversation.sandbox_id != sandbox.id:
         raise HTTPException(
             status.HTTP_403_FORBIDDEN,
@@ -174,13 +223,12 @@ async def _conversation_for_sandbox(conversation_id, sandbox: SandboxInfo):
 
 async def _authorized_read(
     request: HindsightReadRequest,
-    session_api_key: str | None,
     http_client: httpx.AsyncClient,
+    jwt_service: JwtService,
 ):
-    sandbox = await validate_session_key(session_api_key)
-    conversation = await _conversation_for_sandbox(request.conversation_id, sandbox)
-    authorization = await _authorization_for_user(
-        sandbox.created_by_user_id, request.conversation_id
+    conversation = await _conversation(request.conversation_id)
+    authorization = await _authorization_for_identity(
+        request.identity, conversation, jwt_service
     )
     principal = authorization.principal
     broker = await _broker(http_client)
@@ -189,7 +237,7 @@ async def _authorized_read(
         resolve_scope(
             scope,
             principal,
-            sandbox.id,
+            conversation.sandbox_id,
             conversation.selected_repository,
             conversation.git_provider.value if conversation.git_provider else None,
             get_global_config().hindsight_deployment_id,
@@ -219,13 +267,13 @@ async def _authorized_read(
 
 @router.post('/recall', response_model=HindsightRecallResponse)
 async def recall(
-    request: HindsightReadRequest,
+    request: HindsightRecallRequest,
     http_client: Annotated[httpx.AsyncClient, depends_httpx_client()],
-    session_api_key: Annotated[str | None, Header(alias='X-Session-API-Key')] = None,
+    jwt_service: Annotated[JwtService, depends_jwt_service()],
 ):
-    broker, banks = await _authorized_read(request, session_api_key, http_client)
+    broker, banks = await _authorized_read(request, http_client, jwt_service)
     available, memories = await broker.recall(
-        request.query, banks, request.max_results, _token_budget(request.depth)
+        request.query, banks, 10, request.max_tokens
     )
     return HindsightRecallResponse(available=available, memories=memories)
 
@@ -234,13 +282,13 @@ async def recall(
 async def reflect(
     request: HindsightReadRequest,
     http_client: Annotated[httpx.AsyncClient, depends_httpx_client()],
-    session_api_key: Annotated[str | None, Header(alias='X-Session-API-Key')] = None,
+    jwt_service: Annotated[JwtService, depends_jwt_service()],
 ):
-    broker, banks = await _authorized_read(request, session_api_key, http_client)
+    broker, banks = await _authorized_read(request, http_client, jwt_service)
     available, text, sources = await broker.reflect(
-        request.query, banks, _token_budget(request.depth)
+        request.query, banks, request.max_tokens
     )
-    return HindsightReflectResponse(available=available, text=text, sources=sources)
+    return HindsightReflectResponse(available=available, content=text, memories=sources)
 
 
 @router.post(
@@ -257,13 +305,13 @@ async def approve_retain(
     jwt_service: Annotated[JwtService, depends_jwt_service()],
 ):
     user_id = await user_context.get_user_id()
-    authorization = await _authorization_for_user(user_id, request.conversation_id)
-    principal = authorization.principal
     conversation = await conversation_service.get_app_conversation_info(
         request.conversation_id
     )
     if conversation is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail='Conversation not found')
+    authorization = await _authorization_for_user(user_id, conversation)
+    principal = authorization.principal
     sandbox = await sandbox_service.get_sandbox(conversation.sandbox_id)
     if sandbox is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail='Sandbox not found')
@@ -281,7 +329,13 @@ async def approve_retain(
         _scope_bindings(),
     )
     authorize_conversation_organization(
-        conversation.organization_id, authorization, [scope]
+        (
+            str(conversation.organization_id)
+            if conversation.organization_id is not None
+            else None
+        ),
+        authorization,
+        [scope],
     )
     authorize_scope_operation(authorization, scope, 'hindsight:retain')
     payload = {
@@ -315,9 +369,7 @@ async def retain(
     sandbox = await validate_session_key(session_api_key)
     conversation = await _conversation_for_sandbox(request.conversation_id, sandbox)
     owner_user_id = sandbox.created_by_user_id
-    authorization = await _authorization_for_user(
-        owner_user_id, request.conversation_id
-    )
+    authorization = await _authorization_for_user(owner_user_id, conversation)
     principal = authorization.principal
     assert owner_user_id is not None
     scope = resolve_scope(

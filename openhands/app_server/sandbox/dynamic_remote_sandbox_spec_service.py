@@ -91,7 +91,9 @@ class DynamicRemoteSandboxSpecService(SandboxSpecService):
             next_page_id=str(end_idx) if end_idx < len(specs) else None,
         )
 
-    async def get_sandbox_spec(self, sandbox_spec_id: str) -> SandboxSpecInfo | None:
+    async def get_sandbox_spec(
+        self, sandbox_spec_id: str, include_unavailable: bool = False
+    ) -> SandboxSpecInfo | None:
         specs = await self._fetch_specs()
         return next((s for s in specs if s.id == sandbox_spec_id), None)
 

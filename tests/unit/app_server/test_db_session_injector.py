@@ -11,6 +11,7 @@ import os
 import sys
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -87,6 +88,20 @@ def gcp_db_session_injector(temp_persistence_dir):
     )
 
 
+@pytest.fixture
+def azure_db_session_injector(temp_persistence_dir):
+    """Create a DbSessionInjector configured for Azure PostgreSQL identity."""
+    return DbSessionInjector(
+        persistence_dir=temp_persistence_dir,
+        host='server.postgres.database.azure.com',
+        port=5432,
+        name='test_db',
+        user='test_principal',
+        azure_identity=True,
+        ssl_mode='require',
+    )
+
+
 class TestDbSessionInjectorConfiguration:
     """Test configuration processing and environment variable handling."""
 
@@ -110,6 +125,7 @@ class TestDbSessionInjectorConfiguration:
         assert service.gcp_project is None
         assert service.gcp_region is None
         assert service.ssl_mode is None
+        assert service.azure_identity is False
 
     def test_environment_variable_processing(self, temp_persistence_dir):
         """Test that environment variables are properly processed."""
@@ -145,6 +161,62 @@ class TestDbSessionInjectorConfiguration:
 
             assert service.pool_size == 30
             assert service.max_overflow == 7
+
+    def test_azure_workload_identity_environment(self, temp_persistence_dir):
+        with patch.dict(
+            os.environ,
+            {
+                'DB_AZURE_IDENTITY': 'true',
+                'DB_HOST': 'server.postgres.database.azure.com',
+                'DB_USER': 'test_principal',
+                'DB_NAME': 'test_db',
+            },
+            clear=True,
+        ):
+            service = DbSessionInjector(persistence_dir=temp_persistence_dir)
+
+        assert service.azure_identity is True
+        assert service.password is None
+
+    def test_azure_workload_identity_requires_host_and_user(self, temp_persistence_dir):
+        with (
+            patch.dict(
+                os.environ,
+                {'DB_AZURE_IDENTITY': 'true'},
+                clear=True,
+            ),
+            pytest.raises(ValueError, match='DB_HOST'),
+        ):
+            DbSessionInjector(persistence_dir=temp_persistence_dir)
+
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    'DB_AZURE_IDENTITY': 'true',
+                    'DB_HOST': 'server.postgres.database.azure.com',
+                },
+                clear=True,
+            ),
+            pytest.raises(ValueError, match='DB_USER'),
+        ):
+            DbSessionInjector(persistence_dir=temp_persistence_dir)
+
+    def test_azure_workload_identity_rejects_gcp_connector(self, temp_persistence_dir):
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    'DB_AZURE_IDENTITY': 'true',
+                    'DB_HOST': 'server.postgres.database.azure.com',
+                    'DB_USER': 'test_principal',
+                    'GCP_DB_INSTANCE': 'test-instance',
+                },
+                clear=True,
+            ),
+            pytest.raises(ValueError, match='GCP_DB_INSTANCE'),
+        ):
+            DbSessionInjector(persistence_dir=temp_persistence_dir)
 
     def test_explicit_values_override_env_vars(self, temp_persistence_dir):
         """Test that explicitly provided values override environment variables."""
@@ -226,6 +298,46 @@ class TestDbSessionInjectorConnections:
             assert call_args[1]['pool_pre_ping']
             assert call_args[1]['pool_use_lifo'] is True
 
+    def test_azure_sync_connections_refresh_tokens(self, azure_db_session_injector):
+        credential = MagicMock()
+        credential.get_token.side_effect = [
+            SimpleNamespace(token='token-one'),
+            SimpleNamespace(token='token-two'),
+        ]
+        with (
+            patch.object(
+                azure_db_session_injector,
+                '_get_azure_credential',
+                return_value=credential,
+            ),
+            patch('pg8000.connect') as connect,
+        ):
+            azure_db_session_injector._create_azure_db_connection()
+            azure_db_session_injector._create_azure_db_connection()
+
+        assert [call.kwargs['password'] for call in connect.call_args_list] == [
+            'token-one',
+            'token-two',
+        ]
+        assert credential.get_token.call_count == 2
+        credential.get_token.assert_called_with(
+            'https://ossrdbms-aad.database.windows.net/.default'
+        )
+        assert connect.call_args.kwargs['ssl_context'] is True
+
+    def test_azure_sync_engine_uses_connection_creator(self, azure_db_session_injector):
+        with patch(
+            'openhands.app_server.services.db_session_injector.create_engine'
+        ) as create:
+            create.return_value = MagicMock()
+            azure_db_session_injector.get_db_engine()
+
+        assert str(create.call_args.args[0]) == 'postgresql+pg8000://'
+        assert (
+            create.call_args.kwargs['creator']
+            == azure_db_session_injector._create_azure_db_connection
+        )
+
     @pytest.mark.asyncio
     async def test_postgres_async_connection_with_host(
         self, postgres_db_session_injector
@@ -259,6 +371,54 @@ class TestDbSessionInjectorConnections:
             assert call_args[1]['max_overflow'] == 10
             assert call_args[1]['pool_pre_ping']
             assert call_args[1]['pool_use_lifo'] is True
+
+    @pytest.mark.asyncio
+    async def test_azure_async_connections_refresh_tokens(
+        self, azure_db_session_injector
+    ):
+        credential = MagicMock()
+        credential.get_token = AsyncMock(
+            side_effect=[
+                SimpleNamespace(token='token-one'),
+                SimpleNamespace(token='token-two'),
+            ]
+        )
+        with (
+            patch.object(
+                azure_db_session_injector,
+                '_get_azure_async_credential',
+                return_value=credential,
+            ),
+            patch(
+                'openhands.app_server.services.db_session_injector.asyncpg.connect',
+                new_callable=AsyncMock,
+            ) as connect,
+        ):
+            await azure_db_session_injector._create_async_azure_db_connection()
+            await azure_db_session_injector._create_async_azure_db_connection()
+
+        assert [call.kwargs['password'] for call in connect.call_args_list] == [
+            'token-one',
+            'token-two',
+        ]
+        assert credential.get_token.await_count == 2
+        credential.get_token.assert_awaited_with(
+            'https://ossrdbms-aad.database.windows.net/.default'
+        )
+        assert connect.call_args.kwargs['ssl'] == 'require'
+
+    @pytest.mark.asyncio
+    async def test_azure_async_engine_uses_connection_creator(
+        self, azure_db_session_injector
+    ):
+        with patch(
+            'openhands.app_server.services.db_session_injector.create_async_engine'
+        ) as create:
+            create.return_value = MagicMock()
+            await azure_db_session_injector.get_async_db_engine()
+
+        assert str(create.call_args.args[0]) == 'postgresql+asyncpg://'
+        assert callable(create.call_args.kwargs['creator'])
 
     def test_postgres_connection_requires_ssl(self, temp_persistence_dir):
         service = DbSessionInjector(

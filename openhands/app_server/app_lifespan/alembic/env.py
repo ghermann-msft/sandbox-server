@@ -31,8 +31,29 @@ from openhands.app_server.event_callback.sql_event_callback_service import (  # 
 from openhands.app_server.hindsight.hindsight_service import (  # noqa: E402
     StoredHindsightOutbox,  # noqa: F401
 )
+from openhands.app_server.integrations.github.oauth_models import (  # noqa: E402
+    StoredGitHubOAuthState,  # noqa: F401
+)
+from openhands.app_server.organization.agent_profile_models import (  # noqa: E402
+    StoredOrganizationAgentProfiles,  # noqa: F401
+)
+from openhands.app_server.organization.connection_models import (  # noqa: E402
+    StoredOrganizationConnection,  # noqa: F401
+)
+from openhands.app_server.organization.profile_models import (  # noqa: E402
+    StoredOrganizationProfiles,  # noqa: F401
+)
 from openhands.app_server.sandbox.remote_sandbox_service import (  # noqa: E402
     StoredRemoteSandbox,  # noqa: F401
+)
+from openhands.app_server.sandbox.sandbox_access import (  # noqa: E402
+    StoredSandboxAccess,  # noqa: F401
+)
+from openhands.app_server.secrets.sql_secrets_store import (  # noqa: E402
+    StoredUserSecrets,  # noqa: F401
+)
+from openhands.app_server.settings.sql_settings_store import (  # noqa: E402
+    StoredUserSettings,  # noqa: F401
 )
 from openhands.app_server.utils.sql_utils import Base  # noqa: E402
 
@@ -102,11 +123,19 @@ def run_migrations_online() -> None:
     and associate a connection with the context.
 
     """
+    provided_connection = config.attributes.get('connection')
+    if provided_connection is not None:
+        context.configure(
+            connection=provided_connection,
+            target_metadata=target_metadata,
+        )
+        with context.begin_transaction():
+            context.run_migrations()
+        return
+
     # Use the DbSessionInjector engine instead of creating a new one
     global_config = get_global_config()
-    db_session = global_config.db_session
-    connectable = db_session.get_db_engine()
-
+    connectable = global_config.db_session.get_db_engine()
     with connectable.connect() as connection:
         context.configure(connection=connection, target_metadata=target_metadata)
 

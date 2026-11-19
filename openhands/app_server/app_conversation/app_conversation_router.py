@@ -7,6 +7,7 @@ import logging
 import os
 import sys
 import tempfile
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Annotated, Any, AsyncGenerator, Literal
@@ -31,6 +32,7 @@ from openhands.app_server.app_conversation.app_conversation_models import (
     AppConversationStartTask,
     AppConversationStartTaskPage,
     AppConversationStartTaskSortOrder,
+    AppConversationStartTaskStatus,
     AppConversationUpdateRequest,
     AppSendMessageRequest,
     AppSendMessageResponse,
@@ -66,6 +68,18 @@ from openhands.app_server.config import (
     depends_user_context,
     get_app_conversation_service,
 )
+from openhands.app_server.organization.organization_models import (
+    ORGANIZATION_ID_HEADER,
+)
+from openhands.app_server.organization.organization_service import (
+    bind_conversation_organization,
+)
+from openhands.app_server.sandbox.sandbox_access import (
+    can_access_sandbox_credentials,
+)
+from openhands.app_server.sandbox.sandbox_lifecycle import (
+    release_sandbox_if_unreferenced,
+)
 from openhands.app_server.sandbox.sandbox_models import (
     AGENT_SERVER,
     SandboxInfo,
@@ -85,10 +99,6 @@ from openhands.app_server.settings.settings_router import LITE_LLM_API_URL
 from openhands.app_server.user.specifiy_user_context import USER_CONTEXT_ATTR
 from openhands.app_server.user.user_context import UserContext
 from openhands.app_server.user_auth import get_user_settings
-from openhands.app_server.user_auth.organization_service import (
-    bind_conversation_organization,
-)
-from openhands.app_server.user_auth.user_auth import UserAuth, get_user_auth
 from openhands.app_server.utils.dependencies import get_dependencies
 from openhands.app_server.utils.docker_utils import (
     replace_localhost_hostname_for_docker,
@@ -113,6 +123,7 @@ router = APIRouter(
 )
 logger = logging.getLogger(__name__)
 app_conversation_service_dependency = depends_app_conversation_service()
+user_settings_dependency = Depends(get_user_settings)
 app_conversation_info_service_dependency = depends_app_conversation_info_service()
 app_conversation_start_task_service_dependency = (
     depends_app_conversation_start_task_service()
@@ -183,7 +194,9 @@ async def _get_agent_server_context(
         )
 
     # Get the sandbox spec to find the working directory
-    sandbox_spec = await sandbox_spec_service.get_sandbox_spec(sandbox.sandbox_spec_id)
+    sandbox_spec = await sandbox_spec_service.get_sandbox_spec(
+        sandbox.sandbox_spec_id, include_unavailable=True
+    )
     if not sandbox_spec:
         # TODO: This is a temporary work around for the fact that we don't store previous
         # sandbox spec versions when updating OpenHands. When the SandboxSpecServices
@@ -367,55 +380,46 @@ async def batch_get_app_conversations(
 
 @router.post('')
 async def start_app_conversation(
-    request: Request,
     start_request: AppConversationStartRequest,
-    organization_id: Annotated[str | None, Header(alias='X-Org-Id')] = None,
-    user_auth: UserAuth = Depends(get_user_auth),
+    organization_id: Annotated[
+        UUID | None, Header(alias=ORGANIZATION_ID_HEADER)
+    ] = None,
     user_context: UserContext = user_context_dependency,
     db_session: AsyncSession = db_session_dependency,
-    httpx_client: httpx.AsyncClient = httpx_client_dependency,
-    app_conversation_service: AppConversationService = (
-        app_conversation_service_dependency
-    ),
 ) -> AppConversationStartTask:
-    await bind_conversation_organization(start_request, organization_id, user_auth)
-    # Because we are processing after the request finishes, keep the db connection open
-    set_db_session_keep_open(request.state, True)
-    set_httpx_client_keep_open(request.state, True)
+    """Start an app conversation start task and return it."""
+    await bind_conversation_organization(
+        start_request, organization_id, db_session, user_context
+    )
+    first_result = asyncio.get_running_loop().create_future()
+    asyncio.create_task(
+        _run_app_conversation_start(start_request, user_context, first_result)
+    )
+    result = await first_result
 
+    # Analytics: conversation created (V1)
     try:
-        """Start an app conversation start task and return it."""
-        async_iter = app_conversation_service.start_app_conversation(start_request)
-        result = await anext(async_iter)
-
-        # Analytics: conversation created (V1)
-        try:
-            analytics = get_analytics_service()
-            if analytics:
-                user_id = await user_context.get_user_id()
-                if user_id:
-                    ctx = await resolve_analytics_context(user_id)
-                    analytics.track_conversation_created(
-                        ctx=ctx,
-                        conversation_id=str(result.app_conversation_id)
-                        if result.app_conversation_id
-                        else result.id,
-                        trigger=start_request.trigger.value
-                        if start_request.trigger
-                        else None,
-                        llm_model=None,  # Not available at start time
-                        agent_type='default',
-                        has_repository=start_request.selected_repository is not None,
-                    )
-        except Exception:
-            logger.exception('analytics:conversation_created:failed', stack_info=True)
-
-        asyncio.create_task(_consume_remaining(async_iter, db_session, httpx_client))
-        return result
+        analytics = get_analytics_service()
+        if analytics:
+            user_id = await user_context.get_user_id()
+            if user_id:
+                ctx = await resolve_analytics_context(user_id)
+                analytics.track_conversation_created(
+                    ctx=ctx,
+                    conversation_id=str(result.app_conversation_id)
+                    if result.app_conversation_id
+                    else result.id,
+                    trigger=start_request.trigger.value
+                    if start_request.trigger
+                    else None,
+                    llm_model=None,  # Not available at start time
+                    agent_type='default',
+                    has_repository=start_request.selected_repository is not None,
+                )
     except Exception:
-        await db_session.close()
-        await httpx_client.aclose()
-        raise
+        logger.exception('analytics:conversation_created:failed', stack_info=True)
+
+    return result
 
 
 @router.patch('/{conversation_id}')
@@ -637,7 +641,7 @@ async def _persist_conversation_model(
 async def switch_conversation_profile(
     conversation_id: UUID,
     request: SwitchProfileRequest,
-    user_settings: Settings | None = Depends(get_user_settings),
+    user_settings: Settings | None = user_settings_dependency,
     app_conversation_service: AppConversationService = (
         app_conversation_service_dependency
     ),
@@ -917,13 +921,11 @@ async def _finalize_sandbox_delete(
                 sandbox_id,
             )
         else:
-            conversation_count = (
-                await app_conversation_info_service.count_conversations_by_sandbox_id(
-                    sandbox_id
-                )
+            await release_sandbox_if_unreferenced(
+                app_conversation_info_service,
+                sandbox_service,
+                sandbox_id,
             )
-            if conversation_count == 0:
-                await sandbox_service.delete_sandbox(sandbox_id)
         await db_session.commit()
     except Exception:
         # Any failure in the finalizer (a transient stop/lookup error, the count
@@ -1039,19 +1041,50 @@ async def delete_app_conversation(
 @router.post('/stream-start')
 async def stream_app_conversation_start(
     request: AppConversationStartRequest,
-    organization_id: Annotated[str | None, Header(alias='X-Org-Id')] = None,
-    user_auth: UserAuth = Depends(get_user_auth),
+    organization_id: Annotated[
+        UUID | None, Header(alias=ORGANIZATION_ID_HEADER)
+    ] = None,
     user_context: UserContext = user_context_dependency,
+    db_session: AsyncSession = db_session_dependency,
 ) -> list[AppConversationStartTask]:
     """Start an app conversation start task and stream updates from it.
     Leaves the connection open until either the conversation starts or there was an error
     """
-    await bind_conversation_organization(request, organization_id, user_auth)
+    await bind_conversation_organization(
+        request, organization_id, db_session, user_context
+    )
     response = StreamingResponse(
         _stream_app_conversation_start(request, user_context),
         media_type='application/json',
     )
     return response
+
+
+async def _hydrate_start_task_session_api_keys(
+    tasks: Sequence[AppConversationStartTask | None],
+    sandbox_service: SandboxService,
+    user_context: UserContext,
+) -> None:
+    user_id = await user_context.get_user_id()
+    eligible_tasks = [
+        task
+        for task in tasks
+        if task is not None
+        and task.status == AppConversationStartTaskStatus.READY
+        and task.sandbox_id
+        and task.created_by_user_id == user_id
+    ]
+    sandbox_ids = list(dict.fromkeys(task.sandbox_id for task in eligible_tasks))
+    sandboxes = await sandbox_service.batch_get_sandboxes(sandbox_ids)
+    sandboxes_by_id = {
+        sandbox.id: sandbox for sandbox in sandboxes if sandbox is not None
+    }
+    for task in eligible_tasks:
+        sandbox = sandboxes_by_id.get(task.sandbox_id)
+        if sandbox is None:
+            continue
+        if can_access_sandbox_credentials(user_id, sandbox.created_by_user_id):
+            task.session_api_key = sandbox.session_api_key
 
 
 @router.get('/start-tasks/search')
@@ -1083,9 +1116,11 @@ async def search_app_conversation_start_tasks(
     app_conversation_start_task_service: AppConversationStartTaskService = (
         app_conversation_start_task_service_dependency
     ),
+    sandbox_service: SandboxService = sandbox_service_dependency,
+    user_context: UserContext = user_context_dependency,
 ) -> AppConversationStartTaskPage:
     """Search / List conversation start tasks."""
-    return (
+    page = (
         await app_conversation_start_task_service.search_app_conversation_start_tasks(
             conversation_id__eq=conversation_id__eq,
             created_at__gte=created_at__gte,
@@ -1094,6 +1129,10 @@ async def search_app_conversation_start_tasks(
             limit=limit,
         )
     )
+    await _hydrate_start_task_session_api_keys(
+        page.items, sandbox_service, user_context
+    )
+    return page
 
 
 @router.get('/start-tasks/count')
@@ -1123,6 +1162,8 @@ async def batch_get_app_conversation_start_tasks(
     app_conversation_start_task_service: AppConversationStartTaskService = (
         app_conversation_start_task_service_dependency
     ),
+    sandbox_service: SandboxService = sandbox_service_dependency,
+    user_context: UserContext = user_context_dependency,
 ) -> list[AppConversationStartTask | None]:
     """Get a batch of start app conversation tasks given their ids. Return None for any missing."""
     if len(ids) > 100:
@@ -1132,6 +1173,9 @@ async def batch_get_app_conversation_start_tasks(
         )
     start_tasks = await app_conversation_start_task_service.batch_get_app_conversation_start_tasks(
         ids
+    )
+    await _hydrate_start_task_session_api_keys(
+        start_tasks, sandbox_service, user_context
     )
     return start_tasks
 
@@ -1171,7 +1215,9 @@ async def read_conversation_file(
         return ''
 
     # Get the sandbox spec to find the working directory
-    sandbox_spec = await sandbox_spec_service.get_sandbox_spec(sandbox.sandbox_spec_id)
+    sandbox_spec = await sandbox_spec_service.get_sandbox_spec(
+        sandbox.sandbox_spec_id, include_unavailable=True
+    )
     if not sandbox_spec:
         return ''
 
@@ -1694,18 +1740,30 @@ async def export_conversation(
         ) from e
 
 
-async def _consume_remaining(
-    async_iter, db_session: AsyncSession, httpx_client: httpx.AsyncClient
-):
-    """Consume the remaining items from an async iterator"""
+async def _run_app_conversation_start(
+    request: AppConversationStartRequest,
+    user_context: UserContext,
+    first_result: asyncio.Future[AppConversationStartTask],
+) -> None:
+    """Run a start task in a dependency scope owned by the background task."""
+    state = InjectorState()
+    setattr(state, USER_CONTEXT_ATTR, user_context)
     try:
-        while True:
-            await anext(async_iter)
-    except StopAsyncIteration:
-        return
-    finally:
-        await db_session.close()
-        await httpx_client.aclose()
+        async with get_app_conversation_service(state) as app_conversation_service:
+            async for task in app_conversation_service.start_app_conversation(request):
+                if not first_result.done():
+                    first_result.set_result(task)
+        if not first_result.done():
+            first_result.set_exception(
+                RuntimeError('App conversation start produced no task')
+            )
+    except Exception as exc:
+        if not first_result.done():
+            first_result.set_exception(exc)
+        else:
+            logger.exception(
+                'app_conversation_start:background_failed', stack_info=True
+            )
 
 
 async def _stream_app_conversation_start(

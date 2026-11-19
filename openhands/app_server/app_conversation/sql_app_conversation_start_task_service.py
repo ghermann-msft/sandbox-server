@@ -40,6 +40,7 @@ from openhands.app_server.app_conversation.app_conversation_start_task_service i
     AppConversationStartTaskService,
     AppConversationStartTaskServiceInjector,
 )
+from openhands.app_server.sandbox.sandbox_models import SandboxStartupProgress
 from openhands.app_server.services.injector import InjectorState
 from openhands.app_server.utils.sql_utils import (
     Base,
@@ -63,6 +64,9 @@ class StoredAppConversationStartTask(Base):
     app_conversation_id: Mapped[UUID | None] = mapped_column(nullable=True)
     sandbox_id: Mapped[str | None] = mapped_column(String, nullable=True)
     agent_server_url: Mapped[str | None] = mapped_column(String, nullable=True)
+    sandbox_startup_progress: Mapped[SandboxStartupProgress | None] = mapped_column(
+        create_json_type_decorator(SandboxStartupProgress), nullable=True
+    )
     request: Mapped[AppConversationStartRequest] = mapped_column(
         create_json_type_decorator(AppConversationStartRequest)
     )
@@ -243,7 +247,11 @@ class SQLAppConversationStartTaskService(AppConversationStartTaskService):
             existing = result.scalar_one_or_none()
             assert existing is None or existing.created_by_user_id == self.user_id
         task.updated_at = utc_now()
-        await self.session.merge(StoredAppConversationStartTask(**task.model_dump()))
+        await self.session.merge(
+            StoredAppConversationStartTask(
+                **task.model_dump(exclude={'session_api_key'})
+            )
+        )
         await self.session.commit()
         return task
 

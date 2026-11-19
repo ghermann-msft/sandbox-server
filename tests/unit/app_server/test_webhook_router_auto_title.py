@@ -87,6 +87,7 @@ def mock_conversation_info() -> ConversationInfo:
     conversation_info = MagicMock(spec=ConversationInfo)
     conversation_info.id = uuid4()
     conversation_info.execution_status = ConversationExecutionStatus.RUNNING
+    conversation_info.title = None
 
     # Mock agent.llm.model structure
     conversation_info.agent = MagicMock()
@@ -237,6 +238,39 @@ class TestOnConversationUpdateAutoTitle:
 
         # Verify SetTitleCallbackProcessor was NOT registered
         assert len(saved_callbacks) == 0
+
+    @pytest.mark.asyncio
+    async def test_persists_generated_title_from_conversation_update(
+        self,
+        app_conversation_info_service,
+        sandbox_record,
+        mock_conversation_info,
+    ):
+        conversation_id = mock_conversation_info.id
+        placeholder = AppConversationInfo(
+            id=conversation_id,
+            title=f'Conversation {conversation_id.hex[:5]}',
+            sandbox_id='sandbox_123',
+            created_by_user_id='user_123',
+        )
+        mock_conversation_info.title = 'Generated conversation title'
+
+        with patch(
+            'openhands.app_server.event_callback.webhook_router.valid_conversation',
+            return_value=placeholder,
+        ):
+            result = await on_conversation_update(
+                conversation_info=mock_conversation_info,
+                sandbox_record=sandbox_record,
+                app_conversation_info_service=app_conversation_info_service,
+            )
+
+        assert isinstance(result, Success)
+        saved = await app_conversation_info_service.get_app_conversation_info(
+            conversation_id
+        )
+        assert saved is not None
+        assert saved.title == 'Generated conversation title'
 
     @pytest.mark.asyncio
     async def test_does_not_register_callback_for_deleting_conversation(

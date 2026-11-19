@@ -20,6 +20,10 @@ def get_hindsight_base_url() -> str | None:
     return os.getenv('OH_HINDSIGHT_BASE_URL')
 
 
+def get_hindsight_broker_url() -> str | None:
+    return os.getenv('OH_HINDSIGHT_BROKER_URL')
+
+
 def get_hindsight_api_key_file() -> Path | None:
     value = os.getenv('OH_HINDSIGHT_API_KEY_FILE')
     return Path(value) if value else None

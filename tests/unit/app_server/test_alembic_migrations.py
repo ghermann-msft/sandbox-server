@@ -43,6 +43,31 @@ def test_upgrade_downgrade_upgrade(alembic_config):
 
     command.upgrade(config, 'head')
     assert _revision(db_session) == head
+    with db_session.get_db_engine().connect() as connection:
+        tables = set(sa.inspect(connection).get_table_names())
+        permissions = set(
+            connection.execute(
+                sa.text('SELECT name FROM organization_permissions')
+            ).scalars()
+        )
+    assert {
+        'rbac_users',
+        'organizations',
+        'organization_memberships',
+        'organization_roles',
+        'organization_permissions',
+        'organization_role_permissions',
+        'conversation_cost_events',
+        'organization_connections',
+        'organization_llm_profiles',
+    } <= tables
+    with db_session.get_db_engine().connect() as connection:
+        oauth_columns = {
+            column['name']
+            for column in sa.inspect(connection).get_columns('oss_github_oauth_state')
+        }
+    assert 'organization_id' in oauth_columns
+    assert {'hindsight:recall', 'hindsight:retain'} <= permissions
 
     command.downgrade(config, '001')
     assert _revision(db_session) == '001'

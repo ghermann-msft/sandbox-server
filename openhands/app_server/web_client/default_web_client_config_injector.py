@@ -12,6 +12,9 @@ from openhands.app_server.integrations.service_types import ProviderType
 from openhands.app_server.web_client.web_client_config_injector import (
     WebClientConfigInjector,
 )
+from openhands.app_server.web_client.web_client_deployment_mode import (
+    get_deployment_mode,
+)
 from openhands.app_server.web_client.web_client_models import (
     ACPModelOption,
     ACPProviderConfig,
@@ -110,6 +113,11 @@ def _get_github_app_slug() -> str | None:
     return slug if slug else None
 
 
+def _is_absolute_https_url(value: str) -> bool:
+    parsed = urlparse(value)
+    return parsed.scheme == 'https' and bool(parsed.netloc)
+
+
 def _get_slack_enabled() -> bool:
     """Return whether Slack integration is fully configured for the web client."""
     return (
@@ -177,6 +185,24 @@ def _get_feature_flags() -> WebClientFeatureFlags:
     (Settings > Agent) visible on SaaS and existing installs, matching Agent
     Canvas. Set ENABLE_ACP=false to hide it.
     """
+    github_app_slug = _get_github_app_slug()
+    github_callback_url = os.getenv('OH_GITHUB_OAUTH_CALLBACK_URL', '').strip()
+    github_success_url = os.getenv('OH_GITHUB_OAUTH_SUCCESS_URL', '').strip()
+    github_oauth_configured = bool(
+        os.getenv('GITHUB_APP_CLIENT_ID', '').strip()
+        and os.getenv('GITHUB_APP_CLIENT_SECRET', '').strip()
+        and _is_absolute_https_url(github_callback_url)
+        and _is_absolute_https_url(github_success_url)
+        and github_app_slug
+    )
+    canvas_integrations = os.getenv('ENABLE_CANVAS_INTEGRATIONS')
+    if canvas_integrations is None:
+        enable_canvas_integrations = (
+            get_deployment_mode() == 'self_hosted' or github_oauth_configured
+        )
+    else:
+        enable_canvas_integrations = canvas_integrations == 'true'
+
     return WebClientFeatureFlags(
         enable_billing=os.getenv('ENABLE_BILLING', 'false') == 'true',
         hide_llm_settings=os.getenv('HIDE_LLM_SETTINGS', 'false') == 'true',
@@ -195,6 +221,13 @@ def _get_feature_flags() -> WebClientFeatureFlags:
         enable_acp=os.getenv('ENABLE_ACP', 'true') == 'true',
         enable_onboarding=os.getenv('OH_ENABLE_ONBOARDING', 'false') == 'true',
         enable_automations=os.getenv('ENABLE_AUTOMATIONS', 'true') == 'true',
+        enable_canvas_integrations=enable_canvas_integrations,
+        enable_oauth_v2_login=github_oauth_configured,
+        github_app_install_url=(
+            f'https://github.com/apps/{github_app_slug}/installations/new'
+            if github_oauth_configured
+            else None
+        ),
     )
 
 
@@ -245,10 +278,10 @@ class DefaultWebClientConfigInjector(WebClientConfigInjector):
                 key=provider.key,
                 display_name=provider.display_name,
                 default_command=list(provider.default_command),
-                default_model=provider.default_model or None,
+                default_model=getattr(provider, 'default_model', None),
                 available_models=[
                     ACPModelOption(id=m.id, label=m.label)
-                    for m in (provider.available_models or [])
+                    for m in (getattr(provider, 'available_models', None) or [])
                 ],
                 api_key_env_var=provider.api_key_env_var,
                 base_url_env_var=provider.base_url_env_var,

@@ -114,8 +114,10 @@ def test_file_backed_secret_and_scope_contract(tmp_path, monkeypatch):
 def test_sdk_scope_list_shape_and_private_alias_are_canonicalized():
     request = HindsightReadRequest.model_validate(
         {
+            'identity': 'signed-identity',
             'conversation_id': 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa',
             'query': 'memory',
+            'max_tokens': 1024,
             'scope': [
                 {'type': 'private_user', 'id': PRINCIPAL.authority_id},
                 {'type': 'server', 'id': 'halo-ppe'},
@@ -304,6 +306,36 @@ def test_organization_requires_openhands_rbac_permission_and_selection():
     assert exc_info.value.status_code == 403
 
 
+def test_organization_scope_requires_repository_allowlist():
+    bindings = HindsightScopeBindings(
+        organizations={
+            'halo-studios': HindsightOrganizationBinding(
+                display_name='Halo Studios',
+                kind='shared',
+            )
+        },
+        repositories={
+            'github:other/repository': HindsightRepositoryScopeBinding(
+                organization_ids=['halo-studios']
+            )
+        },
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        resolve_scope(
+            HindsightScopeRequest(
+                type=HindsightScopeKind.ORGANIZATION, id='halo-studios'
+            ),
+            PRINCIPAL,
+            'sandbox-1',
+            'OpenHands/sandbox-server',
+            'github',
+            scope_bindings=bindings,
+        )
+
+    assert exc_info.value.status_code == 403
+
+
 def test_event_id_is_deterministic_and_bound_to_content():
     scope = resolve_scope(
         HindsightScopeRequest(kind=HindsightScopeKind.WORKSPACE),
@@ -452,9 +484,9 @@ async def test_recall_preserves_required_provenance(session_maker):
     assert memories[0].source_event_id == 'event-1'
     assert memories[0].source_conversation_id == 'conversation-1'
     assert memories[0].date is not None
-    assert memories[0].scope == scope
+    assert memories[0].scope == (scope,)
+    assert memories[0].relevance == 0.75
     assert memories[0].uncertainty == 0.25
-    assert memories[0].untrusted is True
 
 
 @pytest.mark.asyncio
@@ -497,8 +529,8 @@ async def test_reflect_preserves_evidence_provenance(session_maker):
     assert text == 'A synthesized answer'
     assert sources[0].source_memory_id == 'memory-1'
     assert sources[0].source_event_id == 'event-1'
-    assert sources[0].scope == scope
-    assert sources[0].untrusted is True
+    assert sources[0].scope == (scope,)
+    assert sources[0].relevance == 0.0
 
 
 @pytest.mark.asyncio

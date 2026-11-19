@@ -37,11 +37,18 @@ class PresetSandboxSpecService(SandboxSpecService):
 
         return SandboxSpecInfoPage(items=paginated_specs, next_page_id=next_page_id)
 
-    async def get_sandbox_spec(self, sandbox_spec_id: str) -> SandboxSpecInfo | None:
+    async def get_sandbox_spec(
+        self, sandbox_spec_id: str, include_unavailable: bool = False
+    ) -> SandboxSpecInfo | None:
         """Get a single sandbox spec by ID, returning None if not found."""
         for spec in self.specs:
             if spec.id == sandbox_spec_id:
-                return spec
+                if include_unavailable or (
+                    spec.enabled
+                    and spec.published
+                    and spec.availability.value == 'available'
+                ):
+                    return spec
         return None
 
     async def get_default_sandbox_spec(self) -> SandboxSpecInfo:

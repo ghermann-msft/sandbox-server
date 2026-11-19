@@ -15,11 +15,23 @@ from openhands.app_server.integrations.provider import (
     ProviderType,
 )
 from openhands.app_server.integrations.service_types import UserGitInfo
+from openhands.app_server.organization.agent_profile_service import (
+    OrganizationAgentProfileService,
+)
+from openhands.app_server.organization.connection_service import (
+    OrganizationConnectionService,
+)
+from openhands.app_server.organization.organization_models import (
+    ORGANIZATION_ID_HEADER,
+    AuthenticationIdentity,
+)
+from openhands.app_server.organization.profile_service import OrganizationProfileService
 from openhands.app_server.services.injector import InjectorState
 from openhands.app_server.user.specifiy_user_context import USER_CONTEXT_ATTR
 from openhands.app_server.user.user_context import UserContext, UserContextInjector
 from openhands.app_server.user.user_models import UserInfo
 from openhands.app_server.user_auth.user_auth import UserAuth, get_user_auth
+from openhands.sdk.profiles import resolve_agent_profile as resolve_profile_settings
 from openhands.sdk.secret import SecretSource, StaticSecret
 
 USER_AUTH_ATTR = 'user_auth'
@@ -32,6 +44,7 @@ class AuthUserContext(UserContext):
     this to use true database asyncio."""
 
     user_auth: UserAuth
+    requested_org_id: UUID | None = None
     _user_info: UserInfo | None = None
     _resolved_user_info: UserInfo | None = None
     _provider_handler: ProviderHandler | None = None
@@ -67,24 +80,111 @@ class AuthUserContext(UserContext):
                 resolve_agent_profile=True,
                 override_agent_profile_id=override_agent_profile_id,
             )
-            return self._user_info_from_settings(user_id, settings)
+            override_user_info = self._user_info_from_settings(user_id, settings)
+            return await self._with_organization_settings(
+                override_user_info,
+                resolve_agent_profile=True,
+                override_agent_profile_id=override_agent_profile_id,
+            )
         if resolve_agent_profile:
-            user_info = self._resolved_user_info
-            if user_info is None:
+            resolved_user_info = self._resolved_user_info
+            if resolved_user_info is None:
                 user_id = await self.get_user_id()
                 settings = await self.user_auth.get_user_settings(
                     resolve_agent_profile=True
                 )
-                user_info = self._user_info_from_settings(user_id, settings)
-                self._resolved_user_info = user_info
-            return user_info
-        user_info = self._user_info
-        if user_info is None:
+                resolved_user_info = self._user_info_from_settings(user_id, settings)
+                self._resolved_user_info = resolved_user_info
+            return await self._with_organization_settings(
+                resolved_user_info,
+                resolve_agent_profile=True,
+            )
+        cached_user_info = self._user_info
+        if cached_user_info is None:
             user_id = await self.get_user_id()
             settings = await self.user_auth.get_user_settings()
-            user_info = self._user_info_from_settings(user_id, settings)
-            self._user_info = user_info
-        return user_info
+            cached_user_info = self._user_info_from_settings(user_id, settings)
+            self._user_info = cached_user_info
+        return await self._with_organization_settings(cached_user_info)
+
+    async def _with_organization_settings(
+        self,
+        user_info: UserInfo,
+        *,
+        resolve_agent_profile: bool = False,
+        override_agent_profile_id: str | None = None,
+    ) -> UserInfo:
+        organization_id = await self.get_effective_org_id()
+        if organization_id is None:
+            return user_info
+        from openhands.app_server.config import get_global_config
+
+        config = get_global_config()
+        session_maker = await config.db_session.get_async_session_maker()
+        assert config.jwt is not None
+        async with session_maker() as session:
+            service = OrganizationConnectionService(
+                session, self, config.jwt.get_jwt_service()
+            )
+            organization_mcp = await service.mcp_servers(organization_id)
+            organization_profiles = await OrganizationProfileService(
+                session, self, config.jwt.get_jwt_service()
+            ).load(organization_id, shared_required=False)
+            agent_profiles = await OrganizationAgentProfileService(session, self).load(
+                organization_id
+            )
+            await session.commit()
+        merged_mcp = dict(user_info.agent_settings.mcp_config)
+        merged_mcp.update(organization_mcp)
+        agent_updates: dict[str, Any] = {'mcp_config': merged_mcp}
+        if organization_profiles.active is not None:
+            agent_updates['llm'] = organization_profiles.require(
+                organization_profiles.active
+            )
+        llm_profiles = (
+            organization_profiles
+            if organization_profiles.profiles
+            else user_info.llm_profiles
+        )
+        effective_user = user_info.model_copy(
+            update={
+                'agent_settings': user_info.agent_settings.model_copy(
+                    update=agent_updates
+                ),
+                'llm_profiles': llm_profiles,
+            }
+        )
+        if not resolve_agent_profile:
+            return effective_user
+
+        profile_id = override_agent_profile_id or agent_profiles.active
+        if profile_id is None:
+            return effective_user
+        profile = agent_profiles.profiles.get(profile_id)
+        if profile is None:
+            raise ValueError(f'Agent profile id {profile_id!r} not found')
+
+        class _LLMProfileLoader:
+            def load(self, name: str, cipher: Any = None):
+                del cipher
+                llm = llm_profiles.get(name)
+                if llm is None:
+                    raise FileNotFoundError(name)
+                return llm
+
+        resolved_settings = resolve_profile_settings(
+            profile,
+            llm_store=_LLMProfileLoader(),
+            mcp_config=effective_user.agent_settings.mcp_config,
+            available_skills=None,
+        )
+        return effective_user.model_copy(
+            update={
+                'agent_settings': resolved_settings,
+                'active_agent_profile_id': str(profile.id),
+                'active_agent_profile_revision': profile.revision,
+            }
+        )
 
     async def get_provider_tokens(
         self, as_env_vars: bool = False
@@ -98,6 +198,22 @@ class AuthUserContext(UserContext):
                 return the raw ``dict[ProviderType, ProviderToken]``.
         """
         provider_tokens = await self.user_auth.get_provider_tokens()
+        organization_id = await self.get_effective_org_id()
+        if organization_id is not None:
+            from openhands.app_server.config import get_global_config
+
+            config = get_global_config()
+            session_maker = await config.db_session.get_async_session_maker()
+            assert config.jwt is not None
+            async with session_maker() as session:
+                github_token = await OrganizationConnectionService(
+                    session, self, config.jwt.get_jwt_service()
+                ).github_token(organization_id)
+                await session.commit()
+            if github_token is not None:
+                merged_tokens = dict(provider_tokens or {})
+                merged_tokens[ProviderType.GITHUB] = github_token
+                provider_tokens = MappingProxyType(merged_tokens)
         if not as_env_vars:
             return provider_tokens
         results: dict[str, str] = {}
@@ -125,7 +241,9 @@ class AuthUserContext(UserContext):
     async def get_provider_handler(self):
         provider_handler = self._provider_handler
         if not provider_handler:
-            provider_tokens = await self.user_auth.get_provider_tokens()
+            provider_tokens = cast(
+                PROVIDER_TOKEN_TYPE | None, await self.get_provider_tokens()
+            )
             assert provider_tokens is not None
             if not isinstance(provider_tokens, MappingProxyType):
                 provider_tokens = MappingProxyType(provider_tokens)
@@ -176,11 +294,16 @@ class AuthUserContext(UserContext):
     async def get_user_git_info(self) -> UserGitInfo | None:
         return await self.user_auth.get_user_git_info()
 
+    async def get_authentication_identity(self) -> AuthenticationIdentity | None:
+        return await self.user_auth.get_authentication_identity()
+
     async def get_default_sandbox_spec_id(self) -> str | None:
         user_info = await self.get_user_info()
         return user_info.default_sandbox_spec_id
 
     async def get_effective_org_id(self) -> UUID | None:
+        if self.requested_org_id is not None:
+            return self.requested_org_id
         get_effective_org_id = getattr(self.user_auth, 'get_effective_org_id', None)
         if get_effective_org_id is None:
             return None
@@ -201,7 +324,17 @@ class AuthUserContextInjector(UserContextInjector):
             if request is None:
                 raise AuthError()
             user_auth = await get_user_auth(request)
-            user_context = AuthUserContext(user_auth=user_auth)
+            requested_org_id = None
+            raw_org_id = request.headers.get(ORGANIZATION_ID_HEADER)
+            if raw_org_id:
+                try:
+                    requested_org_id = UUID(raw_org_id)
+                except ValueError as exc:
+                    raise AuthError(f'Invalid {ORGANIZATION_ID_HEADER} header') from exc
+            user_context = AuthUserContext(
+                user_auth=user_auth,
+                requested_org_id=requested_org_id,
+            )
             setattr(state, USER_CONTEXT_ATTR, user_context)
 
         yield user_context

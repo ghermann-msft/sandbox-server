@@ -35,9 +35,14 @@ from sqlalchemy import (
     Integer,
     Select,
     String,
+    Uuid,
     func,
     select,
 )
+from sqlalchemy.dialects.postgresql import insert as postgresql_insert
+from sqlalchemy.dialects.postgresql.dml import Insert as PostgreSQLInsert
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+from sqlalchemy.dialects.sqlite.dml import Insert as SQLiteInsert
 from sqlalchemy.engine import CursorResult
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import Mapped, mapped_column
@@ -54,6 +59,10 @@ from openhands.app_server.app_conversation.app_conversation_models import (
     ConversationTrigger,
 )
 from openhands.app_server.integrations.provider import ProviderType
+from openhands.app_server.organization.organization_models import (
+    OrganizationPermission,
+)
+from openhands.app_server.organization.organization_service import OrganizationService
 from openhands.app_server.services.injector import InjectorState
 from openhands.app_server.user.user_context import UserContext
 from openhands.app_server.utils.sql_utils import (
@@ -85,6 +94,10 @@ def _normalize_event_timestamp(value: datetime | None) -> datetime:
     if value.tzinfo is None:
         return value.replace(tzinfo=UTC)
     return value
+
+
+def _canonical_conversation_id(value: UUID | str) -> str:
+    return str(UUID(str(value)))
 
 
 def _combine_usage_metrics(
@@ -135,6 +148,10 @@ class StoredConversationMetadata(Base):
     conversation_id: Mapped[str] = mapped_column(
         String, primary_key=True, default=lambda: str(uuid.uuid4())
     )
+    user_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    organization_id: Mapped[UUID | None] = mapped_column(
+        Uuid, nullable=True, index=True
+    )
     selected_repository: Mapped[str | None] = mapped_column(String, nullable=True)
     selected_branch: Mapped[str | None] = mapped_column(String, nullable=True)
     git_provider: Mapped[str | None] = mapped_column(
@@ -173,6 +190,9 @@ class StoredConversationMetadata(Base):
         String, nullable=False, default='V0', index=True
     )
     sandbox_id: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
+    sandbox_spec_id: Mapped[str | None] = mapped_column(
+        String, nullable=True, index=True
+    )
     parent_conversation_id: Mapped[str | None] = mapped_column(
         String, nullable=True, index=True
     )
@@ -219,6 +239,18 @@ class SQLAppConversationInfoService(AppConversationInfoService):
 
     db_session: AsyncSession
     user_context: UserContext
+
+    async def resolve_organization_id(
+        self, requested_organization_id: UUID | None
+    ) -> UUID | None:
+        if await self.user_context.get_authentication_identity() is None:
+            return requested_organization_id
+        return await OrganizationService(
+            self.db_session, self.user_context
+        ).resolve_organization_id(
+            requested_organization_id,
+            OrganizationPermission.CONVERSATION_CREATE,
+        )
 
     async def search_app_conversation_info(
         self,
@@ -367,7 +399,7 @@ class SQLAppConversationInfoService(AppConversationInfoService):
         return query
 
     async def get_sub_conversation_ids(
-        self, parent_conversation_id: UUID
+        self, parent_conversation_id: UUID | str
     ) -> list[UUID]:
         """Get all sub-conversation IDs for a given parent conversation.
 
@@ -380,7 +412,7 @@ class SQLAppConversationInfoService(AppConversationInfoService):
         query = await self._secure_select()
         query = query.where(
             StoredConversationMetadata.parent_conversation_id
-            == str(parent_conversation_id)
+            == _canonical_conversation_id(parent_conversation_id)
         )
         result_set = await self.db_session.execute(query)
         rows = result_set.scalars().all()
@@ -395,12 +427,11 @@ class SQLAppConversationInfoService(AppConversationInfoService):
         return count or 0
 
     async def get_app_conversation_info(
-        self, conversation_id: UUID
+        self, conversation_id: UUID | str
     ) -> AppConversationInfo | None:
+        canonical_id = _canonical_conversation_id(conversation_id)
         query = await self._secure_select()
-        query = query.where(
-            StoredConversationMetadata.conversation_id == str(conversation_id)
-        )
+        query = query.where(StoredConversationMetadata.conversation_id == canonical_id)
         result_set = await self.db_session.execute(query)
         result = result_set.scalar_one_or_none()
         if result:
@@ -410,10 +441,11 @@ class SQLAppConversationInfoService(AppConversationInfoService):
         return None
 
     async def batch_get_app_conversation_info(
-        self, conversation_ids: list[UUID]
+        self, conversation_ids: list[UUID | str]
     ) -> list[AppConversationInfo | None]:
         conversation_id_strs = [
-            str(conversation_id) for conversation_id in conversation_ids
+            _canonical_conversation_id(conversation_id)
+            for conversation_id in conversation_ids
         ]
         query = await self._secure_select()
         query = query.where(
@@ -442,37 +474,21 @@ class SQLAppConversationInfoService(AppConversationInfoService):
     ) -> AppConversationInfo:
         metrics = info.metrics or MetricsSnapshot()
         usage = metrics.accumulated_token_usage or TokenUsage()
-
-        # Preserve the original creation time on update.
-        #
-        # ``save`` is an upsert (``merge`` on the primary key), and several
-        # callers rebuild an ``AppConversationInfo`` from scratch rather than
-        # mutating the loaded row (e.g. the ``on_conversation_update`` webhook,
-        # which fires on every start/pause/resume/interrupt). Those callers do
-        # not carry ``created_at`` forward, so ``AppConversationInfo`` fills it
-        # from ``default_factory=utc_now``. Without this guard the merge would
-        # overwrite the persisted ``created_at`` with "now" on every lifecycle
-        # webhook, corrupting created-at ordering and the usage/billing
-        # dashboards that bucket conversations by creation time. Look up the
-        # stored value directly by primary key (not via ``_secure_select``) so
-        # this works under the ADMIN webhook context as well.
-        created_at = info.created_at
-        existing_created_at = await self.db_session.scalar(
-            select(StoredConversationMetadata.created_at).where(
-                StoredConversationMetadata.conversation_id == str(info.id)
-            )
-        )
-        if existing_created_at is not None:
-            created_at = existing_created_at
+        conversation_id = _canonical_conversation_id(info.id)
+        organization_id = info.organization_id
+        if organization_id is None:
+            organization_id = await self.resolve_organization_id(None)
 
         stored = StoredConversationMetadata(
-            conversation_id=str(info.id),
+            conversation_id=conversation_id,
+            user_id=info.created_by_user_id,
+            organization_id=organization_id,
             selected_repository=info.selected_repository,
             selected_branch=info.selected_branch,
             git_provider=info.git_provider.value if info.git_provider else None,
             title=info.title,
             last_updated_at=info.updated_at,
-            created_at=created_at,
+            created_at=info.created_at,
             trigger=info.trigger.value if info.trigger else None,
             pr_number=info.pr_number or [],
             # Cost and token metrics
@@ -489,8 +505,9 @@ class SQLAppConversationInfoService(AppConversationInfoService):
             agent_kind=info.agent_kind,
             conversation_version='V1',
             sandbox_id=info.sandbox_id,
+            sandbox_spec_id=info.sandbox_spec_id,
             parent_conversation_id=(
-                str(info.parent_conversation_id)
+                _canonical_conversation_id(info.parent_conversation_id)
                 if info.parent_conversation_id
                 else None
             ),
@@ -498,7 +515,44 @@ class SQLAppConversationInfoService(AppConversationInfoService):
             tags=info.tags if info.tags else None,
         )
 
-        await self.db_session.merge(stored)
+        table = StoredConversationMetadata.__table__
+        values = {column.name: getattr(stored, column.name) for column in table.columns}
+        dialect_name = self.db_session.get_bind().dialect.name
+        statement: PostgreSQLInsert | SQLiteInsert
+        if dialect_name == 'postgresql':
+            statement = postgresql_insert(StoredConversationMetadata).values(**values)
+        elif dialect_name == 'sqlite':
+            statement = sqlite_insert(StoredConversationMetadata).values(**values)
+        else:
+            raise RuntimeError(
+                f'Unsupported database dialect for conversation metadata upsert: '
+                f'{dialect_name}'
+            )
+
+        excluded = statement.excluded
+        updates = {
+            column.name: getattr(excluded, column.name)
+            for column in table.columns
+            if column.name != 'conversation_id'
+        }
+        for field_name in (
+            'created_at',
+            'user_id',
+            'organization_id',
+            'sandbox_id',
+            'sandbox_spec_id',
+            'parent_conversation_id',
+        ):
+            updates[field_name] = func.coalesce(
+                getattr(table.c, field_name),
+                getattr(excluded, field_name),
+            )
+
+        statement = statement.on_conflict_do_update(
+            index_elements=[table.c.conversation_id],
+            set_=updates,
+        )
+        await self.db_session.execute(statement)
         await self.db_session.commit()
         return info
 
@@ -528,7 +582,8 @@ class SQLAppConversationInfoService(AppConversationInfoService):
         # No-op on SQLite.
         query = await self._secure_select()
         query = query.where(
-            StoredConversationMetadata.conversation_id == str(conversation_id)
+            StoredConversationMetadata.conversation_id
+            == _canonical_conversation_id(conversation_id)
         ).with_for_update()
         result = await self.db_session.execute(query)
         stored = result.scalar_one_or_none()
@@ -722,6 +777,14 @@ class SQLAppConversationInfoService(AppConversationInfoService):
                 conversation_id,
                 stack_info=True,
             )
+            try:
+                await self.db_session.rollback()
+            except Exception:
+                logger.exception(
+                    'Failed to roll back session after statistics error for '
+                    'conversation %s',
+                    conversation_id,
+                )
 
     async def update_execution_status(
         self,
@@ -736,7 +799,8 @@ class SQLAppConversationInfoService(AppConversationInfoService):
         """
         query = await self._secure_select()
         query = query.where(
-            StoredConversationMetadata.conversation_id == str(conversation_id)
+            StoredConversationMetadata.conversation_id
+            == _canonical_conversation_id(conversation_id)
         )
         result = await self.db_session.execute(query)
         stored = result.scalar_one_or_none()
@@ -756,6 +820,15 @@ class SQLAppConversationInfoService(AppConversationInfoService):
         query = select(StoredConversationMetadata).where(
             StoredConversationMetadata.conversation_version == 'V1'
         )
+        if await self.user_context.get_authentication_identity() is not None:
+            organization_id = await OrganizationService(
+                self.db_session, self.user_context
+            ).resolve_organization_id(
+                permission=OrganizationPermission.CONVERSATION_READ
+            )
+            query = query.where(
+                StoredConversationMetadata.organization_id == organization_id
+            )
         return query
 
     def _to_info(
@@ -790,8 +863,10 @@ class SQLAppConversationInfoService(AppConversationInfoService):
 
         return AppConversationInfo(
             id=UUID(stored.conversation_id),
-            created_by_user_id=None,  # User ID is now stored in ConversationMetadataSaas
+            created_by_user_id=stored.user_id,
+            organization_id=stored.organization_id,
             sandbox_id=sandbox_id,  # Use the asserted non-None value
+            sandbox_spec_id=stored.sandbox_spec_id,
             selected_repository=stored.selected_repository,
             selected_branch=stored.selected_branch,
             git_provider=(
@@ -840,7 +915,8 @@ class SQLAppConversationInfoService(AppConversationInfoService):
 
         # Build secure delete query with user context filtering
         delete_query = delete(StoredConversationMetadata).where(
-            StoredConversationMetadata.conversation_id == str(conversation_id)
+            StoredConversationMetadata.conversation_id
+            == _canonical_conversation_id(conversation_id)
         )
 
         # Execute the secure delete query

@@ -43,6 +43,10 @@ class SandboxError(OpenHandsError):
     """Error in Sandbox."""
 
 
+class SandboxStartupTimeoutError(SandboxError):
+    """A sandbox did not become ready before its configured startup deadline."""
+
+
 class SandboxDeleteRetryError(OpenHandsError):
     """The sandbox exists but its delete could not complete and was kept for retry.
 

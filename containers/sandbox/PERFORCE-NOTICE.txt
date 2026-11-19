@@ -1,0 +1,12 @@
+Perforce Software redistribution notice
+
+This image redistributes an unmodified official Linux p4 command-line client
+binary from Perforce Software, Inc. The p4 client is not part of OpenHands and
+is subject to Perforce's applicable license and download terms.
+
+Product and license information:
+https://www.perforce.com/downloads/helix-command-line-client-p4
+
+This image also includes the separately published p4-mcp-server release. Its
+upstream source and MIT license are available at:
+https://github.com/perforce/p4mcp-server

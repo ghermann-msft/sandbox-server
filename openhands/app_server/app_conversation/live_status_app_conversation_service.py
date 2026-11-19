@@ -1,11 +1,13 @@
 import asyncio
+import hashlib
 import importlib.metadata
 import io
 import json
 import logging
+import re
 import zipfile
 from collections import defaultdict
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any, AsyncGenerator, BinaryIO, Sequence, cast
@@ -13,13 +15,19 @@ from uuid import UUID, uuid4
 
 import httpx
 from fastapi import Request
-from pydantic import Field, SecretStr, TypeAdapter
+from pydantic import Field, HttpUrl, SecretStr, TypeAdapter
 
 from openhands.agent_server.models import (
     ConversationInfo,
     SendMessageRequest,
     StartConversationRequest,
     TextContent,
+)
+from openhands.app_server.app_conversation.agent_server_init_models import (
+    AgentServerHindsightMemory,
+    AgentServerInitRequest,
+    AgentServerInitStatus,
+    AgentServerMemoryScope,
 )
 from openhands.app_server.app_conversation.app_conversation_info_service import (
     AppConversationInfoService,
@@ -29,7 +37,6 @@ from openhands.app_server.app_conversation.app_conversation_models import (
     AGENT_PROFILE_ID_TAG_KEY,
     AGENT_PROFILE_REVISION_TAG_KEY,
     ARCHIVE_WORKSPACE_PATH_TAG_KEY,
-    ORGANIZATION_ID_TAG_KEY,
     AgentType,
     AppConversation,
     AppConversationInfo,
@@ -70,7 +77,7 @@ from openhands.app_server.config import (
     get_event_callback_service,
     resolve_provider_llm_base_url,
 )
-from openhands.app_server.errors import SandboxError
+from openhands.app_server.errors import SandboxError, SandboxStartupTimeoutError
 from openhands.app_server.event.event_service import EventService
 from openhands.app_server.event_callback.event_callback_models import EventCallback
 from openhands.app_server.event_callback.event_callback_service import (
@@ -85,15 +92,20 @@ from openhands.app_server.pending_messages.pending_message_service import (
     PendingMessageService,
 )
 from openhands.app_server.sandbox.docker_sandbox_service import DockerSandboxService
+from openhands.app_server.sandbox.sandbox_access import (
+    can_access_sandbox_credentials,
+)
 from openhands.app_server.sandbox.sandbox_models import (
     AGENT_SERVER,
     SandboxInfo,
     SandboxStatus,
 )
 from openhands.app_server.sandbox.sandbox_service import SandboxService
+from openhands.app_server.sandbox.sandbox_spec_models import SandboxOperatingSystem
 from openhands.app_server.sandbox.sandbox_spec_service import (
     SandboxSpecService,
     is_custom_sandbox_spec,
+    resolve_sandbox_spec,
 )
 from openhands.app_server.services.injector import InjectorState
 from openhands.app_server.services.jwt_service import JwtService
@@ -132,7 +144,12 @@ from openhands.sdk.plugin import PluginSource
 from openhands.sdk.secret import LookupSecret, StaticSecret
 from openhands.sdk.settings import ACPAgentSettings
 from openhands.sdk.subagent import get_registered_agent_definitions
+from openhands.sdk.tool import SUB_AGENT_TOOL_NAME
 from openhands.sdk.tool.builtins import SwitchLLMTool
+from openhands.sdk.tool.defaults import (
+    launch_tool_specs,  # type: ignore[attr-defined]
+    selects_tool,  # type: ignore[attr-defined]
+)
 from openhands.sdk.utils.redact import (
     redact_api_key_literals,
     redact_text_secrets,
@@ -140,7 +157,6 @@ from openhands.sdk.utils.redact import (
 )
 from openhands.sdk.workspace.remote.async_remote_workspace import AsyncRemoteWorkspace
 from openhands.tools.preset.default import (
-    get_default_tools,
     register_builtins_agents,
 )
 from openhands.tools.preset.planning import (
@@ -152,6 +168,41 @@ _conversation_info_type_adapter = TypeAdapter(list[ConversationInfo | None])
 _logger = logging.getLogger(__name__)
 
 _EXPORT_LOCK_KEY_PREFIX = 'app_conversation_export'
+_PERFORCE_SECRET_ENV_VARS = ('P4PORT', 'P4USER', 'P4PASSWD')
+_SECRET_REFERENCE_PATTERN = re.compile(r'^\$\{[A-Za-z_][A-Za-z0-9_]*\}$')
+
+
+def should_forward_provider_token_to_acp(
+    agent_settings: Any, provider_type: ProviderType
+) -> bool:
+    """Copilot ACP authentication comes only from its explicit PAT secret."""
+
+    return not (
+        isinstance(agent_settings, ACPAgentSettings)
+        and agent_settings.acp_server == 'copilot-cli'
+        and provider_type == ProviderType.GITHUB
+    )
+
+
+async def add_acp_provider_token_secrets(
+    agent_settings: Any,
+    secrets: dict[str, Any],
+    provider_tokens: PROVIDER_TOKEN_TYPE | None,
+    get_latest_token: Callable[[ProviderType], Awaitable[str | None]],
+) -> None:
+    if not provider_tokens:
+        return
+    for provider_type, provider_token in provider_tokens.items():
+        if not provider_token.token or not should_forward_provider_token_to_acp(
+            agent_settings, provider_type
+        ):
+            continue
+        static_token = await get_latest_token(provider_type)
+        if static_token:
+            secrets[f'{provider_type.name}_TOKEN'] = StaticSecret(
+                value=SecretStr(static_token),
+                description=f'{provider_type.name} authentication token',
+            )
 
 
 def _resolve_title_llm_profile(user: UserInfo) -> str | None:
@@ -239,6 +290,56 @@ def append_system_context(existing: str | None, block: str) -> str:
     return f'{existing.rstrip()}\n\n{block}'
 
 
+def _perforce_mcp_secret_name(server_name: str, env_name: str) -> str:
+    slug = re.sub(r'[^A-Za-z0-9_]', '_', server_name).upper().strip('_')
+    slug = slug[:48] or 'SERVER'
+    digest = hashlib.sha256(server_name.encode('utf-8')).hexdigest().upper()
+    return f'OH_MCP_{slug}_{digest}_{env_name}'
+
+
+def bridge_perforce_mcp_secrets(
+    mcp_servers: Mapping[str, MCPServer],
+) -> tuple[dict[str, MCPServer], dict[str, StaticSecret]]:
+    """Move Perforce stdio credentials into per-server conversation secrets."""
+    rewritten_servers: dict[str, MCPServer] = {}
+    secrets: dict[str, StaticSecret] = {}
+
+    for server_name, server in mcp_servers.items():
+        env = getattr(server, 'env', None)
+        if not env:
+            rewritten_servers[server_name] = server
+            continue
+
+        rewritten_env = dict(env)
+        changed = False
+        for env_name in _PERFORCE_SECRET_ENV_VARS:
+            value = env.get(env_name)
+            if value is None:
+                continue
+
+            raw_value = (
+                value.get_secret_value()
+                if hasattr(value, 'get_secret_value')
+                else str(value)
+            )
+            if _SECRET_REFERENCE_PATTERN.fullmatch(raw_value):
+                continue
+
+            secret_name = _perforce_mcp_secret_name(server_name, env_name)
+            secrets[secret_name] = StaticSecret(
+                value=SecretStr(raw_value),
+                description=f'{env_name} for MCP server {server_name}',
+            )
+            rewritten_env[env_name] = SecretStr(f'${{{secret_name}}}')
+            changed = True
+
+        rewritten_servers[server_name] = (
+            server.model_copy(update={'env': rewritten_env}) if changed else server
+        )
+
+    return rewritten_servers, secrets
+
+
 def effective_disabled_skills(user: UserInfo) -> list[str]:
     """Union of the member-level and launched-profile-level skill deny-lists.
 
@@ -272,6 +373,7 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
     jwt_service: JwtService
     pending_message_service: PendingMessageService
     sandbox_startup_timeout: int
+    sandbox_startup_inactivity_timeout: int
     sandbox_startup_poll_frequency: int
     max_num_conversations_per_sandbox: int
     httpx_client: httpx.AsyncClient
@@ -286,6 +388,65 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
     export_lock_ttl_seconds: int = 3600
     export_lock_refresh_interval_seconds: int = 30
     export_lock_required: bool | None = None
+
+    async def resume_sandbox(self, sandbox_id: str) -> bool:
+        if not await self.sandbox_service.resume_sandbox(sandbox_id):
+            return False
+
+        conversations = (
+            await self.app_conversation_info_service.search_app_conversation_info(
+                sandbox_id__eq=sandbox_id,
+                sort_order=AppConversationSortOrder.UPDATED_AT_DESC,
+                limit=1,
+            )
+        ).items
+        if not conversations:
+            return True
+
+        async for _ in self.sandbox_service.watch_sandbox_startup(
+            sandbox_id,
+            timeout=self.sandbox_startup_timeout,
+            inactivity_timeout=min(
+                self.sandbox_startup_inactivity_timeout,
+                self.sandbox_startup_timeout,
+            ),
+            poll_interval=self.sandbox_startup_poll_frequency,
+        ):
+            pass
+
+        sandbox = await self.sandbox_service.get_sandbox(sandbox_id)
+        if sandbox is None:
+            raise SandboxError(f'Sandbox not found after resume: {sandbox_id}')
+        conversation = conversations[0]
+        sandbox_spec = await self.sandbox_spec_service.get_sandbox_spec(
+            sandbox.sandbox_spec_id,
+            include_unavailable=True,
+        )
+        if sandbox_spec is None:
+            raise SandboxError(
+                f'Execution profile not found after resume: {sandbox.sandbox_spec_id}'
+            )
+
+        initial_env = getattr(sandbox_spec, 'initial_env', {})
+        if initial_env.get('OH_DEFERRED_INIT', '').lower() == 'true':
+            await self._initialize_agent_server(
+                agent_server_url=self._get_agent_server_url(sandbox),
+                sandbox=sandbox,
+                organization_id=conversation.organization_id,
+                working_dir=conversation.tags.get(
+                    ARCHIVE_WORKSPACE_PATH_TAG_KEY,
+                    sandbox_spec.working_dir,
+                ),
+                git_provider=conversation.git_provider,
+                selected_repository=conversation.selected_repository,
+                agent_profile_id=conversation.tags.get(AGENT_PROFILE_ID_TAG_KEY),
+            )
+
+        await self._seed_sandbox_profiles(
+            self._get_agent_server_url(sandbox),
+            sandbox.session_api_key,
+        )
+        return True
 
     def _maybe_append_shallow_clone_context(
         self,
@@ -385,6 +546,12 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
     ) -> AsyncGenerator[AppConversationStartTask, None]:
         # Create and yield the start task
         user_id = await self.user_context.get_user_id()
+        organization_id = (
+            await self.app_conversation_info_service.resolve_organization_id(
+                request.organization_id
+            )
+        )
+        request.organization_id = organization_id
         # Prefer the user's email as the Laminar trace user id so traces are
         # immediately attributable in the Laminar UI instead of showing only
         # a pseudo-anonymous internal id. Falls back to ``user_id`` when no
@@ -423,15 +590,9 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
             assert sandbox is not None
             agent_server_url = self._get_agent_server_url(sandbox)
 
-            # Mirror the user's LLM profiles into the sandbox so the agent's
-            # built-in switch_llm tool can resolve them (in SaaS profiles live
-            # on the app-server, not the sandbox filesystem). Before conversation
-            # creation, so the tool is enabled; re-runs on every start/resume.
-            await self._seed_sandbox_profiles(agent_server_url, sandbox.session_api_key)
-
             # Get the working dir
             sandbox_spec = await self.sandbox_spec_service.get_sandbox_spec(
-                sandbox.sandbox_spec_id
+                sandbox.sandbox_spec_id, include_unavailable=True
             )
             assert sandbox_spec is not None
 
@@ -444,7 +605,30 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
                 sandbox_spec.working_dir,
                 sandbox_grouping_strategy,
                 conversation_id.hex,
+                getattr(
+                    sandbox_spec,
+                    'operating_system',
+                    SandboxOperatingSystem.LINUX,
+                ),
             )
+
+            initial_env = getattr(sandbox_spec, 'initial_env', {})
+            if initial_env.get('OH_DEFERRED_INIT', '').lower() == 'true':
+                await self._initialize_agent_server(
+                    agent_server_url=agent_server_url,
+                    sandbox=sandbox,
+                    organization_id=organization_id,
+                    working_dir=working_dir,
+                    git_provider=request.git_provider,
+                    selected_repository=request.selected_repository,
+                    agent_profile_id=request.agent_profile_id,
+                )
+
+            # Mirror the user's LLM profiles into the sandbox so the agent's
+            # built-in switch_llm tool can resolve them (in SaaS profiles live
+            # on the app-server, not the sandbox filesystem). Before conversation
+            # creation, so the tool is enabled; re-runs on every start/resume.
+            await self._seed_sandbox_profiles(agent_server_url, sandbox.session_api_key)
 
             # Run setup scripts
             remote_workspace = AsyncRemoteWorkspace(
@@ -483,6 +667,7 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
                     remote_workspace=remote_workspace,
                     selected_repository=request.selected_repository,
                     selected_branch=request.selected_branch,
+                    organization_id=organization_id,
                     plugins=request.plugins,
                     api_secrets=request.secrets,
                     agent_profile_id=request.agent_profile_id,
@@ -514,6 +699,8 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
             # ``StartConversationRequest``.
             if laminar_user_id:
                 body_json['user_id'] = laminar_user_id
+            if organization_id:
+                body_json['organization_id'] = str(organization_id)
             headers = (
                 {'X-Session-API-Key': sandbox.session_api_key}
                 if sandbox.session_api_key
@@ -595,13 +782,12 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
                 conversation_tags['git_provider'] = request.git_provider.value
             if request.selected_branch:
                 conversation_tags['selected_branch'] = request.selected_branch
-            if request.organization_id:
-                conversation_tags[ORGANIZATION_ID_TAG_KEY] = request.organization_id
-
             app_conversation_info = AppConversationInfo(
                 id=info.id,
+                organization_id=organization_id,
                 title=f'Conversation {info.id.hex[:5]}',
                 sandbox_id=sandbox.id,
+                sandbox_spec_id=sandbox.sandbox_spec_id,
                 created_by_user_id=user_id,
                 llm_model=llm_model,
                 agent_kind=agent_kind,
@@ -642,6 +828,7 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
             # Update the start task
             task.status = AppConversationStartTaskStatus.READY
             task.app_conversation_id = info.id
+            task.session_api_key = sandbox.session_api_key
             yield task
 
             # Process any pending messages queued while waiting for conversation
@@ -673,6 +860,14 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
             list(sandbox_id_to_conversation_ids)
         )
         sandboxes_by_id = {sandbox.id: sandbox for sandbox in sandboxes if sandbox}
+        user_id = await self.user_context.get_user_id()
+        credential_access_by_id = {
+            sandbox.id: can_access_sandbox_credentials(
+                user_id, sandbox.created_by_user_id
+            )
+            for sandbox in sandboxes
+            if sandbox
+        }
 
         # Gather the running conversations
         tasks = [
@@ -681,7 +876,9 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
                 sandbox_id_to_conversation_ids.get(sandbox.id),
             )
             for sandbox in sandboxes
-            if sandbox and sandbox.status == SandboxStatus.RUNNING
+            if sandbox
+            and sandbox.status == SandboxStatus.RUNNING
+            and credential_access_by_id.get(sandbox.id, False)
         ]
         if tasks:
             sandbox_conversation_infos = await asyncio.gather(*tasks)
@@ -701,6 +898,9 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
                     app_conversation_info,
                     sandboxes_by_id.get(app_conversation_info.sandbox_id),
                     conversation_info_by_id.get(app_conversation_info.id),
+                    credential_access_by_id.get(
+                        app_conversation_info.sandbox_id, False
+                    ),
                 )
                 if app_conversation_info
                 else None
@@ -756,6 +956,7 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
         app_conversation_info: AppConversationInfo | None,
         sandbox: SandboxInfo | None,
         conversation_info: ConversationInfo | None,
+        include_session_api_key: bool = True,
     ) -> AppConversation | None:
         if app_conversation_info is None:
             return None
@@ -776,7 +977,8 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
             )
             if conversation_url:
                 conversation_url += f'/api/conversations/{app_conversation_info.id.hex}'
-            session_api_key = sandbox.session_api_key
+            if include_session_api_key:
+                session_api_key = sandbox.session_api_key
 
         return AppConversation(
             **app_conversation_info.model_dump(),
@@ -795,7 +997,9 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
                 result[stored_conversation.sandbox_id].append(stored_conversation.id)
         return result
 
-    async def _find_running_sandbox_for_user(self) -> SandboxInfo | None:
+    async def _find_running_sandbox_for_user(
+        self, sandbox_spec_id: str
+    ) -> SandboxInfo | None:
         """Find a running sandbox for the current user based on the grouping strategy.
 
         Returns:
@@ -821,6 +1025,7 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
                     if (
                         sandbox.status == SandboxStatus.RUNNING
                         and sandbox.created_by_user_id == user_id
+                        and sandbox.sandbox_spec_id == sandbox_spec_id
                     ):
                         running_sandboxes.append(sandbox)
 
@@ -929,10 +1134,19 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
         self, task: AppConversationStartTask
     ) -> AsyncGenerator[AppConversationStartTask, None]:
         """Wait for sandbox to start and return info."""
+        created_sandbox = False
+        sandbox_spec = None
         # Get or create the sandbox
         if not task.request.sandbox_id:
+            requested_spec = await resolve_sandbox_spec(
+                task.request.sandbox_spec_id,
+                await self.user_context.get_default_sandbox_spec_id(),
+                self.sandbox_spec_service,
+                _logger,
+            )
+            task.request.sandbox_spec_id = requested_spec.id
             # First try to find a running sandbox for the current user
-            sandbox = await self._find_running_sandbox_for_user()
+            sandbox = await self._find_running_sandbox_for_user(requested_spec.id)
             if sandbox is None:
                 # No running sandbox found, start a new one
 
@@ -944,8 +1158,11 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
                 )
 
                 sandbox = await self.sandbox_service.start_sandbox(
-                    sandbox_id=sandbox_id_str
+                    sandbox_spec_id=requested_spec.id,
+                    sandbox_id=sandbox_id_str,
                 )
+                created_sandbox = True
+            sandbox_spec = requested_spec
             task.sandbox_id = sandbox.id
         else:
             sandbox_info = await self.sandbox_service.get_sandbox(
@@ -953,7 +1170,20 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
             )
             if sandbox_info is None:
                 raise SandboxError(f'Sandbox not found: {task.request.sandbox_id}')
+            if (
+                task.request.sandbox_spec_id is not None
+                and sandbox_info.sandbox_spec_id != task.request.sandbox_spec_id
+            ):
+                raise SandboxError(
+                    f'Sandbox {task.request.sandbox_id} uses execution profile '
+                    f'{sandbox_info.sandbox_spec_id!r}, not requested profile '
+                    f'{task.request.sandbox_spec_id!r}'
+                )
             sandbox = sandbox_info
+            task.request.sandbox_spec_id = sandbox.sandbox_spec_id
+            sandbox_spec = await self.sandbox_spec_service.get_sandbox_spec(
+                sandbox.sandbox_spec_id, include_unavailable=True
+            )
 
         # Update the listener with sandbox info
         task.status = AppConversationStartTaskStatus.WAITING_FOR_SANDBOX
@@ -975,25 +1205,195 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
         if sandbox.status == SandboxStatus.PAUSED:
             await self.sandbox_service.resume_sandbox(sandbox.id)
 
-        # Check for immediate error states
-        if sandbox.status in (None, SandboxStatus.ERROR):
+        # A scheduler-reported ERROR can be transient while an autoscalable node
+        # pool is provisioning. The shared wait utility distinguishes those from
+        # terminal startup failures.
+        if sandbox.status is None:
             raise SandboxError(f'Sandbox status: {sandbox.status}')
 
-        # For non-STARTING/RUNNING states (except PAUSED which we just resumed), fail fast
+        # For states the wait utility cannot resolve, fail fast.
         if sandbox.status not in (
             SandboxStatus.STARTING,
             SandboxStatus.RUNNING,
             SandboxStatus.PAUSED,
+            SandboxStatus.ERROR,
         ):
             raise SandboxError(f'Sandbox not startable: {sandbox.id}')
 
-        # Use shared wait_for_sandbox_running utility to poll for ready state
-        await self.sandbox_service.wait_for_sandbox_running(
-            sandbox.id,
-            timeout=self.sandbox_startup_timeout,
-            poll_interval=self.sandbox_startup_poll_frequency,
-            httpx_client=self.httpx_client,
+        # The profile timeout is the absolute safety ceiling. Observable runtime
+        # progress refreshes the shorter inactivity deadline.
+        startup_timeout = (
+            sandbox_spec.startup_timeout_seconds
+            if sandbox_spec is not None
+            and sandbox_spec.startup_timeout_seconds is not None
+            else self.sandbox_startup_timeout
         )
+        try:
+            async for progress in self.sandbox_service.watch_sandbox_startup(
+                sandbox.id,
+                timeout=startup_timeout,
+                inactivity_timeout=min(
+                    self.sandbox_startup_inactivity_timeout,
+                    startup_timeout,
+                ),
+                poll_interval=self.sandbox_startup_poll_frequency,
+                httpx_client=self.httpx_client,
+            ):
+                task.sandbox_startup_progress = progress
+                yield task
+        except SandboxStartupTimeoutError:
+            if created_sandbox:
+                try:
+                    deleted = await self.sandbox_service.delete_sandbox(sandbox.id)
+                    if not deleted:
+                        _logger.warning(
+                            'Timed-out sandbox %s was already absent during cleanup',
+                            sandbox.id,
+                        )
+                except Exception:
+                    _logger.exception(
+                        'Failed to clean up timed-out sandbox %s',
+                        sandbox.id,
+                        stack_info=True,
+                    )
+            raise
+
+    async def _initialize_agent_server(
+        self,
+        *,
+        agent_server_url: str,
+        sandbox: SandboxInfo,
+        organization_id: UUID | None,
+        working_dir: str,
+        git_provider: ProviderType | None,
+        selected_repository: str | None,
+        agent_profile_id: str | None,
+    ) -> None:
+        from openhands.app_server.config import get_global_config
+        from openhands.app_server.hindsight.hindsight_service import (
+            normalize_repository,
+        )
+
+        session_api_key = sandbox.session_api_key
+        if not session_api_key:
+            raise SandboxError(
+                'Deferred Agent Server initialization requires a session API key'
+            )
+
+        config = get_global_config()
+        hindsight_memory: AgentServerHindsightMemory | None = None
+        user = await self.user_context.get_user_info(
+            resolve_agent_profile=True,
+            override_agent_profile_id=agent_profile_id,
+        )
+        if config.hindsight_enabled and not isinstance(
+            user.agent_settings, ACPAgentSettings
+        ):
+            broker_url = config.hindsight_broker_url
+            deployment_id = config.hindsight_deployment_id
+            if not broker_url or not deployment_id:
+                raise SandboxError(
+                    'Hindsight requires OH_HINDSIGHT_BROKER_URL and '
+                    'OH_HINDSIGHT_DEPLOYMENT_ID'
+                )
+            if organization_id is None:
+                raise SandboxError('Hindsight requires a validated organization')
+            identity = await self.user_context.get_authentication_identity()
+            user_id = await self.user_context.get_user_id()
+            if identity is None or identity.tenant_id is None or not user_id:
+                raise SandboxError(
+                    'Hindsight requires an authenticated immutable user identity'
+                )
+
+            scopes = [
+                AgentServerMemoryScope(type='server', id=deployment_id),
+                AgentServerMemoryScope(type='organization', id=str(organization_id)),
+            ]
+            if selected_repository and git_provider:
+                scopes.append(
+                    AgentServerMemoryScope(
+                        type='repository',
+                        id=f'{git_provider.value}:{normalize_repository(selected_repository)}',
+                    )
+                )
+            scopes.extend(
+                [
+                    AgentServerMemoryScope(
+                        type='workspace',
+                        id=str(sandbox.id),
+                    ),
+                    AgentServerMemoryScope(
+                        type='private_user',
+                        id=f'{identity.tenant_id}:{identity.subject_id}',
+                    ),
+                ]
+            )
+            signed_identity = self.jwt_service.create_jws_token(
+                {
+                    'purpose': 'hindsight_memory',
+                    'user_id': user_id,
+                    'tenant_id': identity.tenant_id,
+                    'object_id': identity.subject_id,
+                    'sandbox_id': str(sandbox.id),
+                    'organization_id': str(organization_id),
+                },
+                expires_in=timedelta(days=30),
+            )
+            hindsight_memory = AgentServerHindsightMemory(
+                broker_url=HttpUrl(broker_url),
+                identity=signed_identity,
+                scope=scopes,
+            )
+
+        # Keep the Agent Server's configured OH_SECRET_KEY. Passing the
+        # per-sandbox session key here would override it and make persisted
+        # OAuth ciphertext unreadable by the next sandbox.
+        init_request = AgentServerInitRequest(
+            session_api_keys=[session_api_key],
+            hindsight_memory=hindsight_memory,
+        )
+        internal_url = await self.sandbox_service.get_sandbox_internal_url(
+            sandbox.id, AGENT_SERVER
+        )
+        init_url = f'{internal_url or agent_server_url}/api/init'
+        response = await self.httpx_client.get(
+            init_url, timeout=self.sandbox_startup_timeout
+        )
+        response.raise_for_status()
+        init_status = AgentServerInitStatus.model_validate(response.json())
+        if init_status.state == 'dormant':
+            init_api_key = await self.sandbox_service.get_sandbox_init_api_key(
+                sandbox.id
+            )
+            if not init_api_key:
+                raise SandboxError(
+                    'Deferred Agent Server initialization requires the dormant '
+                    'server bootstrap key'
+                )
+            response = await self.httpx_client.post(
+                init_url,
+                headers={'X-Init-API-Key': init_api_key},
+                json=init_request.model_dump(mode='json', exclude_none=True),
+                timeout=self.sandbox_startup_timeout,
+            )
+            response.raise_for_status()
+            init_status = AgentServerInitStatus.model_validate(response.json())
+
+        deadline = asyncio.get_running_loop().time() + self.sandbox_startup_timeout
+        while init_status.state == 'initializing':
+            if asyncio.get_running_loop().time() >= deadline:
+                raise SandboxError('Timed out waiting for Agent Server initialization')
+            await asyncio.sleep(0.25)
+            response = await self.httpx_client.get(
+                init_url, timeout=self.sandbox_startup_timeout
+            )
+            response.raise_for_status()
+            init_status = AgentServerInitStatus.model_validate(response.json())
+
+        if init_status.state != 'ready' or init_status.error:
+            raise SandboxError(
+                f'Agent Server initialization failed: {init_status.error or init_status.state}'
+            )
 
     async def _seed_sandbox_profiles(
         self, agent_server_url: str, session_api_key: str | None
@@ -1100,9 +1500,16 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
             request: The conversation start request to modify
             parent_info: The parent conversation info to inherit from
         """
-        # Inherit sandbox_id from parent to share the same workspace/environment
-        if not request.sandbox_id:
+        # Share the parent sandbox only when the caller did not explicitly select
+        # a different execution profile. A different profile requires a distinct
+        # compatible sandbox.
+        if not request.sandbox_id and (
+            not request.sandbox_spec_id
+            or request.sandbox_spec_id == parent_info.sandbox_spec_id
+        ):
             request.sandbox_id = parent_info.sandbox_id
+            if not request.sandbox_spec_id:
+                request.sandbox_spec_id = parent_info.sandbox_spec_id
 
         # Inherit git parameters from parent if not provided
         if not request.selected_repository:
@@ -1165,7 +1572,9 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
 
         return f'{working_dir}/{config_dir}/PLAN.md'
 
-    async def _setup_secrets_for_git_providers(self, user: UserInfo) -> dict:
+    async def _setup_secrets_for_git_providers(
+        self, user: UserInfo, sandbox: SandboxInfo | None = None
+    ) -> dict:
         """Set up secrets for all git provider authentication.
 
         Args:
@@ -1190,8 +1599,21 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
                 secret_name = f'{provider_type.name}_TOKEN'
                 description = f'{provider_type.name} authentication token'
 
-                if self.web_url:
-                    # Create an access token for web-based authentication
+                control_plane_url = self.sandbox_service.get_control_plane_base_url()
+                if (
+                    control_plane_url
+                    and sandbox is not None
+                    and sandbox.session_api_key
+                ):
+                    secrets[secret_name] = LookupSecret(
+                        url=(
+                            f'{control_plane_url.rstrip("/")}/api/v1/sandboxes/'
+                            f'{sandbox.id}/settings/secrets/{secret_name}'
+                        ),
+                        headers={'X-Session-API-Key': sandbox.session_api_key},
+                        description=description,
+                    )
+                elif self.web_url:
                     access_token = self.jwt_service.create_jws_token(
                         payload={
                             'user_id': user.id,
@@ -1199,14 +1621,12 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
                         },
                         expires_in=self.access_token_hard_timeout,
                     )
-                    headers = {'X-Access-Token': access_token}
-
                     secrets[secret_name] = LookupSecret(
                         url=self.web_url + '/api/v1/webhooks/secrets',
-                        headers=headers,
+                        headers={'X-Access-Token': access_token},
                         description=description,
                     )
-                else:
+                elif not self.web_url:
                     # Use static token for environments without web URL access
                     static_token = await self.user_context.get_latest_token(
                         provider_type
@@ -1221,6 +1641,7 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
     async def _setup_conversation_secrets(
         self,
         user: UserInfo,
+        sandbox: SandboxInfo,
         trigger: ConversationTrigger | None,
         system_message_suffix: str | None,
     ) -> tuple[dict, str | None]:
@@ -1234,7 +1655,7 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
         Returns:
             Tuple of secrets and updated system message suffix.
         """
-        secrets = await self._setup_secrets_for_git_providers(user)
+        secrets = await self._setup_secrets_for_git_providers(user, sandbox)
 
         enrichment = await self.conversation_secret_enricher.enrich(
             user_context=self.user_context,
@@ -1895,6 +2316,7 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
         remote_workspace: AsyncRemoteWorkspace | None = None,
         selected_repository: str | None = None,
         selected_branch: str | None = None,
+        organization_id: UUID | None = None,
         plugins: list[PluginSpec] | None = None,
         api_secrets: dict[str, SecretStr] | None = None,
         agent_profile_id: str | None = None,
@@ -1987,6 +2409,7 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
                 git_provider=git_provider,
                 selected_repository=selected_repository,
                 selected_branch=selected_branch,
+                organization_id=organization_id,
                 remote_workspace=remote_workspace,
                 plugins=plugins,
                 api_secrets=api_secrets,
@@ -2014,6 +2437,7 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
         # Start with secrets from git providers and database
         secrets, system_message_suffix = await self._setup_conversation_secrets(
             user,
+            sandbox,
             trigger,
             system_message_suffix,
         )
@@ -2045,6 +2469,7 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
         llm, mcp_config = await self._configure_llm_and_mcp(
             user, llm_model, conversation_id
         )
+        mcp_config, mcp_secrets = bridge_perforce_mcp_secrets(mcp_config)
 
         # --- system_message_suffix (planning-agent prefix) ------------------
         effective_suffix = system_message_suffix
@@ -2074,11 +2499,11 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
             tools = get_planning_tools(plan_path=plan_path)
         else:
             register_builtins_agents(enable_browser=True)
-            tools = get_default_tools(
-                enable_browser=True,
-                enable_sub_agents=user.agent_settings.enable_sub_agents,
+            tools = launch_tool_specs(
+                user.agent_settings.tools,
+                browser_available=True,
             )
-            if user.agent_settings.enable_sub_agents:
+            if selects_tool(tools, SUB_AGENT_TOOL_NAME):
                 agent_definitions = list(get_registered_agent_definitions())
 
         # --- build AgentSettings and create agent ---------------------------
@@ -2213,7 +2638,12 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
             self._extend_observability_tags(
                 observability_tags, request_observability_tags
             )
-        create_kwargs: dict[str, Any] = {'agent': agent, 'user_id': laminar_user_id}
+        create_kwargs: dict[str, Any] = {
+            'agent': agent,
+            'user_id': laminar_user_id,
+            'organization_id': str(organization_id) if organization_id else None,
+            'secrets': {**secrets, **mcp_secrets},
+        }
         title_llm_profile = _resolve_title_llm_profile(user)
         if title_llm_profile:
             create_kwargs['title_llm_profile'] = title_llm_profile
@@ -2310,6 +2740,7 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
         git_provider: ProviderType | None = None,
         selected_repository: str | None = None,
         selected_branch: str | None = None,
+        organization_id: UUID | None = None,
         remote_workspace: AsyncRemoteWorkspace | None = None,
         plugins: list[PluginSpec] | None = None,
         api_secrets: dict[str, SecretStr] | None = None,
@@ -2368,18 +2799,12 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
             PROVIDER_TOKEN_TYPE | None,
             await self.user_context.get_provider_tokens(),
         )
-        if provider_tokens:
-            for provider_type, provider_token in provider_tokens.items():
-                if not provider_token.token:
-                    continue
-                secret_name = f'{provider_type.name}_TOKEN'
-                static_token = await self.user_context.get_latest_token(provider_type)
-                if static_token:
-                    secrets[secret_name] = StaticSecret(
-                        value=SecretStr(static_token),
-                        description=f'{provider_type.name} authentication token',
-                    )
-
+        await add_acp_provider_token_secrets(
+            user.agent_settings,
+            secrets,
+            provider_tokens,
+            self.user_context.get_latest_token,
+        )
         enrichment = await self.conversation_secret_enricher.enrich(
             user_context=self.user_context,
             user=user,
@@ -2423,13 +2848,8 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
         # Isolate the CLI data dir onto the durable /workspace tree so the SDK
         # self-resumes the provider session (session/load from base_state.json)
         # across pause/resume — matching the regular-agent lifecycle (#1274).
-        # Strip llm.api_key/base_url to prevent proxy settings from leaking
-        # into the subprocess env (ACP CLIs handle their own LLM calls).
         settings_update: dict[str, Any] = {
             'acp_isolate_data_dir': True,
-            'llm': acp_settings.llm.model_copy(
-                update={'api_key': None, 'base_url': None}
-            ),
         }
         # Forward the resolved profile's / user's custom MCP servers to the ACP
         # subprocess (#15044 §7). Only custom servers — the system OpenHands MCP
@@ -2437,6 +2857,8 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
         # ACP CLI, so it is intentionally not injected here.
         acp_mcp_servers: dict[str, MCPServer] = {}
         self._merge_custom_mcp_config(acp_mcp_servers, user)
+        acp_mcp_servers, mcp_secrets = bridge_perforce_mcp_secrets(acp_mcp_servers)
+        secrets.update(mcp_secrets)
         if acp_mcp_servers:
             settings_update['mcp_config'] = acp_mcp_servers
         if system_message_suffix:
@@ -2500,6 +2922,7 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
         create_kwargs: dict[str, Any] = {
             'agent': acp_agent,
             'user_id': laminar_user_id,
+            'organization_id': str(organization_id) if organization_id else None,
             'secrets': secrets,
         }
         title_llm_profile = _resolve_title_llm_profile(user)
@@ -3033,7 +3456,20 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
 
 class LiveStatusAppConversationServiceInjector(AppConversationServiceInjector):
     sandbox_startup_timeout: int = Field(
-        default=120, description='The max timeout time for sandbox startup'
+        default=120,
+        gt=0,
+        description=(
+            'Legacy absolute sandbox startup safety limit when the selected '
+            'execution profile has no startup_timeout_seconds'
+        ),
+    )
+    sandbox_startup_inactivity_timeout: int = Field(
+        default=120,
+        gt=0,
+        description=(
+            'Maximum seconds without verifiable sandbox startup progress before '
+            'the start fails'
+        ),
     )
     sandbox_startup_poll_frequency: int = Field(
         default=2, description='The frequency to poll for sandbox readiness'
@@ -3148,6 +3584,9 @@ class LiveStatusAppConversationServiceInjector(AppConversationServiceInjector):
                 jwt_service=jwt_service,
                 pending_message_service=pending_message_service,
                 sandbox_startup_timeout=self.sandbox_startup_timeout,
+                sandbox_startup_inactivity_timeout=(
+                    self.sandbox_startup_inactivity_timeout
+                ),
                 sandbox_startup_poll_frequency=self.sandbox_startup_poll_frequency,
                 max_num_conversations_per_sandbox=self.max_num_conversations_per_sandbox,
                 httpx_client=httpx_client,

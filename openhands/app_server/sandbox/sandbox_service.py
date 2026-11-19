@@ -2,15 +2,21 @@ import asyncio
 import logging
 import time
 from abc import ABC, abstractmethod
+from collections.abc import AsyncGenerator
+from dataclasses import dataclass
 
 import httpx
 
-from openhands.app_server.errors import SandboxError
+from openhands.agent_server.utils import utc_now
+from openhands.app_server.errors import SandboxError, SandboxStartupTimeoutError
 from openhands.app_server.sandbox.sandbox_models import (
     AGENT_SERVER,
     SandboxInfo,
     SandboxPage,
     SandboxRecord,
+    SandboxStartupPhase,
+    SandboxStartupProgress,
+    SandboxStartupProgressStatus,
     SandboxStatus,
 )
 from openhands.app_server.services.injector import Injector
@@ -39,6 +45,7 @@ _CAPACITY_MARKERS = (
     'Insufficient pods',
 )
 _IMAGE_PULL_MARKERS = ('ImagePullBackOff', 'ErrImagePull')
+_STORAGE_MARKERS = ('FailedAttachVolume', 'FailedMount', 'ProvisioningFailed')
 # Deterministic placement failures -- retrying won't help. Substrings match the
 # scheduler's predicate messages without echoing specific taint/label values.
 _SCHEDULING_MARKERS = (
@@ -53,6 +60,36 @@ _SCHEDULING_MARKERS = (
 _GENERIC_START_FAILURE = (
     'The sandbox failed to start for an unexpected reason. Please try again.'
 )
+_STARTUP_PHASE_MESSAGES = {
+    SandboxStartupPhase.WAITING_FOR_CAPACITY: (
+        'Waiting for cluster capacity. The autoscaler may add a node.'
+    ),
+    SandboxStartupPhase.PROVISIONING_NODE: (
+        'The cluster autoscaler is provisioning capacity.'
+    ),
+    SandboxStartupPhase.SCHEDULING: 'Scheduling the sandbox onto a node.',
+    SandboxStartupPhase.PROVISIONING_STORAGE: (
+        'Provisioning and attaching sandbox storage.'
+    ),
+    SandboxStartupPhase.PULLING_IMAGE: 'Pulling the sandbox runtime image.',
+    SandboxStartupPhase.STARTING_CONTAINER: 'Starting the sandbox container.',
+    SandboxStartupPhase.WAITING_FOR_AGENT_SERVER: (
+        'Waiting for the Agent Server to become ready.'
+    ),
+    SandboxStartupPhase.READY: 'The sandbox is ready.',
+    SandboxStartupPhase.FAILED: 'The sandbox failed to start.',
+}
+
+
+@dataclass(frozen=True)
+class SandboxStartupObservation:
+    progress: SandboxStartupProgress
+    progress_key: str
+    failure_detail: str | None = None
+
+
+def _monotonic() -> float:
+    return time.monotonic()
 
 
 def _classify_start_failure(detail: str | None) -> str | None:
@@ -80,6 +117,11 @@ def _classify_start_failure(detail: str | None) -> str | None:
         return (
             'The sandbox container could not be created, possibly due to an '
             'invalid mount, device, or startup command.'
+        )
+    if any(marker in detail for marker in _STORAGE_MARKERS):
+        return (
+            'The sandbox storage could not be provisioned or mounted. Check the '
+            'workspace storage class and durable volume configuration.'
         )
     resource = next((m for m in _CAPACITY_MARKERS if m in detail), None)
     if resource:
@@ -112,6 +154,10 @@ def _start_failure_error(sandbox_id: str, detail: str | None) -> SandboxError:
 class SandboxService(ABC):
     """Service for accessing sandboxes in which conversations may be run."""
 
+    def get_control_plane_base_url(self) -> str | None:
+        """Return a runtime-reachable app-server base URL, when available."""
+        return None
+
     @abstractmethod
     async def search_sandboxes(
         self,
@@ -123,6 +169,21 @@ class SandboxService(ABC):
     @abstractmethod
     async def get_sandbox(self, sandbox_id: str) -> SandboxInfo | None:
         """Get a single sandbox. Return None if the sandbox was not found."""
+
+    async def get_sandbox_init_api_key(self, sandbox_id: str) -> str | None:
+        """Return the immutable bootstrap key for deferred initialization.
+
+        Backends that support deferred initialization must return the exact
+        secret configured on the dormant Agent Server. The key is intentionally
+        kept out of ``SandboxInfo`` so it cannot be exposed through sandbox APIs.
+        """
+        return None
+
+    async def get_sandbox_internal_url(
+        self, sandbox_id: str, service_name: str
+    ) -> str | None:
+        """Return a control-plane-only URL for a service, when available."""
+        return None
 
     @abstractmethod
     async def get_sandbox_by_session_api_key(
@@ -178,61 +239,203 @@ class SandboxService(ABC):
         timeout: int = 120,
         poll_interval: int = 2,
         httpx_client: httpx.AsyncClient | None = None,
+        inactivity_timeout: int = 120,
     ) -> SandboxInfo:
-        """Wait for a sandbox to reach RUNNING status with an alive agent server.
+        """Wait for a sandbox with progress-aware inactivity and absolute limits."""
+        sandbox = None
+        async for _ in self.watch_sandbox_startup(
+            sandbox_id,
+            timeout=timeout,
+            inactivity_timeout=inactivity_timeout,
+            poll_interval=poll_interval,
+            httpx_client=httpx_client,
+        ):
+            sandbox = await self.get_sandbox(sandbox_id)
+        if sandbox is None:
+            sandbox = await self.get_sandbox(sandbox_id)
+        if sandbox is None:
+            raise SandboxError(f'Sandbox not found: {sandbox_id}')
+        return sandbox
 
-        This method polls the sandbox status until it reaches RUNNING state and
-        optionally verifies the agent server is responding to health checks.
+    async def get_sandbox_startup_observation(
+        self, sandbox_id: str
+    ) -> SandboxStartupObservation:
+        """Return a sanitized startup observation.
 
-        Args:
-            sandbox_id: The sandbox ID to wait for
-            timeout: Maximum time to wait in seconds (default: 120)
-            poll_interval: Time between status checks in seconds (default: 2)
-            httpx_client: Optional httpx client for agent server health checks.
-                If provided, will verify the agent server /alive endpoint responds
-                before returning.
-
-        Returns:
-            SandboxInfo with RUNNING status and verified agent server
-
-        Raises:
-            SandboxError: If sandbox not found, enters ERROR state, or times out
+        Runtime-specific services should override this to expose authoritative
+        scheduling, storage, image, and container phases.
         """
-        start = time.time()
-        sandbox: SandboxInfo | None = None
-        while time.time() - start <= timeout:
+        sandbox = await self.get_sandbox(sandbox_id)
+        if sandbox is None:
+            raise SandboxError(f'Sandbox not found: {sandbox_id}')
+        now = utc_now()
+        if sandbox.status == SandboxStatus.RUNNING:
+            phase = SandboxStartupPhase.READY
+            status = SandboxStartupProgressStatus.READY
+            reason = 'SANDBOX_RUNNING'
+        elif sandbox.status == SandboxStatus.ERROR:
+            phase = SandboxStartupPhase.FAILED
+            status = SandboxStartupProgressStatus.FAILED
+            reason = 'SANDBOX_ERROR'
+        else:
+            phase = SandboxStartupPhase.WAITING_FOR_AGENT_SERVER
+            status = SandboxStartupProgressStatus.PROGRESSING
+            reason = 'SANDBOX_STARTING'
+        return SandboxStartupObservation(
+            progress=SandboxStartupProgress(
+                phase=phase,
+                status=status,
+                message=_STARTUP_PHASE_MESSAGES[phase],
+                reason=reason,
+                started_at=now,
+                updated_at=now,
+                phase_started_at=now,
+                elapsed_seconds=0,
+                phase_elapsed_seconds=0,
+                inactivity_seconds=0,
+            ),
+            progress_key=f'{phase.value}:{sandbox.status_detail or ""}',
+            failure_detail=sandbox.status_detail,
+        )
+
+    async def watch_sandbox_startup(
+        self,
+        sandbox_id: str,
+        timeout: int = 120,
+        inactivity_timeout: int = 120,
+        poll_interval: int = 2,
+        httpx_client: httpx.AsyncClient | None = None,
+    ) -> AsyncGenerator[SandboxStartupProgress, None]:
+        """Yield meaningful startup progress until ready or a safe terminal error.
+
+        ``timeout`` is the bounded absolute safety ceiling. The inactivity
+        deadline refreshes only when the runtime's progress key changes.
+        """
+        started_monotonic = _monotonic()
+        last_progress_monotonic = started_monotonic
+        started_at = utc_now()
+        phase_started_at = started_at
+        phase_started_monotonic = started_monotonic
+        previous_key: str | None = None
+        previous_phase: SandboxStartupPhase | None = None
+
+        while True:
+            observation = await self.get_sandbox_startup_observation(sandbox_id)
+            progress = observation.progress
+            progress_key = observation.progress_key
+            failure_detail = observation.failure_detail
             sandbox = await self.get_sandbox(sandbox_id)
             if sandbox is None:
                 raise SandboxError(f'Sandbox not found: {sandbox_id}')
 
-            if sandbox.status == SandboxStatus.ERROR:
-                _logger.warning(
-                    'Sandbox %s entered error state; status_detail=%r',
-                    sandbox_id,
-                    sandbox.status_detail,
+            if (
+                progress.status == SandboxStartupProgressStatus.READY
+                and httpx_client
+                and sandbox.exposed_urls
+                and not await self._check_agent_server_alive(sandbox, httpx_client)
+            ):
+                progress = progress.model_copy(
+                    update={
+                        'phase': SandboxStartupPhase.WAITING_FOR_AGENT_SERVER,
+                        'status': SandboxStartupProgressStatus.PROGRESSING,
+                        'message': _STARTUP_PHASE_MESSAGES[
+                            SandboxStartupPhase.WAITING_FOR_AGENT_SERVER
+                        ],
+                        'reason': 'AGENT_SERVER_NOT_READY',
+                    }
                 )
-                raise _start_failure_error(sandbox_id, sandbox.status_detail)
+                progress_key = 'WAITING_FOR_AGENT_SERVER'
 
-            if sandbox.status == SandboxStatus.RUNNING:
-                # Optionally verify agent server is alive to avoid race conditions
-                # where sandbox reports RUNNING but agent server isn't ready yet
-                if httpx_client and sandbox.exposed_urls:
-                    if await self._check_agent_server_alive(sandbox, httpx_client):
-                        return sandbox
-                    # Agent server not ready yet, continue polling
-                else:
-                    return sandbox
+            now_monotonic = _monotonic()
+            now = utc_now()
+            progressed = progress_key != previous_key
+            if progressed:
+                last_progress_monotonic = now_monotonic
+                previous_key = progress_key
+                if progress.phase != previous_phase:
+                    phase_started_at = now
+                    phase_started_monotonic = now_monotonic
+                    previous_phase = progress.phase
+            progress = progress.model_copy(
+                update={
+                    'started_at': started_at,
+                    'updated_at': now,
+                    'phase_started_at': phase_started_at,
+                    'elapsed_seconds': int(now_monotonic - started_monotonic),
+                    'phase_elapsed_seconds': int(
+                        now_monotonic - phase_started_monotonic
+                    ),
+                    'inactivity_seconds': int(now_monotonic - last_progress_monotonic),
+                }
+            )
 
+            if progress.status == SandboxStartupProgressStatus.FAILED:
+                _logger.warning(
+                    'Sandbox %s entered terminal startup phase; detail=%r',
+                    sandbox_id,
+                    failure_detail,
+                )
+                yield progress
+                raise _start_failure_error(sandbox_id, failure_detail)
+
+            if progress.status == SandboxStartupProgressStatus.READY:
+                yield progress
+                return
+
+            elapsed = now_monotonic - started_monotonic
+            inactive = now_monotonic - last_progress_monotonic
+            if elapsed >= timeout:
+                failure = SandboxStartupProgress(
+                    **progress.model_dump(
+                        exclude={
+                            'phase',
+                            'status',
+                            'message',
+                            'reason',
+                            'phase_started_at',
+                            'phase_elapsed_seconds',
+                        }
+                    ),
+                    phase=SandboxStartupPhase.FAILED,
+                    status=SandboxStartupProgressStatus.FAILED,
+                    message=(
+                        f'The sandbox did not become ready within the {timeout}s '
+                        f'safety limit. (reference: {sandbox_id})'
+                    ),
+                    reason='STARTUP_ABSOLUTE_TIMEOUT',
+                    phase_started_at=now,
+                    phase_elapsed_seconds=0,
+                )
+                yield failure
+                raise SandboxStartupTimeoutError(failure.message)
+            if inactive >= inactivity_timeout:
+                failure = SandboxStartupProgress(
+                    **progress.model_dump(
+                        exclude={
+                            'phase',
+                            'status',
+                            'message',
+                            'reason',
+                            'phase_started_at',
+                            'phase_elapsed_seconds',
+                        }
+                    ),
+                    phase=SandboxStartupPhase.FAILED,
+                    status=SandboxStartupProgressStatus.FAILED,
+                    message=(
+                        f'No verifiable sandbox startup progress occurred for '
+                        f'{inactivity_timeout}s. (reference: {sandbox_id})'
+                    ),
+                    reason='STARTUP_INACTIVITY_TIMEOUT',
+                    phase_started_at=now,
+                    phase_elapsed_seconds=0,
+                )
+                yield failure
+                raise SandboxStartupTimeoutError(failure.message)
+
+            if progressed:
+                yield progress
             await asyncio.sleep(poll_interval)
-
-        status_detail = sandbox.status_detail if sandbox is not None else None
-        _logger.warning(
-            'Sandbox %s did not start within %ss; status_detail=%r',
-            sandbox_id,
-            timeout,
-            status_detail,
-        )
-        raise _start_failure_error(sandbox_id, status_detail)
 
     async def _check_agent_server_alive(
         self, sandbox: SandboxInfo, httpx_client: httpx.AsyncClient
@@ -250,7 +453,14 @@ class SandboxService(ABC):
         try:
             agent_server_url = self._get_agent_server_url(sandbox)
             url = f'{agent_server_url.rstrip("/")}/alive'
-            response = await httpx_client.get(url, timeout=5.0)
+            if sandbox.session_api_key:
+                response = await httpx_client.get(
+                    url,
+                    headers={'X-Session-API-Key': sandbox.session_api_key},
+                    timeout=5.0,
+                )
+            else:
+                response = await httpx_client.get(url, timeout=5.0)
             return response.is_success
         except Exception as exc:
             _logger.debug(

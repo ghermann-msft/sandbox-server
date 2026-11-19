@@ -27,9 +27,33 @@ class ServerConfig(ServerConfigInterface):
     analytics_user_provider_class: str | None = None
     enable_v1: bool = os.getenv('ENABLE_V1') != '0'
 
+    def __init__(self) -> None:
+        if os.getenv('OH_TRUSTED_IDENTITY_ASSERTION_SECRET', '').strip():
+            self.settings_store_class = (
+                'openhands.app_server.settings.sql_settings_store.SQLSettingsStore'
+            )
+            self.secret_store_class = (
+                'openhands.app_server.secrets.sql_secrets_store.SQLSecretsStore'
+            )
+            self.user_auth_class = (
+                'openhands.app_server.user_auth.trusted_identity_user_auth.'
+                'TrustedIdentityUserAuth'
+            )
+
     def verify_config(self):
         if self.config_cls:
             raise ValueError('Unexpected config path provided')
+        if os.getenv('OH_TRUSTED_IDENTITY_ASSERTION_SECRET', '').strip():
+            required = (
+                'OH_TRUSTED_IDENTITY_ASSERTION_ISSUER',
+                'OH_TRUSTED_IDENTITY_ASSERTION_AUDIENCE',
+                'JWT_SECRET',
+            )
+            missing = [name for name in required if not os.getenv(name, '').strip()]
+            if missing:
+                raise ValueError(
+                    'Trusted identity configuration is missing: ' + ', '.join(missing)
+                )
 
     def get_config(self):
         config = {

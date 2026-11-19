@@ -16,7 +16,10 @@ from openhands.app_server.event_callback.event_callback_models import (
     EventCallbackProcessor,
 )
 from openhands.app_server.integrations.service_types import ProviderType, SuggestedTask
-from openhands.app_server.sandbox.sandbox_models import SandboxStatus
+from openhands.app_server.sandbox.sandbox_models import (
+    SandboxStartupProgress,
+    SandboxStatus,
+)
 
 # Import from new location and re-export for backward compatibility
 from openhands.app_server.settings.settings_models import SandboxGroupingStrategy
@@ -50,7 +53,6 @@ ARCHIVE_WORKSPACE_PATH_TAG_KEY = 'archiveworkspacepath'
 # tag-key rule forbids underscores, hence the squashed keys.
 AGENT_PROFILE_ID_TAG_KEY = 'agentprofileid'
 AGENT_PROFILE_REVISION_TAG_KEY = 'agentprofilerevision'
-ORGANIZATION_ID_TAG_KEY = 'organizationid'
 
 
 class ConversationTrigger(Enum):
@@ -119,7 +121,9 @@ class AppConversationInfo(BaseModel):
     id: OpenHandsUUID = Field(default_factory=uuid4)
 
     created_by_user_id: str | None
+    organization_id: UUID | None = None
     sandbox_id: str
+    sandbox_spec_id: str | None = None
 
     selected_repository: str | None = None
     selected_branch: str | None = None
@@ -183,12 +187,6 @@ class AppConversationInfo(BaseModel):
             # Malformed id tag — surface no provenance rather than 500 the list.
             return None
 
-    @computed_field  # type: ignore[prop-decorator]
-    @property
-    def organization_id(self) -> str | None:
-        """Trusted organization selected when the conversation was created."""
-        return self.tags.get(ORGANIZATION_ID_TAG_KEY)
-
 
 class AppConversationSortOrder(Enum):
     CREATED_AT = 'CREATED_AT'
@@ -239,6 +237,14 @@ class AppConversationStartRequest(OpenHandsModel):
     """
 
     sandbox_id: str | None = Field(default=None)
+    organization_id: UUID | None = None
+    sandbox_spec_id: str | None = Field(
+        default=None,
+        description=(
+            'Exact enabled execution-profile id. Resource fields are selected '
+            'from the administrator-authored profile and cannot be supplied here.'
+        ),
+    )
     conversation_id: UUID | None = Field(default=None)
     initial_message: SendMessageRequest | None = None
     system_message_suffix: str | None = None
@@ -248,7 +254,6 @@ class AppConversationStartRequest(OpenHandsModel):
     # Profile (by id) without changing the member's active pointer. When unset,
     # the member's active_agent_profile_id is used.
     agent_profile_id: str | None = None
-    organization_id: str | None = None
 
     # Git parameters
     selected_repository: str | None = None
@@ -356,6 +361,17 @@ class AppConversationStartTask(OpenHandsModel):
     )
     agent_server_url: str | None = Field(
         default=None, description='The agent server url, if READY'
+    )
+    session_api_key: str | None = Field(
+        default=None,
+        description='The session API key, if READY and requested by the creator.',
+    )
+    sandbox_startup_progress: SandboxStartupProgress | None = Field(
+        default=None,
+        description=(
+            'Sanitized Kubernetes/runtime startup phase and timing while waiting '
+            'for the sandbox.'
+        ),
     )
     request: AppConversationStartRequest
     created_at: datetime = Field(default_factory=utc_now)

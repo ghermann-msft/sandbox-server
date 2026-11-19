@@ -4,6 +4,7 @@ This module tests the SQL implementation of AppConversationStartTaskService,
 focusing on basic CRUD operations and batch operations using SQLite as a mock database.
 """
 
+from datetime import datetime, timezone
 from typing import AsyncGenerator
 from uuid import uuid4
 
@@ -19,6 +20,11 @@ from openhands.app_server.app_conversation.app_conversation_models import (
 )
 from openhands.app_server.app_conversation.sql_app_conversation_start_task_service import (
     SQLAppConversationStartTaskService,
+)
+from openhands.app_server.sandbox.sandbox_models import (
+    SandboxStartupPhase,
+    SandboxStartupProgress,
+    SandboxStartupProgressStatus,
 )
 from openhands.app_server.utils.sql_utils import Base
 
@@ -80,6 +86,7 @@ def sample_task(
     sample_request: AppConversationStartRequest,
 ) -> AppConversationStartTask:
     """Create a sample AppConversationStartTask for testing."""
+    now = datetime.now(timezone.utc)
     return AppConversationStartTask(
         id=uuid4(),
         created_by_user_id='test_user',
@@ -88,6 +95,18 @@ def sample_task(
         app_conversation_id=None,
         sandbox_id=None,
         agent_server_url=None,
+        sandbox_startup_progress=SandboxStartupProgress(
+            phase=SandboxStartupPhase.PROVISIONING_NODE,
+            status=SandboxStartupProgressStatus.PROGRESSING,
+            message='The cluster autoscaler is provisioning a node.',
+            reason='AUTOSCALER_TRIGGERED',
+            started_at=now,
+            updated_at=now,
+            phase_started_at=now,
+            elapsed_seconds=30,
+            phase_elapsed_seconds=10,
+            inactivity_seconds=0,
+        ),
         request=sample_request,
     )
 
@@ -119,6 +138,39 @@ class TestSQLAppConversationStartTaskService:
         assert retrieved_task.created_by_user_id == sample_task.created_by_user_id
         assert retrieved_task.status == sample_task.status
         assert retrieved_task.request == sample_task.request
+        assert retrieved_task.sandbox_startup_progress is not None
+        assert (
+            retrieved_task.sandbox_startup_progress.phase
+            == SandboxStartupPhase.PROVISIONING_NODE
+        )
+        progress_payload = retrieved_task.model_dump(mode='json')[
+            'sandbox_startup_progress'
+        ]
+        assert set(progress_payload) == {
+            'phase',
+            'status',
+            'message',
+            'reason',
+            'started_at',
+            'updated_at',
+            'phase_started_at',
+            'elapsed_seconds',
+            'phase_elapsed_seconds',
+            'inactivity_seconds',
+        }
+
+    async def test_session_key_is_rehydrated_instead_of_stored(
+        self,
+        service: SQLAppConversationStartTaskService,
+        sample_task: AppConversationStartTask,
+    ):
+        sample_task.session_api_key = 'session-key'
+
+        await service.save_app_conversation_start_task(sample_task)
+        retrieved_task = await service.get_app_conversation_start_task(sample_task.id)
+
+        assert retrieved_task is not None
+        assert retrieved_task.session_api_key is None
 
     async def test_get_nonexistent_task(
         self, service: SQLAppConversationStartTaskService

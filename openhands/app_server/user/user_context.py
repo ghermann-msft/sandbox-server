@@ -6,6 +6,7 @@ from openhands.app_server.integrations.provider import (
     ProviderType,
 )
 from openhands.app_server.integrations.service_types import UserGitInfo
+from openhands.app_server.organization.organization_models import AuthenticationIdentity
 from openhands.app_server.services.injector import Injector
 from openhands.app_server.user.user_models import (
     UserInfo,
@@ -105,6 +106,12 @@ class UserContext(ABC):
         expected to degrade gracefully when it raises.
         """
         raise NotImplementedError
+
+    async def get_authentication_identity(self) -> AuthenticationIdentity | None:
+        return None
+
+    async def get_effective_org_id(self):
+        return None
 
     async def get_max_concurrent_sandboxes(self, default: int = 10) -> int:
         """Get the user's maximum concurrent sandboxes limit.
