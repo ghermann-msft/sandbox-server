@@ -77,10 +77,23 @@ def create_sandbox_service_context_manager(sandbox_service):
     return _context_manager
 
 
-async def call_valid_conversation(conversation_id, sandbox_record, service):
-    with patch(
-        'openhands.app_server.event_callback.webhook_router.get_app_conversation_info_service',
-        create_sandbox_service_context_manager(service),
+async def call_valid_conversation(
+    conversation_id, sandbox_record, service, start_task_service=None
+):
+    if start_task_service is None:
+        start_task_service = AsyncMock()
+        start_task_service.search_app_conversation_start_tasks.return_value = (
+            AppConversationStartTaskPage(items=[])
+        )
+    with (
+        patch(
+            'openhands.app_server.event_callback.webhook_router.get_app_conversation_info_service',
+            create_sandbox_service_context_manager(service),
+        ),
+        patch(
+            'openhands.app_server.event_callback.webhook_router.get_app_conversation_start_task_service',
+            create_sandbox_service_context_manager(start_task_service),
+        ),
     ):
         return await valid_conversation(
             conversation_id=conversation_id,
@@ -335,6 +348,7 @@ class TestValidConversation:
         """Test that non-existing conversation creates a stub."""
         # Arrange
         conversation_id = uuid4()
+        organization_id = uuid4()
         sandbox_record = SandboxRecord(
             id='sandbox-123',
             created_by_user_id='user-123',
@@ -342,18 +356,35 @@ class TestValidConversation:
 
         mock_service = AsyncMock()
         mock_service.get_app_conversation_info = AsyncMock(return_value=None)
+        start_task_service = AsyncMock()
+        start_task_service.search_app_conversation_start_tasks.return_value = (
+            AppConversationStartTaskPage(
+                items=[
+                    AppConversationStartTask(
+                        created_by_user_id=sandbox_record.created_by_user_id,
+                        app_conversation_id=conversation_id,
+                        sandbox_id=sandbox_record.id,
+                        request=AppConversationStartRequest(
+                            organization_id=organization_id
+                        ),
+                    )
+                ]
+            )
+        )
 
         # Act
         result = await call_valid_conversation(
             conversation_id,
             sandbox_record,
             mock_service,
+            start_task_service,
         )
 
         # Assert
         assert result.id == conversation_id
         assert result.sandbox_id == sandbox_record.id
         assert result.created_by_user_id == sandbox_record.created_by_user_id
+        assert result.organization_id == organization_id
 
     @pytest.mark.asyncio
     async def test_valid_conversation_different_user_raises_auth_error(self):
@@ -419,6 +450,7 @@ class TestValidConversation:
         self,
     ):
         conversation_id = uuid4()
+        organization_id = uuid4()
         owner_id = 'entra:tenant-id:object-id'
         sandbox_record = SandboxRecord(
             id='sandbox-123',
@@ -440,7 +472,9 @@ class TestValidConversation:
                         created_by_user_id=owner_id,
                         app_conversation_id=conversation_id,
                         sandbox_id=sandbox_record.id,
-                        request=AppConversationStartRequest(),
+                        request=AppConversationStartRequest(
+                            organization_id=organization_id
+                        ),
                     )
                 ]
             )
@@ -462,6 +496,7 @@ class TestValidConversation:
             )
 
         assert result.created_by_user_id == owner_id
+        assert result.organization_id == organization_id
         assert result.sandbox_id == sandbox_record.id
         start_task_service.search_app_conversation_start_tasks.assert_awaited_once_with(
             conversation_id__eq=conversation_id,

@@ -316,28 +316,45 @@ async def valid_conversation(
         app_conversation_info = await service.get_app_conversation_info(conversation_id)
     if not app_conversation_info:
         # Conversation does not yet exist - create a stub
-        return AppConversationInfo(
+        app_conversation_info = AppConversationInfo(
             id=conversation_id,
             sandbox_id=sandbox_record.id,
             created_by_user_id=sandbox_record.created_by_user_id,
         )
 
-    if app_conversation_info.created_by_user_id is None:
+    if (
+        app_conversation_info.created_by_user_id is None
+        or app_conversation_info.organization_id is None
+    ):
         async with get_app_conversation_start_task_service(state) as service:
             start_tasks = await service.search_app_conversation_start_tasks(
                 conversation_id__eq=conversation_id,
                 limit=100,
             )
+        sandbox_tasks = [
+            task for task in start_tasks.items if task.sandbox_id == sandbox_record.id
+        ]
+        updates: dict[str, Any] = {}
         matching_owners = {
-            task.created_by_user_id
-            for task in start_tasks.items
-            if task.sandbox_id == sandbox_record.id and task.created_by_user_id
+            task.created_by_user_id for task in sandbox_tasks if task.created_by_user_id
         }
-        if matching_owners != {sandbox_record.created_by_user_id}:
-            raise AuthError()
-        app_conversation_info = app_conversation_info.model_copy(
-            update={'created_by_user_id': sandbox_record.created_by_user_id}
-        )
+        if app_conversation_info.created_by_user_id is None:
+            if matching_owners != {sandbox_record.created_by_user_id}:
+                raise AuthError()
+            updates['created_by_user_id'] = sandbox_record.created_by_user_id
+        if app_conversation_info.organization_id is None:
+            matching_organization_ids = {
+                task.request.organization_id
+                for task in sandbox_tasks
+                if task.created_by_user_id == sandbox_record.created_by_user_id
+                and task.request.organization_id is not None
+            }
+            if len(matching_organization_ids) > 1:
+                raise AuthError()
+            if matching_organization_ids:
+                updates['organization_id'] = matching_organization_ids.pop()
+        if updates:
+            app_conversation_info = app_conversation_info.model_copy(update=updates)
 
     if (
         app_conversation_info.created_by_user_id != sandbox_record.created_by_user_id
@@ -446,6 +463,7 @@ async def on_conversation_update(
             conversation_info.id, existing.title, conversation_info.title
         )
         or f'Conversation {conversation_info.id.hex}',
+        organization_id=existing.organization_id,
         sandbox_id=sandbox_record.id,
         created_by_user_id=sandbox_record.created_by_user_id,
         llm_model=llm_model,
