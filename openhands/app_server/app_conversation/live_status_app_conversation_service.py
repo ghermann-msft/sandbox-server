@@ -389,6 +389,65 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
     export_lock_refresh_interval_seconds: int = 30
     export_lock_required: bool | None = None
 
+    async def resume_sandbox(self, sandbox_id: str) -> bool:
+        if not await self.sandbox_service.resume_sandbox(sandbox_id):
+            return False
+
+        conversations = (
+            await self.app_conversation_info_service.search_app_conversation_info(
+                sandbox_id__eq=sandbox_id,
+                sort_order=AppConversationSortOrder.UPDATED_AT_DESC,
+                limit=1,
+            )
+        ).items
+        if not conversations:
+            return True
+
+        async for _ in self.sandbox_service.watch_sandbox_startup(
+            sandbox_id,
+            timeout=self.sandbox_startup_timeout,
+            inactivity_timeout=min(
+                self.sandbox_startup_inactivity_timeout,
+                self.sandbox_startup_timeout,
+            ),
+            poll_interval=self.sandbox_startup_poll_frequency,
+        ):
+            pass
+
+        sandbox = await self.sandbox_service.get_sandbox(sandbox_id)
+        if sandbox is None:
+            raise SandboxError(f'Sandbox not found after resume: {sandbox_id}')
+        conversation = conversations[0]
+        sandbox_spec = await self.sandbox_spec_service.get_sandbox_spec(
+            sandbox.sandbox_spec_id,
+            include_unavailable=True,
+        )
+        if sandbox_spec is None:
+            raise SandboxError(
+                f'Execution profile not found after resume: {sandbox.sandbox_spec_id}'
+            )
+
+        initial_env = getattr(sandbox_spec, 'initial_env', {})
+        if initial_env.get('OH_DEFERRED_INIT', '').lower() == 'true':
+            await self._initialize_agent_server(
+                agent_server_url=self._get_agent_server_url(sandbox),
+                sandbox=sandbox,
+                organization_id=conversation.organization_id,
+                working_dir=conversation.tags.get(
+                    ARCHIVE_WORKSPACE_PATH_TAG_KEY,
+                    sandbox_spec.working_dir,
+                ),
+                git_provider=conversation.git_provider,
+                selected_repository=conversation.selected_repository,
+                agent_profile_id=conversation.tags.get(AGENT_PROFILE_ID_TAG_KEY),
+            )
+
+        await self._seed_sandbox_profiles(
+            self._get_agent_server_url(sandbox),
+            sandbox.session_api_key,
+        )
+        return True
+
     def _maybe_append_shallow_clone_context(
         self,
         user: UserInfo,

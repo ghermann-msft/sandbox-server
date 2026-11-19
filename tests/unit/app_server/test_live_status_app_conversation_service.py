@@ -20,6 +20,8 @@ from openhands.agent_server.models import (
     TextContent,
 )
 from openhands.app_server.app_conversation.app_conversation_models import (
+    AGENT_PROFILE_ID_TAG_KEY,
+    ARCHIVE_WORKSPACE_PATH_TAG_KEY,
     AgentType,
     AppConversationInfo,
     AppConversationStartRequest,
@@ -594,6 +596,92 @@ class TestLiveStatusAppConversationService:
             )
 
         self.mock_httpx_client.post.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_resume_sandbox_initializes_recreated_deferred_agent_server(self):
+        organization_id = uuid4()
+        conversation_id = uuid4()
+        sandbox = SandboxInfo(
+            id='sandbox-123',
+            created_by_user_id='test_user_123',
+            sandbox_spec_id='linux-standard',
+            status=SandboxStatus.RUNNING,
+            session_api_key='resumed-session-key',
+            exposed_urls=[
+                ExposedUrl(
+                    name=AGENT_SERVER,
+                    url='http://resumed-agent-server:8000',
+                    port=8000,
+                )
+            ],
+        )
+        conversation = AppConversationInfo(
+            id=conversation_id,
+            created_by_user_id='test_user_123',
+            organization_id=organization_id,
+            sandbox_id=sandbox.id,
+            sandbox_spec_id=sandbox.sandbox_spec_id,
+            selected_repository='OpenHands/sandbox-server',
+            git_provider=ProviderType.GITHUB,
+            tags={
+                ARCHIVE_WORKSPACE_PATH_TAG_KEY: '/workspace/project',
+                AGENT_PROFILE_ID_TAG_KEY: str(uuid4()),
+            },
+        )
+        self.mock_sandbox_service.resume_sandbox = AsyncMock(return_value=True)
+        self.mock_sandbox_service.watch_sandbox_startup = Mock(
+            return_value=_async_iter([Mock()])
+        )
+        self.mock_sandbox_service.get_sandbox = AsyncMock(return_value=sandbox)
+        self.mock_sandbox_service.get_sandbox_internal_url = AsyncMock(
+            return_value='http://sandbox.agents.svc.cluster.local:8000'
+        )
+        self.mock_sandbox_service.get_sandbox_init_api_key = AsyncMock(
+            return_value='shared-bootstrap-key'
+        )
+        self.mock_app_conversation_info_service.search_app_conversation_info = (
+            AsyncMock(return_value=SimpleNamespace(items=[conversation]))
+        )
+        self.mock_sandbox_spec_service.get_sandbox_spec = AsyncMock(
+            return_value=SimpleNamespace(
+                working_dir='/workspace',
+                initial_env={'OH_DEFERRED_INIT': 'true'},
+            )
+        )
+        self.mock_user_context.get_user_info = AsyncMock(return_value=self.mock_user)
+        self.service._seed_sandbox_profiles = AsyncMock()
+
+        dormant = Mock()
+        dormant.json.return_value = {'state': 'dormant', 'error': None}
+        dormant.raise_for_status.return_value = None
+        ready = Mock()
+        ready.json.return_value = {'state': 'ready', 'error': None}
+        ready.raise_for_status.return_value = None
+        self.mock_httpx_client.get = AsyncMock(return_value=dormant)
+        self.mock_httpx_client.post = AsyncMock(return_value=ready)
+
+        with patch(
+            'openhands.app_server.config.get_global_config',
+            return_value=Mock(hindsight_enabled=False),
+        ):
+            assert await self.service.resume_sandbox(sandbox.id) is True
+
+        self.mock_sandbox_service.resume_sandbox.assert_awaited_once_with(sandbox.id)
+        self.mock_sandbox_service.watch_sandbox_startup.assert_called_once_with(
+            sandbox.id,
+            timeout=30,
+            inactivity_timeout=10,
+            poll_interval=1,
+        )
+        post = self.mock_httpx_client.post.await_args
+        assert post.args[0] == 'http://sandbox.agents.svc.cluster.local:8000/api/init'
+        assert post.kwargs['headers'] == {'X-Init-API-Key': 'shared-bootstrap-key'}
+        assert post.kwargs['json']['session_api_keys'] == ['resumed-session-key']
+        assert 'secret_key' not in post.kwargs['json']
+        self.service._seed_sandbox_profiles.assert_awaited_once_with(
+            'http://resumed-agent-server:8000',
+            'resumed-session-key',
+        )
 
     @pytest.mark.asyncio
     async def test_setup_secrets_for_git_providers_no_provider_tokens(self):

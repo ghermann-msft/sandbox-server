@@ -79,6 +79,10 @@ class AppConversationService(ABC):
         )
 
     @abstractmethod
+    async def resume_sandbox(self, sandbox_id: str) -> bool:
+        """Resume a sandbox and restore its Agent Server lifecycle."""
+
+    @abstractmethod
     async def start_app_conversation(
         self, request: AppConversationStartRequest
     ) -> AsyncGenerator[AppConversationStartTask, None]:
