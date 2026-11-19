@@ -1485,6 +1485,7 @@ class TestConversationOwnershipPreservation:
                 created_by_user_id='owner-123',
                 organization_id=organization_id,
                 sandbox_id='sandbox-123',
+                sandbox_spec_id='windows-build',
                 title='Original',
             )
         )
@@ -1503,4 +1504,83 @@ class TestConversationOwnershipPreservation:
         assert info is not None
         assert info.created_by_user_id == 'owner-123'
         assert info.organization_id == organization_id
+        assert info.sandbox_spec_id == 'windows-build'
         assert info.title == 'Updated by lifecycle webhook'
+
+    @pytest.mark.asyncio
+    async def test_stale_lifecycle_upsert_cannot_clear_lineage(
+        self,
+        async_engine,
+    ):
+        conversation_id = uuid4()
+        organization_id = uuid4()
+        session_factory = async_sessionmaker(
+            async_engine, class_=AsyncSession, expire_on_commit=False
+        )
+
+        async with session_factory() as canonical_session:
+            canonical_service = SQLAppConversationInfoService(
+                db_session=canonical_session,
+                user_context=SpecifyUserContext(user_id=None),
+            )
+
+            class StaleReadResult:
+                @staticmethod
+                def one_or_none():
+                    return None
+
+            class InterleavingSession:
+                def __init__(self, db_session):
+                    self.db_session = db_session
+                    self.interleaved = False
+
+                def get_bind(self):
+                    return self.db_session.get_bind()
+
+                async def execute(self, statement):
+                    if not self.interleaved:
+                        self.interleaved = True
+                        await canonical_service.save_app_conversation_info(
+                            AppConversationInfo(
+                                id=conversation_id,
+                                created_by_user_id='owner-123',
+                                organization_id=organization_id,
+                                sandbox_id='sandbox-123',
+                                sandbox_spec_id='windows-build',
+                                title='Canonical',
+                            )
+                        )
+                        if statement.is_select:
+                            return StaleReadResult()
+                    return await self.db_session.execute(statement)
+
+                async def merge(self, instance):
+                    return await self.db_session.merge(instance)
+
+                async def commit(self):
+                    await self.db_session.commit()
+
+            async with session_factory() as lifecycle_session:
+                lifecycle_service = SQLAppConversationInfoService(
+                    db_session=InterleavingSession(lifecycle_session),
+                    user_context=SpecifyUserContext(user_id=None),
+                )
+                await lifecycle_service.save_app_conversation_info(
+                    AppConversationInfo(
+                        id=conversation_id,
+                        created_by_user_id=None,
+                        organization_id=None,
+                        sandbox_id='sandbox-123',
+                        sandbox_spec_id=None,
+                        title='Updated by stale lifecycle webhook',
+                    )
+                )
+
+            info = await canonical_service.get_app_conversation_info(conversation_id)
+
+        assert info is not None
+        assert info.created_by_user_id == 'owner-123'
+        assert info.organization_id == organization_id
+        assert info.sandbox_id == 'sandbox-123'
+        assert info.sandbox_spec_id == 'windows-build'
+        assert info.title == 'Updated by stale lifecycle webhook'

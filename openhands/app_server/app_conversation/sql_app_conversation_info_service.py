@@ -39,6 +39,10 @@ from sqlalchemy import (
     func,
     select,
 )
+from sqlalchemy.dialects.postgresql import insert as postgresql_insert
+from sqlalchemy.dialects.postgresql.dml import Insert as PostgreSQLInsert
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+from sqlalchemy.dialects.sqlite.dml import Insert as SQLiteInsert
 from sqlalchemy.engine import CursorResult
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import Mapped, mapped_column
@@ -471,52 +475,20 @@ class SQLAppConversationInfoService(AppConversationInfoService):
         metrics = info.metrics or MetricsSnapshot()
         usage = metrics.accumulated_token_usage or TokenUsage()
         conversation_id = _canonical_conversation_id(info.id)
-
-        # Preserve the original creation time on update.
-        #
-        # ``save`` is an upsert (``merge`` on the primary key), and several
-        # callers rebuild an ``AppConversationInfo`` from scratch rather than
-        # mutating the loaded row (e.g. the ``on_conversation_update`` webhook,
-        # which fires on every start/pause/resume/interrupt). Those callers do
-        # not carry ``created_at`` forward, so ``AppConversationInfo`` fills it
-        # from ``default_factory=utc_now``. Without this guard the merge would
-        # overwrite the persisted ``created_at`` with "now" on every lifecycle
-        # webhook, corrupting created-at ordering and the usage/billing
-        # dashboards that bucket conversations by creation time. Look up the
-        # stored value directly by primary key (not via ``_secure_select``) so
-        # this works under the ADMIN webhook context as well.
-        created_at = info.created_at
-        created_by_user_id = info.created_by_user_id
-        existing = (
-            await self.db_session.execute(
-                select(
-                    StoredConversationMetadata.created_at,
-                    StoredConversationMetadata.user_id,
-                    StoredConversationMetadata.organization_id,
-                ).where(StoredConversationMetadata.conversation_id == conversation_id)
-            )
-        ).one_or_none()
-        existing_organization_id = None
-        if existing is not None:
-            created_at = existing.created_at
-            existing_organization_id = existing.organization_id
-            if created_by_user_id is None:
-                created_by_user_id = existing.user_id
-
-        organization_id = info.organization_id or existing_organization_id
+        organization_id = info.organization_id
         if organization_id is None:
             organization_id = await self.resolve_organization_id(None)
 
         stored = StoredConversationMetadata(
             conversation_id=conversation_id,
-            user_id=created_by_user_id,
+            user_id=info.created_by_user_id,
             organization_id=organization_id,
             selected_repository=info.selected_repository,
             selected_branch=info.selected_branch,
             git_provider=info.git_provider.value if info.git_provider else None,
             title=info.title,
             last_updated_at=info.updated_at,
-            created_at=created_at,
+            created_at=info.created_at,
             trigger=info.trigger.value if info.trigger else None,
             pr_number=info.pr_number or [],
             # Cost and token metrics
@@ -543,7 +515,44 @@ class SQLAppConversationInfoService(AppConversationInfoService):
             tags=info.tags if info.tags else None,
         )
 
-        await self.db_session.merge(stored)
+        table = StoredConversationMetadata.__table__
+        values = {column.name: getattr(stored, column.name) for column in table.columns}
+        dialect_name = self.db_session.get_bind().dialect.name
+        statement: PostgreSQLInsert | SQLiteInsert
+        if dialect_name == 'postgresql':
+            statement = postgresql_insert(StoredConversationMetadata).values(**values)
+        elif dialect_name == 'sqlite':
+            statement = sqlite_insert(StoredConversationMetadata).values(**values)
+        else:
+            raise RuntimeError(
+                f'Unsupported database dialect for conversation metadata upsert: '
+                f'{dialect_name}'
+            )
+
+        excluded = statement.excluded
+        updates = {
+            column.name: getattr(excluded, column.name)
+            for column in table.columns
+            if column.name != 'conversation_id'
+        }
+        for field_name in (
+            'created_at',
+            'user_id',
+            'organization_id',
+            'sandbox_id',
+            'sandbox_spec_id',
+            'parent_conversation_id',
+        ):
+            updates[field_name] = func.coalesce(
+                getattr(table.c, field_name),
+                getattr(excluded, field_name),
+            )
+
+        statement = statement.on_conflict_do_update(
+            index_elements=[table.c.conversation_id],
+            set_=updates,
+        )
+        await self.db_session.execute(statement)
         await self.db_session.commit()
         return info
 
