@@ -205,6 +205,34 @@ async def test_start_sandbox_creates_claim(service, custom_objects):
     assert info.exposed_urls == []
 
 
+async def test_start_sandbox_uses_configured_agent_server_secret_key(
+    service, custom_objects
+):
+    service.agent_server_secret_key = 'configured-shared-key'
+
+    await service.start_sandbox()
+
+    body = custom_objects.create_namespaced_custom_object.call_args.kwargs['body']
+    env = {item['name']: item['value'] for item in body['spec']['env']}
+    assert env[SECRET_KEY_VARIABLE] == 'configured-shared-key'
+    assert env[SESSION_API_KEY_VARIABLE]
+    assert env[SESSION_API_KEY_VARIABLE] != env[SECRET_KEY_VARIABLE]
+
+
+async def test_start_sandbox_generates_secret_key_when_shared_key_is_absent(
+    service, custom_objects
+):
+    service.agent_server_secret_key = None
+
+    await service.start_sandbox()
+
+    body = custom_objects.create_namespaced_custom_object.call_args.kwargs['body']
+    env = {item['name']: item['value'] for item in body['spec']['env']}
+    assert env[SECRET_KEY_VARIABLE]
+    assert env[SESSION_API_KEY_VARIABLE]
+    assert env[SESSION_API_KEY_VARIABLE] != env[SECRET_KEY_VARIABLE]
+
+
 async def test_windows_claim_uses_profile_storage_and_sandbox_scoped_durable_paths(
     service, mock_sandbox_spec_service, custom_objects
 ):

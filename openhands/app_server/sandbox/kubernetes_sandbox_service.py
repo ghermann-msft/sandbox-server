@@ -256,6 +256,7 @@ class KubernetesSandboxService(SandboxService):
     web_url: str | None = None
     permitted_cors_origins: list[str] = field(default_factory=list)
     inject_session_key: bool = True
+    agent_server_secret_key: str | None = None
     shutdown_after_seconds: int | None = None
     default_sandbox_spec_id: str | None = None
     validate_profile_infrastructure: bool = True
@@ -1166,7 +1167,10 @@ class KubernetesSandboxService(SandboxService):
             for name, value in sandbox_spec.initial_env.items()
         }
         env_vars['OH_SANDBOX_ID'] = sandbox_id
-        env_vars[SECRET_KEY_VARIABLE] = base62.encodebytes(os.urandom(32))
+        secret_key = self.agent_server_secret_key
+        if secret_key is None or not secret_key.strip():
+            secret_key = base62.encodebytes(os.urandom(32))
+        env_vars[SECRET_KEY_VARIABLE] = secret_key
         env_vars[WEBHOOK_CALLBACK_VARIABLE] = (
             f'{self.webhook_base_url.rstrip("/")}/api/v1/webhooks'
         )
@@ -1517,6 +1521,7 @@ class KubernetesSandboxServiceInjector(SandboxServiceInjector):
                 web_url=config.web_url,
                 permitted_cors_origins=config.permitted_cors_origins,
                 inject_session_key=self.inject_session_key,
+                agent_server_secret_key=os.getenv(SECRET_KEY_VARIABLE),
                 shutdown_after_seconds=self.shutdown_after_seconds,
                 default_sandbox_spec_id=(
                     await user_context.get_default_sandbox_spec_id()
