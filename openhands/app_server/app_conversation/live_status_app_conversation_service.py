@@ -1301,14 +1301,18 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
 
             scopes = [
                 AgentServerMemoryScope(type='server', id=deployment_id),
-                AgentServerMemoryScope(type='organization', id=str(organization_id)),
             ]
             if selected_repository and git_provider:
-                scopes.append(
-                    AgentServerMemoryScope(
-                        type='repository',
-                        id=f'{git_provider.value}:{normalize_repository(selected_repository)}',
-                    )
+                scopes.extend(
+                    [
+                        AgentServerMemoryScope(
+                            type='organization', id=str(organization_id)
+                        ),
+                        AgentServerMemoryScope(
+                            type='repository',
+                            id=f'{git_provider.value}:{normalize_repository(selected_repository)}',
+                        ),
+                    ]
                 )
             scopes.extend(
                 [

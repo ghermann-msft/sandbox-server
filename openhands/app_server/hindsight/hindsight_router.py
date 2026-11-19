@@ -1,3 +1,4 @@
+import asyncio
 import sys
 from datetime import timedelta
 from typing import Annotated, Literal
@@ -61,6 +62,9 @@ from openhands.app_server.user.user_context import UserContext
 from openhands.app_server.user_auth.user_auth import get_for_user
 
 router = APIRouter(prefix='/hindsight', tags=['Hindsight'])
+
+_CONVERSATION_VISIBILITY_ATTEMPTS = 10
+_CONVERSATION_VISIBILITY_DELAY_SECONDS = 0.1
 
 
 async def _broker(http_client: httpx.AsyncClient | None = None) -> HindsightBroker:
@@ -211,6 +215,20 @@ async def _conversation(conversation_id):
     return conversation
 
 
+async def _conversation_for_read(conversation_id):
+    for attempt in range(_CONVERSATION_VISIBILITY_ATTEMPTS):
+        try:
+            return await _conversation(conversation_id)
+        except HTTPException as exc:
+            if (
+                exc.status_code != status.HTTP_404_NOT_FOUND
+                or attempt == _CONVERSATION_VISIBILITY_ATTEMPTS - 1
+            ):
+                raise
+            await asyncio.sleep(_CONVERSATION_VISIBILITY_DELAY_SECONDS)
+    raise AssertionError('conversation visibility retry loop did not return')
+
+
 async def _conversation_for_sandbox(conversation_id, sandbox: SandboxInfo):
     conversation = await _conversation(conversation_id)
     if conversation.sandbox_id != sandbox.id:
@@ -226,7 +244,7 @@ async def _authorized_read(
     http_client: httpx.AsyncClient,
     jwt_service: JwtService,
 ):
-    conversation = await _conversation(request.conversation_id)
+    conversation = await _conversation_for_read(request.conversation_id)
     authorization = await _authorization_for_identity(
         request.identity, conversation, jwt_service
     )

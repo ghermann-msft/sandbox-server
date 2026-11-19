@@ -1,10 +1,11 @@
 import json
 from datetime import timedelta
+from unittest.mock import AsyncMock, patch
 from uuid import UUID
 
 import httpx
 import pytest
-from fastapi import HTTPException
+from fastapi import HTTPException, status
 
 from openhands.agent_server.utils import utc_now
 from openhands.app_server.hindsight.hindsight_config import (
@@ -21,6 +22,10 @@ from openhands.app_server.hindsight.hindsight_models import (
     HindsightScopeBindings,
     HindsightScopeKind,
     HindsightScopeRequest,
+)
+from openhands.app_server.hindsight.hindsight_router import (
+    _CONVERSATION_VISIBILITY_ATTEMPTS,
+    _conversation_for_read,
 )
 from openhands.app_server.hindsight.hindsight_service import (
     HindsightBroker,
@@ -127,6 +132,81 @@ def test_sdk_scope_list_shape_and_private_alias_are_canonicalized():
 
     assert request.scope[0].type == HindsightScopeKind.PRIVATE
     assert request.scope[1].type == HindsightScopeKind.SERVER
+
+
+@pytest.mark.asyncio
+async def test_read_waits_for_conversation_metadata_visibility():
+    conversation = object()
+    not_found = HTTPException(
+        status.HTTP_404_NOT_FOUND,
+        detail='Conversation not found',
+    )
+    get_conversation = AsyncMock(side_effect=[not_found, conversation])
+    sleep = AsyncMock()
+
+    with (
+        patch(
+            'openhands.app_server.hindsight.hindsight_router._conversation',
+            get_conversation,
+        ),
+        patch('openhands.app_server.hindsight.hindsight_router.asyncio.sleep', sleep),
+    ):
+        result = await _conversation_for_read(
+            UUID('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa')
+        )
+
+    assert result is conversation
+    assert get_conversation.await_count == 2
+    sleep.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_read_conversation_visibility_wait_is_bounded():
+    not_found = HTTPException(
+        status.HTTP_404_NOT_FOUND,
+        detail='Conversation not found',
+    )
+    get_conversation = AsyncMock(side_effect=not_found)
+
+    with (
+        patch(
+            'openhands.app_server.hindsight.hindsight_router._conversation',
+            get_conversation,
+        ),
+        patch(
+            'openhands.app_server.hindsight.hindsight_router.asyncio.sleep',
+            AsyncMock(),
+        ),
+        pytest.raises(HTTPException) as exc_info,
+    ):
+        await _conversation_for_read(UUID('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa'))
+
+    assert exc_info.value.status_code == status.HTTP_404_NOT_FOUND
+    assert get_conversation.await_count == _CONVERSATION_VISIBILITY_ATTEMPTS
+
+
+@pytest.mark.asyncio
+async def test_read_conversation_visibility_does_not_retry_other_failures():
+    forbidden = HTTPException(
+        status.HTTP_403_FORBIDDEN,
+        detail='Forbidden',
+    )
+    get_conversation = AsyncMock(side_effect=forbidden)
+    sleep = AsyncMock()
+
+    with (
+        patch(
+            'openhands.app_server.hindsight.hindsight_router._conversation',
+            get_conversation,
+        ),
+        patch('openhands.app_server.hindsight.hindsight_router.asyncio.sleep', sleep),
+        pytest.raises(HTTPException) as exc_info,
+    ):
+        await _conversation_for_read(UUID('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa'))
+
+    assert exc_info.value.status_code == status.HTTP_403_FORBIDDEN
+    get_conversation.assert_awaited_once()
+    sleep.assert_not_awaited()
 
 
 def test_repository_scope_must_match_conversation_repository():
@@ -447,6 +527,46 @@ async def test_recall_outage_can_fail_closed(session_maker):
 
 
 @pytest.mark.asyncio
+async def test_recall_missing_bank_is_available_and_empty(session_maker):
+    async def missing(_request):
+        return httpx.Response(404)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(missing)) as client:
+        broker = HindsightBroker(_settings(), session_maker, client)
+        scope = resolve_scope(
+            HindsightScopeRequest(kind=HindsightScopeKind.WORKSPACE),
+            PRINCIPAL,
+            'sandbox-1',
+            None,
+        )
+        available, memories = await broker.recall(
+            'query', [('bank-1', scope)], max_results=10, token_budget=1024
+        )
+
+    assert available is True
+    assert memories == []
+
+
+@pytest.mark.asyncio
+async def test_recall_rejects_other_client_errors(session_maker):
+    async def unauthorized(_request):
+        return httpx.Response(401)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(unauthorized)) as client:
+        broker = HindsightBroker(_settings(), session_maker, client)
+        scope = resolve_scope(
+            HindsightScopeRequest(kind=HindsightScopeKind.WORKSPACE),
+            PRINCIPAL,
+            'sandbox-1',
+            None,
+        )
+        with pytest.raises(httpx.HTTPStatusError):
+            await broker.recall(
+                'query', [('bank-1', scope)], max_results=10, token_budget=1024
+            )
+
+
+@pytest.mark.asyncio
 async def test_recall_preserves_required_provenance(session_maker):
     async def recalled(_request):
         return httpx.Response(
@@ -531,6 +651,45 @@ async def test_reflect_preserves_evidence_provenance(session_maker):
     assert sources[0].source_event_id == 'event-1'
     assert sources[0].scope == (scope,)
     assert sources[0].relevance == 0.0
+
+
+@pytest.mark.asyncio
+async def test_reflect_missing_bank_is_available_and_empty(session_maker):
+    async def missing(_request):
+        return httpx.Response(404)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(missing)) as client:
+        broker = HindsightBroker(_settings(), session_maker, client)
+        scope = resolve_scope(
+            HindsightScopeRequest(kind=HindsightScopeKind.WORKSPACE),
+            PRINCIPAL,
+            'sandbox-1',
+            None,
+        )
+        available, text, sources = await broker.reflect(
+            'query', [('bank-1', scope)], token_budget=4096
+        )
+
+    assert available is True
+    assert text is None
+    assert sources == []
+
+
+@pytest.mark.asyncio
+async def test_reflect_rejects_other_client_errors(session_maker):
+    async def forbidden(_request):
+        return httpx.Response(403)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(forbidden)) as client:
+        broker = HindsightBroker(_settings(), session_maker, client)
+        scope = resolve_scope(
+            HindsightScopeRequest(kind=HindsightScopeKind.WORKSPACE),
+            PRINCIPAL,
+            'sandbox-1',
+            None,
+        )
+        with pytest.raises(httpx.HTTPStatusError):
+            await broker.reflect('query', [('bank-1', scope)], token_budget=4096)
 
 
 @pytest.mark.asyncio

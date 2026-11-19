@@ -640,6 +640,72 @@ class TestLiveStatusAppConversationService:
         ]
 
     @pytest.mark.asyncio
+    async def test_initialize_agent_server_omits_repository_scopes_without_repository(
+        self,
+    ):
+        organization_id = uuid4()
+        self.mock_user.agent_settings = ACPAgentSettings(
+            acp_server='claude-code',
+            acp_model='claude-sonnet-4-5',
+        )
+        self.mock_sandbox_service.get_sandbox_internal_url = AsyncMock(
+            return_value='http://sandbox.agents.svc.cluster.local:8000'
+        )
+        self.mock_sandbox_service.get_sandbox_init_api_key = AsyncMock(
+            return_value='bootstrap-key'
+        )
+        self.mock_user_context.get_authentication_identity = AsyncMock(
+            return_value=AuthenticationIdentity(
+                provider='entra',
+                tenant_id='11111111-1111-1111-1111-111111111111',
+                subject_id='22222222-2222-2222-2222-222222222222',
+            )
+        )
+        self.mock_user_context.get_user_id = AsyncMock(return_value='user-1')
+        self.mock_jwt_service.create_jws_token.return_value = 'signed-identity'
+        dormant = Mock()
+        dormant.json.return_value = {'state': 'dormant', 'error': None}
+        dormant.raise_for_status.return_value = None
+        ready = Mock()
+        ready.json.return_value = {'state': 'ready', 'error': None}
+        ready.raise_for_status.return_value = None
+        self.mock_httpx_client.get = AsyncMock(return_value=dormant)
+        self.mock_httpx_client.post = AsyncMock(return_value=ready)
+
+        config = Mock(
+            hindsight_enabled=True,
+            hindsight_broker_url='https://control-plane/hindsight',
+            hindsight_deployment_id='halo-ppe',
+        )
+        with patch(
+            'openhands.app_server.config.get_global_config', return_value=config
+        ):
+            await self.service._initialize_agent_server(
+                agent_server_url='http://agent-server',
+                sandbox=self.mock_sandbox,
+                organization_id=organization_id,
+                working_dir='/workspace',
+                git_provider=None,
+                selected_repository=None,
+                agent_profile_id=None,
+            )
+
+        hindsight_memory = self.mock_httpx_client.post.await_args.kwargs['json'][
+            'hindsight_memory'
+        ]
+        assert hindsight_memory['scope'] == [
+            {'type': 'server', 'id': 'halo-ppe'},
+            {'type': 'workspace', 'id': 'sandbox-123'},
+            {
+                'type': 'private_user',
+                'id': (
+                    '11111111-1111-1111-1111-111111111111:'
+                    '22222222-2222-2222-2222-222222222222'
+                ),
+            },
+        ]
+
+    @pytest.mark.asyncio
     async def test_initialize_agent_server_rejects_acp_without_trusted_identity(self):
         self.mock_user.agent_settings = ACPAgentSettings(
             acp_server='claude-code',

@@ -376,6 +376,9 @@ class HindsightBroker:
                     if not self.settings.fail_open:
                         raise response
                     continue
+                if response.status_code == 404:
+                    available = True
+                    continue
                 if self._is_transient(response):
                     if not self.settings.fail_open:
                         response.raise_for_status()
@@ -437,6 +440,9 @@ class HindsightBroker:
                 if isinstance(response, BaseException):
                     if not self.settings.fail_open:
                         raise response
+                    continue
+                if response.status_code == 404:
+                    available = True
                     continue
                 if self._is_transient(response):
                     if not self.settings.fail_open:
