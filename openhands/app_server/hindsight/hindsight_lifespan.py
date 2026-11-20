@@ -41,6 +41,7 @@ async def hindsight_lifespan(_app):
         max_outbox_pending=config.hindsight_max_outbox_pending,
         max_attempts=config.hindsight_max_attempts,
         request_timeout_seconds=config.hindsight_request_timeout_seconds,
+        reflect_timeout_seconds=config.hindsight_reflect_timeout_seconds,
     )
     try:
         settings.get_api_key()

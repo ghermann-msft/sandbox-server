@@ -250,6 +250,8 @@ class AppServerConfig(OpenHandsModel):
     hindsight_max_outbox_pending: int = Field(default=10_000, ge=1)
     hindsight_max_attempts: int = Field(default=8, ge=1)
     hindsight_request_timeout_seconds: float = Field(default=5.0, gt=0, le=30)
+    hindsight_reflect_timeout_seconds: float = Field(default=25.0, gt=0, le=120)
+    hindsight_agent_timeout_seconds: float = Field(default=30.0, gt=0, le=30)
     hindsight_default_token_ceiling: int = Field(default=1024, ge=256, le=1024)
     hindsight_adaptive_token_ceiling: int = Field(default=2048, ge=1024, le=2048)
     hindsight_deep_token_ceiling: int = Field(default=4096, ge=2048, le=4096)

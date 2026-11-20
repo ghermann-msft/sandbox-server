@@ -22,7 +22,7 @@ class AgentServerHindsightMemory(BaseModel):
     broker_url: HttpUrl
     identity: str = Field(min_length=1)
     scope: list[AgentServerMemoryScope] = Field(default_factory=list)
-    timeout_seconds: float = Field(default=2.0, gt=0, le=30)
+    timeout_seconds: float = Field(default=30.0, gt=0, le=30)
 
 
 class AgentServerInitRequest(BaseModel):

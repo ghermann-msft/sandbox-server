@@ -1341,6 +1341,7 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
                 broker_url=HttpUrl(broker_url),
                 identity=signed_identity,
                 scope=scopes,
+                timeout_seconds=config.hindsight_agent_timeout_seconds,
             )
 
         # Keep the Agent Server's configured OH_SECRET_KEY. Passing the

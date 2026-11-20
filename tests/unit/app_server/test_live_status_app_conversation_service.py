@@ -525,6 +525,7 @@ class TestLiveStatusAppConversationService:
             hindsight_enabled=True,
             hindsight_broker_url='https://control-plane/hindsight',
             hindsight_deployment_id='halo-ppe',
+            hindsight_agent_timeout_seconds=30.0,
         )
         with patch(
             'openhands.app_server.config.get_global_config', return_value=config
@@ -565,7 +566,7 @@ class TestLiveStatusAppConversationService:
                     ),
                 },
             ],
-            'timeout_seconds': 2.0,
+            'timeout_seconds': 30.0,
         }
 
     @pytest.mark.asyncio
@@ -604,6 +605,7 @@ class TestLiveStatusAppConversationService:
             hindsight_enabled=True,
             hindsight_broker_url='https://control-plane/hindsight',
             hindsight_deployment_id='halo-ppe',
+            hindsight_agent_timeout_seconds=30.0,
         )
         with patch(
             'openhands.app_server.config.get_global_config', return_value=config
@@ -622,6 +624,7 @@ class TestLiveStatusAppConversationService:
             'hindsight_memory'
         ]
         assert hindsight_memory['identity'] == 'signed-identity'
+        assert hindsight_memory['timeout_seconds'] == 30.0
         assert hindsight_memory['scope'] == [
             {'type': 'server', 'id': 'halo-ppe'},
             {'type': 'organization', 'id': str(organization_id)},
@@ -676,6 +679,7 @@ class TestLiveStatusAppConversationService:
             hindsight_enabled=True,
             hindsight_broker_url='https://control-plane/hindsight',
             hindsight_deployment_id='halo-ppe',
+            hindsight_agent_timeout_seconds=30.0,
         )
         with patch(
             'openhands.app_server.config.get_global_config', return_value=config
@@ -721,6 +725,7 @@ class TestLiveStatusAppConversationService:
             hindsight_enabled=True,
             hindsight_broker_url='https://control-plane/hindsight',
             hindsight_deployment_id='halo-ppe',
+            hindsight_agent_timeout_seconds=30.0,
         )
         with (
             patch('openhands.app_server.config.get_global_config', return_value=config),
@@ -752,6 +757,7 @@ class TestLiveStatusAppConversationService:
             hindsight_enabled=True,
             hindsight_broker_url='https://control-plane/hindsight',
             hindsight_deployment_id='halo-ppe',
+            hindsight_agent_timeout_seconds=30.0,
         )
         with (
             patch('openhands.app_server.config.get_global_config', return_value=config),

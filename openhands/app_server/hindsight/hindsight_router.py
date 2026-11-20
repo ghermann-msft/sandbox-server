@@ -39,13 +39,12 @@ from openhands.app_server.hindsight.hindsight_service import (
     HindsightBrokerSettings,
     HindsightOutboxStatus,
     authorize_conversation_organization,
+    authorize_explicit_retain_scope,
     authorize_scope_operation,
     content_sha256,
     derive_bank_id,
     derive_event_id,
     resolve_scope,
-    retain_requires_approval,
-    validate_retain_approval,
 )
 from openhands.app_server.organization.organization_models import (
     OrganizationPermission,
@@ -88,6 +87,7 @@ async def _broker(http_client: httpx.AsyncClient | None = None) -> HindsightBrok
         max_outbox_pending=config.hindsight_max_outbox_pending,
         max_attempts=config.hindsight_max_attempts,
         request_timeout_seconds=config.hindsight_request_timeout_seconds,
+        reflect_timeout_seconds=config.hindsight_reflect_timeout_seconds,
     )
     try:
         settings.get_api_key()
@@ -381,7 +381,6 @@ async def approve_retain(
 )
 async def retain(
     request: HindsightRetainRequest,
-    jwt_service: Annotated[JwtService, depends_jwt_service()],
     session_api_key: Annotated[str | None, Header(alias='X-Session-API-Key')] = None,
 ):
     sandbox = await validate_session_key(session_api_key)
@@ -403,29 +402,8 @@ async def retain(
         conversation.organization_id, authorization, [scope]
     )
     authorize_scope_operation(authorization, scope, 'hindsight:retain')
+    authorize_explicit_retain_scope(scope)
     digest = content_sha256(request.content)
-    if retain_requires_approval(scope):
-        if request.approval_token is None:
-            raise HTTPException(
-                status.HTTP_403_FORBIDDEN,
-                detail='Retain approval is required for this scope',
-            )
-        try:
-            approval = jwt_service.verify_jws_token(request.approval_token)
-        except Exception as exc:
-            raise HTTPException(
-                status.HTTP_403_FORBIDDEN, detail='Invalid retain approval'
-            ) from exc
-        validate_retain_approval(
-            approval,
-            user_id=owner_user_id,
-            principal=principal,
-            conversation_id=str(request.conversation_id),
-            sandbox_id=sandbox.id,
-            source_event_id=request.source_event_id,
-            scope=scope,
-            content_digest=digest,
-        )
     broker = await _broker()
     event_id = derive_event_id(
         principal,

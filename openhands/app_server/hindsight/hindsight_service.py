@@ -78,6 +78,7 @@ class HindsightBrokerSettings:
     max_outbox_pending: int = 10_000
     max_attempts: int = 8
     request_timeout_seconds: float = 5.0
+    reflect_timeout_seconds: float = 25.0
 
     def get_api_key(self) -> str:
         if self.api_key_file is not None:
@@ -317,9 +318,18 @@ def validate_retain_approval(
 
 def retain_requires_approval(scope: ResolvedHindsightScope) -> bool:
     return scope.type not in {
+        HindsightScopeKind.PRIVATE,
         HindsightScopeKind.SERVER,
         HindsightScopeKind.ORGANIZATION,
     }
+
+
+def authorize_explicit_retain_scope(scope: ResolvedHindsightScope) -> None:
+    if scope.type != HindsightScopeKind.PRIVATE:
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            detail='Explicit retain is restricted to private_user memory',
+        )
 
 
 class HindsightBroker:
@@ -423,6 +433,7 @@ class HindsightBroker:
                 client.post(
                     f'{self.settings.base_url.rstrip("/")}/v1/default/banks/{quote(bank_id)}/reflect',
                     headers=self._headers(),
+                    timeout=self.settings.reflect_timeout_seconds,
                     json={
                         'query': query,
                         'max_tokens': token_budget,
