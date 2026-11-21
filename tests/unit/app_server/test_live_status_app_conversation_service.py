@@ -284,7 +284,21 @@ class TestLiveStatusAppConversationService:
         self.mock_sandbox_service.get_control_plane_base_url.return_value = (
             'http://control-plane'
         )
+        self.mock_sandbox_service.get_sandbox_secret_key = AsyncMock(
+            return_value='sandbox-secret'
+        )
         self.mock_sandbox_spec_service = AsyncMock()
+        self.mock_sandbox_spec_service.get_sandbox_spec.return_value = SimpleNamespace(
+            initial_env={
+                'OH_DEFERRED_INIT': 'true',
+                'OH_CONVERSATIONS_PATH': '/workspace/.openhands/conversations',
+                'OH_BASH_EVENTS_DIR': '/workspace/.openhands/bash_events',
+                'OH_PERSISTENCE_DIR': '/workspace/.openhands/persistence',
+                'OH_CONVERSATION_WORKTREE_ROOT': '/workspace/worktrees',
+                'OH_WORKSPACE_PATH': '/workspace/project',
+                'LOG_JSON': 'true',
+            }
+        )
         self.mock_app_conversation_info_service = Mock()
         self.mock_app_conversation_info_service.resolve_organization_id = AsyncMock(
             return_value=None
@@ -338,6 +352,8 @@ class TestLiveStatusAppConversationService:
         self.mock_sandbox.id = 'sandbox-123'
         self.mock_sandbox.status = SandboxStatus.RUNNING
         self.mock_sandbox.session_api_key = 'session-key'
+        self.mock_sandbox.sandbox_spec_id = 'linux-default'
+        self.mock_sandbox.exposed_urls = []
 
         # Stable conversation ID for tests that call _configure_llm_and_mcp directly
         self.conversation_id = uuid4()
@@ -546,7 +562,21 @@ class TestLiveStatusAppConversationService:
         assert get.args[0] == 'http://sandbox.agents.svc.cluster.local:8000/api/init'
         assert post.kwargs['headers'] == {'X-Init-API-Key': 'bootstrap-key'}
         assert post.kwargs['json']['session_api_keys'] == ['session-key']
-        assert 'secret_key' not in post.kwargs['json']
+        assert post.kwargs['json']['secret_key'] == 'sandbox-secret'
+        assert post.kwargs['json']['conversations_path'] == (
+            '/workspace/.openhands/conversations'
+        )
+        assert post.kwargs['json']['bash_events_dir'] == (
+            '/workspace/.openhands/bash_events'
+        )
+        assert post.kwargs['json']['conversation_worktree_root'] == (
+            '/workspace/worktrees'
+        )
+        assert post.kwargs['json']['webhooks'] == [
+            {'base_url': 'http://control-plane/api/v1/webhooks'}
+        ]
+        assert post.kwargs['json']['env']['OH_SANDBOX_ID'] == 'sandbox-123'
+        assert 'OH_DEFERRED_INIT' not in post.kwargs['json']['env']
         assert post.kwargs['json']['hindsight_memory'] == {
             'broker_url': 'https://control-plane/hindsight',
             'identity': 'signed-identity',
@@ -892,7 +922,7 @@ class TestLiveStatusAppConversationService:
         assert post.args[0] == 'http://sandbox.agents.svc.cluster.local:8000/api/init'
         assert post.kwargs['headers'] == {'X-Init-API-Key': 'shared-bootstrap-key'}
         assert post.kwargs['json']['session_api_keys'] == ['resumed-session-key']
-        assert 'secret_key' not in post.kwargs['json']
+        assert post.kwargs['json']['secret_key'] == 'sandbox-secret'
         self.service._seed_sandbox_profiles.assert_awaited_once_with(
             'http://resumed-agent-server:8000',
             'resumed-session-key',

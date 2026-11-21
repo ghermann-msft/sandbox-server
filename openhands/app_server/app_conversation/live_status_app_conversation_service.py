@@ -28,6 +28,7 @@ from openhands.app_server.app_conversation.agent_server_init_models import (
     AgentServerInitRequest,
     AgentServerInitStatus,
     AgentServerMemoryScope,
+    AgentServerWebhookSpec,
 )
 from openhands.app_server.app_conversation.app_conversation_info_service import (
     AppConversationInfoService,
@@ -100,8 +101,13 @@ from openhands.app_server.sandbox.sandbox_models import (
     SandboxInfo,
     SandboxStatus,
 )
-from openhands.app_server.sandbox.sandbox_service import SandboxService
-from openhands.app_server.sandbox.sandbox_spec_models import SandboxOperatingSystem
+from openhands.app_server.sandbox.sandbox_service import (
+    WEBHOOK_CALLBACK_VARIABLE,
+    SandboxService,
+)
+from openhands.app_server.sandbox.sandbox_spec_models import (
+    SandboxOperatingSystem,
+)
 from openhands.app_server.sandbox.sandbox_spec_service import (
     SandboxSpecService,
     is_custom_sandbox_spec,
@@ -1281,6 +1287,14 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
             )
 
         config = get_global_config()
+        sandbox_spec = await self.sandbox_spec_service.get_sandbox_spec(
+            sandbox.sandbox_spec_id,
+            include_unavailable=True,
+        )
+        if sandbox_spec is None:
+            raise SandboxError(
+                f'Execution profile not found: {sandbox.sandbox_spec_id}'
+            )
         hindsight_memory: AgentServerHindsightMemory | None = None
         if config.hindsight_enabled:
             broker_url = config.hindsight_broker_url
@@ -1344,11 +1358,47 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
                 timeout_seconds=config.hindsight_agent_timeout_seconds,
             )
 
-        # Keep the Agent Server's configured OH_SECRET_KEY. Passing the
-        # per-sandbox session key here would override it and make persisted
-        # OAuth ciphertext unreadable by the next sandbox.
+        secret_key = await self.sandbox_service.get_sandbox_secret_key(sandbox.id)
+        if not secret_key:
+            raise SandboxError(
+                'Deferred Agent Server initialization requires a sandbox secret key'
+            )
+        runtime_env = {
+            name: value.replace('{sandbox_id}', sandbox.id)
+            for name, value in sandbox_spec.initial_env.items()
+        }
+        runtime_env.pop('OH_DEFERRED_INIT', None)
+        runtime_env['OH_SANDBOX_ID'] = sandbox.id
+        for exposed_url in sandbox.exposed_urls or []:
+            runtime_env[exposed_url.name] = str(exposed_url.port)
+
+        webhook_base_url = self.sandbox_service.get_control_plane_base_url()
+        webhooks = None
+        if webhook_base_url:
+            webhook_url = f'{webhook_base_url}/api/v1/webhooks'
+            runtime_env[WEBHOOK_CALLBACK_VARIABLE] = webhook_url
+            webhooks = [AgentServerWebhookSpec(base_url=webhook_url)]
+
+        web_url = getattr(config, 'web_url', None)
+        permitted_cors_origins = getattr(config, 'permitted_cors_origins', [])
+        if not isinstance(web_url, str):
+            web_url = None
+        if not isinstance(permitted_cors_origins, list):
+            permitted_cors_origins = []
+        cors_origins = list(
+            dict.fromkeys(
+                origin for origin in [web_url, *permitted_cors_origins] if origin
+            )
+        )
         init_request = AgentServerInitRequest(
             session_api_keys=[session_api_key],
+            secret_key=secret_key,
+            conversations_path=runtime_env.get('OH_CONVERSATIONS_PATH'),
+            bash_events_dir=runtime_env.get('OH_BASH_EVENTS_DIR'),
+            conversation_worktree_root=runtime_env.get('OH_CONVERSATION_WORKTREE_ROOT'),
+            webhooks=webhooks,
+            allow_cors_origins=cors_origins,
+            env=runtime_env,
             hindsight_memory=hindsight_memory,
         )
         internal_url = await self.sandbox_service.get_sandbox_internal_url(

@@ -25,11 +25,26 @@ class AgentServerHindsightMemory(BaseModel):
     timeout_seconds: float = Field(default=30.0, gt=0, le=30)
 
 
+class AgentServerWebhookSpec(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+
+    base_url: str
+
+
 class AgentServerInitRequest(BaseModel):
     model_config = ConfigDict(extra='forbid')
 
     session_api_keys: list[str] | None = None
     secret_key: str | None = None
+    previous_secret_keys: list[str] | None = None
+    conversations_path: str | None = None
+    bash_events_dir: str | None = None
+    conversation_worktree_root: str | None = None
+    webhooks: list[AgentServerWebhookSpec] | None = None
+    web_url: str | None = None
+    allow_cors_origins: list[str] | None = None
+    max_concurrent_runs: int | None = Field(default=None, ge=1)
+    env: dict[str, str] | None = None
     hindsight_memory: AgentServerHindsightMemory | None = None
 
 

@@ -179,6 +179,10 @@ class SandboxService(ABC):
         """
         return None
 
+    async def get_sandbox_secret_key(self, sandbox_id: str) -> str | None:
+        """Return the sandbox-scoped encryption key for deferred initialization."""
+        return None
+
     async def get_sandbox_internal_url(
         self, sandbox_id: str, service_name: str
     ) -> str | None:

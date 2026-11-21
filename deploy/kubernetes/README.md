@@ -21,7 +21,16 @@ the source of truth, exactly as the docker backend treats the docker daemon.
    kubectl -n agent-sandbox-system rollout status deploy --timeout=180s
    ```
 
-2. The template, pool, and RBAC from this directory:
+2. A bootstrap Secret shared by the app server and dormant Agent Server pods:
+
+   ```bash
+   kubectl create secret generic openhands-agent-server-bootstrap \
+     --from-literal=secret-key="$(openssl rand -base64 32)"
+   ```
+
+   Expose the same value to the app-server container as `OH_SECRET_KEY`.
+
+3. The template, pool, and RBAC from this directory:
 
    ```bash
    kubectl apply -f sandboxtemplate.yaml
@@ -62,26 +71,19 @@ Execution profiles are enforced at claim creation:
 
 - The selected profile chooses a `SandboxWarmPool`, whose
   `sandboxTemplateRef` must match the profile's `template_name`.
-- The claim overrides the template's `workspace` volume claim with the profile's
-  workspace storage class and size. Templates must set
-  `volumeClaimTemplatesPolicy: Overrides`.
-- The durable Azure Files PVC, container image, resource requests/limits, mount
-  roots, node selector, and tolerations are validated against the selected
-  template before a claim is created. A mismatch fails explicitly instead of
-  launching a sandbox with different infrastructure than the profile describes.
+- The template-owned `workspace` volume claim must match the profile's storage
+  class and size. Claims do not override volume claims because agent-sandbox
+  cold-starts any claim with `volumeClaimTemplates`.
+- The container image, workspace mount, resource requests/limits, node selector,
+  and tolerations are validated against the selected template before a claim is
+  created.
 
-The bundled Linux and Windows templates mount the existing Halo Azure Files PVC
-`openhands-halo-conversations`. To use another PVC or storage class, update the
-template and seed the matching profile fields together (the profile can be seeded
-with `OH_HALO_DURABLE_STATE_PVC` and `OH_HALO_DURABLE_STORAGE_CLASS`). Changing
-only the profile is rejected at sandbox creation.
-
-Linux mounts the sandbox's Azure Files directory at `/openhands` with
-`subPathExpr: $(OH_SANDBOX_ID)`. Kubernetes Windows containers do not support
-volume subPath mounts, so Windows mounts the whole share at `C:\OpenHands` and
-the app server expands `{sandbox_id}` into the conversations, bash-events, and
-persistence environment paths. This preserves deterministic per-sandbox
-directories without relying on an unsupported Windows mount feature.
+The adopted Sandbox owns its workspace PVC. Agent-sandbox reattaches that PVC
+when a paused sandbox resumes or a pod restarts, and garbage-collects it when the
+Sandbox is deleted. Durable Agent Server state therefore lives under
+`/workspace/.openhands` on Linux and `C:\workspace\.openhands` on Windows. This
+preserves lifecycle semantics without a shared PVC, `subPathExpr`, or
+claim-specific pod environment.
 
 The global legacy startup safety limit is configured with
 `OH_APP_CONVERSATION_SANDBOX_STARTUP_TIMEOUT` (120 seconds by default). Curated
@@ -136,17 +138,16 @@ Ingress or Gateway that routes to the per-sandbox Service.
 
 ### Session keys and warm pools
 
-The app server gives each sandbox a unique session API key by injecting it as an
-environment variable on the claim. agent-sandbox cold starts a pod whenever a claim
-carries `spec.env`, and the app server always sets webhook and port variables there,
-so **pre-warmed replicas are never used today**, whatever `inject_session_key` is set
-to. Turning that flag off only drops the per-sandbox key, which is not safe on a
-shared cluster.
+Claims contain only `warmPoolRef` and optional lifecycle configuration, so they
+can adopt an already-running warm Sandbox. The app server stores the generated
+session and encryption keys in a claim-owned Kubernetes Secret; the Secret is
+never mounted into the pod. After adoption it calls Agent Server `POST /api/init`
+with `X-Init-API-Key` and delivers the session/encryption keys, persistence paths,
+webhook, CORS origins, ports, and profile runtime environment.
 
-Using the warm path would mean sending no claim environment at all: bake the
-configuration into the template and hand each sandbox its key through the agent
-server after the claim binds. That needs post-adoption credential injection from
-agent-sandbox, which does not exist yet.
+The template's `OH_SECRET_KEY` is only the pool-safe bootstrap credential for
+`/api/init`. Keep it identical to the app server's `OH_SECRET_KEY`, rotate it by
+recreating unclaimed warm-pool replicas, and never use it as a user session key.
 
 ## Verifying
 
@@ -167,6 +168,8 @@ Verified on a kind cluster and on GKE with the manifests in this directory.
 kind create cluster --name ohk8s
 kubectl apply -f "https://github.com/kubernetes-sigs/agent-sandbox/releases/download/v0.5.2/sandbox-with-extensions.yaml"
 kubectl -n agent-sandbox-system rollout status deploy --timeout=240s
+kubectl create secret generic openhands-agent-server-bootstrap \
+  --from-literal=secret-key="$OH_SECRET_KEY"
 kubectl apply -f deploy/kubernetes/
 
 # optional on kind: preload the image so the first sandbox starts quickly

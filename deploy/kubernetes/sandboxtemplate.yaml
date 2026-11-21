@@ -10,12 +10,6 @@ metadata:
   name: openhands-agent-server
   namespace: default
 spec:
-  # Required: the app server injects the per-sandbox session API key (and webhook
-  # and CORS settings) as environment variables on each SandboxClaim. Without this
-  # the controller rejects the injection and sandboxes come up unauthenticated.
-  envVarsInjectionPolicy: Allowed
-  volumeClaimTemplatesPolicy: Overrides
-
   # The controller-managed NetworkPolicy is restrictive in both directions: egress
   # allows public ranges but blocks private ones, and ingress only admits the
   # sandbox-router. The app server needs both, since sandboxes call back to it for
@@ -57,10 +51,6 @@ spec:
             storage: 5Gi
   podTemplate:
     spec:
-      volumes:
-        - name: openhands-state
-          persistentVolumeClaim:
-            claimName: openhands-halo-conversations
       # runtimeClassName: gvisor   # uncomment for kernel-level isolation
       securityContext:
         runAsUser: 10001
@@ -71,6 +61,14 @@ spec:
           image: ghcr.io/openhands/agent-server:1.37.1-python-p4-r25.2-p4mcp-2026.4.3126709
           args: ["--host", "0.0.0.0", "--port", "8000"]
           workingDir: /workspace/project
+          env:
+            - name: OH_DEFERRED_INIT
+              value: "true"
+            - name: OH_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: openhands-agent-server-bootstrap
+                  key: secret-key
           ports:
             - containerPort: 8000
               name: agent-server
@@ -93,9 +91,6 @@ spec:
           volumeMounts:
             - name: workspace
               mountPath: /workspace
-            - name: openhands-state
-              mountPath: /openhands
-              subPathExpr: $(OH_SANDBOX_ID)
 ---
 # Native Windows Server 2025 execution profile. The image digest is deliberately
 # a deployment-time contract: replace the zero digest with the digest produced by
@@ -106,8 +101,6 @@ metadata:
   name: openhands-agent-server-windows-2025
   namespace: default
 spec:
-  envVarsInjectionPolicy: Allowed
-  volumeClaimTemplatesPolicy: Overrides
   volumeClaimTemplates:
     - metadata:
         name: workspace
@@ -128,16 +121,19 @@ spec:
           operator: Equal
           value: windows
           effect: NoSchedule
-      volumes:
-        - name: openhands-state
-          persistentVolumeClaim:
-            claimName: openhands-halo-conversations
       containers:
         - name: agent-server
           image: ghcr.io/ghermann-msft/agent-server:replace-with-sha-windows-ltsc2025-amd64@sha256:0000000000000000000000000000000000000000000000000000000000000000
           args: ["--host", "0.0.0.0", "--port", "8000"]
           workingDir: 'C:\workspace\project'
           env:
+            - name: OH_DEFERRED_INIT
+              value: "true"
+            - name: OH_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: openhands-agent-server-bootstrap
+                  key: secret-key
             - name: OH_SANDBOX_OPERATING_SYSTEM
               value: windows
           ports:
@@ -165,5 +161,3 @@ spec:
           volumeMounts:
             - name: workspace
               mountPath: 'C:\workspace'
-            - name: openhands-state
-              mountPath: 'C:\OpenHands'

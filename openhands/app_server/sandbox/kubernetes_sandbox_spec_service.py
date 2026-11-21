@@ -41,14 +41,6 @@ LINUX_AGENT_SERVER_IMAGE = (
 WINDOWS_AGENT_SERVER_IMAGE = os.getenv('OH_WINDOWS_AGENT_SERVER_IMAGE')
 
 
-def _durable_state_pvc() -> str:
-    return os.getenv('OH_HALO_DURABLE_STATE_PVC', 'openhands-halo-conversations')
-
-
-def _durable_storage_class() -> str:
-    return os.getenv('OH_HALO_DURABLE_STORAGE_CLASS', 'openhands-halo-azurefile')
-
-
 def get_default_sandbox_specs() -> list[SandboxSpecInfo]:
     return [
         SandboxSpecInfo(
@@ -56,15 +48,14 @@ def get_default_sandbox_specs() -> list[SandboxSpecInfo]:
             display_name='Linux Standard',
             source='bootstrap',
             immutable=True,
-            bootstrap_revision='builtin-linux-v1',
-            # The template's container command applies; the claim only injects env.
+            bootstrap_revision='builtin-linux-v2',
             command=None,
             initial_env={
                 'OH_ENABLE_VNC': '0',
                 'LOG_JSON': 'true',
-                'OH_CONVERSATIONS_PATH': '/openhands/conversations',
-                'OH_BASH_EVENTS_DIR': '/openhands/bash_events',
-                'OH_PERSISTENCE_DIR': '/openhands/persistence',
+                'OH_CONVERSATIONS_PATH': '/workspace/.openhands/conversations',
+                'OH_BASH_EVENTS_DIR': '/workspace/.openhands/bash_events',
+                'OH_PERSISTENCE_DIR': '/workspace/.openhands/persistence',
                 'OH_CONVERSATION_WORKTREE_ROOT': '/workspace/worktrees',
                 'OH_WORKSPACE_PATH': '/workspace/project',
                 'PYTHONUNBUFFERED': '1',
@@ -76,8 +67,8 @@ def get_default_sandbox_specs() -> list[SandboxSpecInfo]:
             resource_class=SandboxResourceClass.STANDARD,
             image=LINUX_AGENT_SERVER_IMAGE,
             workspace_mount_path='/workspace',
-            durable_state_dir='/openhands',
-            durable_mount_path='/openhands',
+            durable_state_dir='/workspace/.openhands',
+            durable_mount_path='/workspace',
             template_name='openhands-agent-server',
             warm_pool_name=DEFAULT_WARM_POOL,
             startup_timeout_seconds=300,
@@ -90,9 +81,6 @@ def get_default_sandbox_specs() -> list[SandboxSpecInfo]:
             storage_size='5Gi',
             workspace_storage_class='managed-csi',
             workspace_storage_size='5Gi',
-            durable_storage_class=_durable_storage_class(),
-            durable_volume_claim_name=_durable_state_pvc(),
-            durable_sub_path_template='{sandbox_id}',
             capabilities=['git', 'perforce'],
         ),
         SandboxSpecInfo(
@@ -100,15 +88,15 @@ def get_default_sandbox_specs() -> list[SandboxSpecInfo]:
             display_name='Windows Server 2025 Standard',
             source='bootstrap',
             immutable=True,
-            bootstrap_revision='builtin-windows-2025-v1',
+            bootstrap_revision='builtin-windows-2025-v2',
             description='Native Windows Server 2025 container on AKS Windows nodes.',
             command=None,
             initial_env={
                 'OH_ENABLE_VNC': '0',
                 'LOG_JSON': 'true',
-                'OH_CONVERSATIONS_PATH': (r'C:\OpenHands\{sandbox_id}\conversations'),
-                'OH_BASH_EVENTS_DIR': r'C:\OpenHands\{sandbox_id}\bash_events',
-                'OH_PERSISTENCE_DIR': r'C:\OpenHands\{sandbox_id}\persistence',
+                'OH_CONVERSATIONS_PATH': (r'C:\workspace\.openhands\conversations'),
+                'OH_BASH_EVENTS_DIR': r'C:\workspace\.openhands\bash_events',
+                'OH_PERSISTENCE_DIR': r'C:\workspace\.openhands\persistence',
                 'OH_CONVERSATION_WORKTREE_ROOT': r'C:\workspace\worktrees',
                 'OH_WORKSPACE_PATH': r'C:\workspace\project',
                 'PYTHONUNBUFFERED': '1',
@@ -122,8 +110,8 @@ def get_default_sandbox_specs() -> list[SandboxSpecInfo]:
             image=WINDOWS_AGENT_SERVER_IMAGE,
             shell=['powershell.exe', '-NoLogo', '-NoProfile'],
             workspace_mount_path=r'C:\workspace',
-            durable_state_dir=r'C:\OpenHands\{sandbox_id}',
-            durable_mount_path=r'C:\OpenHands',
+            durable_state_dir=r'C:\workspace\.openhands',
+            durable_mount_path=r'C:\workspace',
             template_name='openhands-agent-server-windows-2025',
             warm_pool_name=WINDOWS_STANDARD_POOL,
             startup_timeout_seconds=600,
@@ -137,9 +125,6 @@ def get_default_sandbox_specs() -> list[SandboxSpecInfo]:
             storage_size='20Gi',
             workspace_storage_class='managed-csi',
             workspace_storage_size='20Gi',
-            durable_storage_class=_durable_storage_class(),
-            durable_volume_claim_name=_durable_state_pvc(),
-            durable_sub_path_template='{sandbox_id}',
             node_selector={
                 'kubernetes.io/os': 'windows',
                 'node.kubernetes.io/windows-build': '10.0.26100',
