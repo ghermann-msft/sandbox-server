@@ -37,6 +37,8 @@ from openhands.app_server.hindsight.hindsight_service import (
     content_sha256,
     derive_bank_id,
     derive_event_id,
+    hindsight_memory_item,
+    hindsight_operation_id,
     resolve_scope,
     retain_requires_approval,
     validate_retain_approval,
@@ -484,6 +486,68 @@ async def test_enqueue_is_idempotent(session_maker):
     assert second_duplicate is True
     async with session_maker() as session:
         assert await session.get(StoredHindsightOutbox, 'event-1') is not None
+
+
+def test_hindsight_async_retain_contract_is_schema_compatible():
+    event_id = 'a' * 64
+    item = hindsight_memory_item(
+        {
+            'content': 'remember this',
+            'metadata': {
+                'source_event_id': 'event-1',
+                'scope': {'type': 'private_user', 'id': 'user-1'},
+            },
+        }
+    )
+
+    assert UUID(hindsight_operation_id(event_id))
+    assert item['metadata'] == {
+        'source_event_id': 'event-1',
+        'scope': '{"id":"user-1","type":"private_user"}',
+    }
+
+
+@pytest.mark.asyncio
+async def test_delivery_uses_hindsight_async_retain_contract(session_maker):
+    event_id = 'a' * 64
+
+    async def retained(request):
+        payload = json.loads(request.content)
+        assert payload == {
+            'items': [
+                {
+                    'content': 'remember this',
+                    'metadata': {
+                        'source_event_id': 'event-1',
+                        'scope': '{"id":"user-1","type":"private_user"}',
+                    },
+                }
+            ],
+            'async': True,
+            'operation_id': hindsight_operation_id(event_id),
+        }
+        return httpx.Response(202)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(retained)) as client:
+        broker = HindsightBroker(_settings(), session_maker, http_client=client)
+        await broker.enqueue(
+            event_id,
+            'bank-1',
+            {
+                'content': 'remember this',
+                'metadata': {
+                    'source_event_id': 'event-1',
+                    'scope': {'type': 'private_user', 'id': 'user-1'},
+                },
+            },
+        )
+
+        assert await broker.deliver_once() is True
+
+    async with session_maker() as session:
+        row = await session.get(StoredHindsightOutbox, event_id)
+        assert row is not None
+        assert row.status == HindsightOutboxStatus.DELIVERED
 
 
 @pytest.mark.asyncio

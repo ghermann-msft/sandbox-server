@@ -10,6 +10,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
+from uuid import NAMESPACE_URL, uuid5
 
 import httpx
 from fastapi import HTTPException, status
@@ -263,6 +264,25 @@ def derive_bank_id(
 
 def content_sha256(content: str) -> str:
     return hashlib.sha256(content.encode()).hexdigest()
+
+
+def hindsight_operation_id(event_id: str) -> str:
+    return str(uuid5(NAMESPACE_URL, f'openhands-hindsight:{event_id}'))
+
+
+def hindsight_memory_item(payload: dict[str, Any]) -> dict[str, Any]:
+    item = dict(payload)
+    metadata = item.get('metadata')
+    if isinstance(metadata, dict):
+        item['metadata'] = {
+            key: (
+                value
+                if isinstance(value, str)
+                else json.dumps(value, sort_keys=True, separators=(',', ':'))
+            )
+            for key, value in metadata.items()
+        }
+    return item
 
 
 def derive_event_id(
@@ -571,9 +591,9 @@ class HindsightBroker:
                 f'{self.settings.base_url.rstrip("/")}/v1/default/banks/{quote(bank_id)}/memories',
                 headers=self._headers(event_id),
                 json={
-                    'items': [payload],
+                    'items': [hindsight_memory_item(payload)],
                     'async': True,
-                    'operation_id': event_id,
+                    'operation_id': hindsight_operation_id(event_id),
                 },
             )
             response.raise_for_status()
