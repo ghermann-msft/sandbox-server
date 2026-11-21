@@ -558,17 +558,14 @@ def _matching_existing_mcp_server(
     incoming_servers: Mapping[str, Any],
     existing_servers: Mapping[str, Any],
 ) -> Mapping[str, Any]:
+    named_server = existing_servers.get(name)
+    if isinstance(named_server, Mapping):
+        # The settings-map key is stable across command migrations.
+        return named_server
+
     incoming_endpoint = _mcp_endpoint_identity(incoming_server)
     if incoming_endpoint is None:
         return {}
-
-    named_server = existing_servers.get(name)
-    if isinstance(named_server, Mapping):
-        return (
-            named_server
-            if incoming_endpoint == _mcp_endpoint_identity(named_server)
-            else {}
-        )
 
     candidates = [
         server
