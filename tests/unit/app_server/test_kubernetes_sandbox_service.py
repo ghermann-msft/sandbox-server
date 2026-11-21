@@ -21,8 +21,17 @@ from kubernetes.client.rest import ApiException
 from pydantic import ValidationError
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
+from openhands.app_server.app_conversation.app_conversation_models import (
+    AppConversationStartRequest,
+    AppConversationStartTask,
+    AppConversationStartTaskStatus,
+)
 from openhands.app_server.app_conversation.sql_app_conversation_info_service import (
     StoredConversationMetadata,
+)
+from openhands.app_server.app_conversation.sql_app_conversation_start_task_service import (
+    SQLAppConversationStartTaskService,
+    StoredAppConversationStartTask,
 )
 from openhands.app_server.errors import SandboxError
 from openhands.app_server.sandbox.kubernetes_sandbox_service import (
@@ -1102,6 +1111,60 @@ async def test_creation_reconciliation_removes_access_for_orphans(
         await service._reconcile_orphaned_capacity()
 
     access_service.delete_sandbox.assert_awaited_once_with('sb1')
+
+
+async def test_creation_reconciliation_preserves_inflight_start_claim(
+    service, custom_objects
+):
+    engine = create_async_engine('sqlite+aiosqlite:///:memory:')
+    async with engine.begin() as connection:
+        await connection.run_sync(StoredAppConversationStartTask.__table__.create)
+        await connection.run_sync(StoredConversationMetadata.__table__.create)
+        await connection.run_sync(StoredSandboxAccess.__table__.create)
+    session_maker = async_sessionmaker(engine, expire_on_commit=False)
+
+    try:
+        async with session_maker() as db_session:
+            start_task_service = SQLAppConversationStartTaskService(db_session)
+            await start_task_service.save_app_conversation_start_task(
+                AppConversationStartTask(
+                    created_by_user_id='user',
+                    status=AppConversationStartTaskStatus.WAITING_FOR_SANDBOX,
+                    sandbox_id='first-start',
+                    request=AppConversationStartRequest(),
+                )
+            )
+            await start_task_service.save_app_conversation_start_task(
+                AppConversationStartTask(
+                    created_by_user_id='user',
+                    status=AppConversationStartTaskStatus.ERROR,
+                    sandbox_id='failed-start',
+                    request=AppConversationStartRequest(),
+                )
+            )
+            active = _claim(sandbox_id='first-start')
+            failed = _claim(sandbox_id='failed-start')
+            orphan = _claim(sandbox_id='orphan')
+            custom_objects.list_namespaced_custom_object.return_value = {
+                'items': [active, failed, orphan]
+            }
+            service.access_service = SandboxAccessService(
+                db_session=db_session,
+                user_id='user',
+            )
+
+            await service._reconcile_orphaned_capacity()
+
+            deleted_claims = {
+                call.kwargs['name']
+                for call in custom_objects.delete_namespaced_custom_object.call_args_list
+            }
+            assert deleted_claims == {
+                'oh-agent-server-failed-start',
+                'oh-agent-server-orphan',
+            }
+    finally:
+        await engine.dispose()
 
 
 @pytest.mark.parametrize(
